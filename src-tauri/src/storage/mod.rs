@@ -109,7 +109,6 @@ impl Storage {
                 reply_sent_at TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id);
             CREATE INDEX IF NOT EXISTS idx_events_conversation ON events(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_events_received_at ON events(received_at);
             CREATE INDEX IF NOT EXISTS idx_events_processed ON events(processed);
@@ -147,6 +146,13 @@ impl Storage {
         ] {
             let _ = db.execute(stmt, []);
         }
+
+        // project_id 可能刚刚才补上，索引必须在补列之后建，否则旧库会直接报
+        // `no such column: project_id` 而启动失败。
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id)",
+            [],
+        )?;
 
         let archive_dir = data_dir.join("archive");
         fs::create_dir_all(&archive_dir)?;
@@ -534,5 +540,107 @@ impl Storage {
             failed_replies: count("SELECT COUNT(*) FROM events WHERE reply_status = 'failed'")?,
             conversations: count("SELECT COUNT(DISTINCT conversation_id) FROM events")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个**旧结构**的库：events 缺 project_id，sessions 是旧的 conversation_id 单列唯一。
+    fn write_legacy_database(dir: &std::path::Path) {
+        let db = Connection::open(dir.join("agentmux.db")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT UNIQUE NOT NULL,
+                conversation_id TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                sender_open_dingtalk_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                create_time TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                listen_kind TEXT NOT NULL DEFAULT '',
+                malformed INTEGER NOT NULL DEFAULT 0,
+                raw TEXT NOT NULL DEFAULT '',
+                processed BOOLEAN DEFAULT FALSE,
+                reply_status TEXT, reply_text TEXT, reply_sent_at TEXT
+             );
+
+             INSERT INTO events
+                (message_id, conversation_id, sender, sender_open_dingtalk_id, content, create_time, received_at)
+             VALUES
+                ('msg-1', 'cid-1', '甲', 'open-1', '老数据', '2026-09-18 10:00:00', '2026-09-18T10:00:00+08:00');
+
+             CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT UNIQUE NOT NULL,
+                agent_session_id TEXT NOT NULL,
+                agent_cwd TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+
+             INSERT INTO sessions
+                (conversation_id, agent_session_id, agent_cwd, created_at, updated_at)
+             VALUES
+                ('cid-1', 'sess-1', 'D:\\old-cwd', '2026-09-18T10:00:00+08:00', '2026-09-18T10:00:00+08:00');",
+        )
+        .unwrap();
+    }
+
+    /// 回归：旧库必须能正常打开并完成迁移。
+    ///
+    /// 曾经因为「先建 project_id 索引、后补列」，旧库启动时直接 panic：
+    /// `no such column: project_id`。这个 bug 只有真正启动应用才会暴露。
+    #[test]
+    fn migrating_a_legacy_database_does_not_panic() {
+        let dir = std::env::temp_dir().join("agentmux-legacy-schema-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_legacy_database(&dir);
+
+        let storage = Storage::new(dir.clone()).expect("旧库应能迁移成功，而不是 panic");
+
+        // 旧事件仍在，project_id 补成空串
+        let rows = storage
+            .list_events(&EventQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "迁移不应丢数据");
+        assert_eq!(rows[0].message_id, "msg-1");
+        assert_eq!(rows[0].project_id, "", "旧事件迁移后项目应为空串");
+
+        // 旧会话被搬进新结构，且可按 (项目, 会话) 读回
+        let session = storage.get_session("", "cid-1").unwrap();
+        assert!(session.is_some(), "旧会话应保留");
+        assert_eq!(session.unwrap().0, "sess-1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 项目维度可写入可读回；两个项目对同一会话各自独立。
+    #[test]
+    fn sessions_are_isolated_per_project() {
+        let dir = std::env::temp_dir().join("agentmux-session-scope-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir.clone()).unwrap();
+
+        storage.save_session("p1", "cid-1", "sess-a", "D:\\a").unwrap();
+        storage.save_session("p2", "cid-1", "sess-b", "D:\\b").unwrap();
+
+        assert_eq!(storage.get_session("p1", "cid-1").unwrap().unwrap().0, "sess-a");
+        assert_eq!(storage.get_session("p2", "cid-1").unwrap().unwrap().0, "sess-b");
+
+        storage.delete_session("p1", "cid-1").unwrap();
+        assert!(storage.get_session("p1", "cid-1").unwrap().is_none());
+        assert!(
+            storage.get_session("p2", "cid-1").unwrap().is_some(),
+            "作废一个项目的会话不应影响另一个项目"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
