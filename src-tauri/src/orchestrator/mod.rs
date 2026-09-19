@@ -647,6 +647,11 @@ impl Shared {
             let _ = channel.send(ListenerUpdate::Event {
                 event: event.clone(),
             });
+            self.trace(&event.message_id, "④ 推流", " 已推给界面（实时事件流）")
+                .await;
+        } else {
+            self.trace(&event.message_id, "④ 推流", " 无界面通道，跳过")
+                .await;
         }
 
         // 先落盘再推流再回复：回复失败不影响事件已经安全落盘。
@@ -719,6 +724,13 @@ impl Shared {
                 .await;
             return;
         }
+
+        self.trace(
+            &event.message_id,
+            "⑥ 单条判定",
+            " 通过（非畸形、非本人发送、Agent CLI 就绪）",
+        )
+        .await;
 
         let conversation = event.conversation_id.clone();
         let batch = {
@@ -1742,14 +1754,43 @@ process.stdout.write("收到 " + process.cwd());
         std::env::set_current_dir(previous).unwrap();
 
         assert_eq!(rows.len(), 1, "应只落盘 1 条事件，实际 {:?}", rows);
+        let logs = orchestrator.get_logs(500).await;
+        let joined = logs.join("\n");
         // 失败时把全链路 trace 打出来，直接看出卡在哪一步
         // （加 --nocapture 可见）。这正是 trace 要解决的问题。
         if rows[0].reply_status.as_deref() != Some("sent") {
-            eprintln!(
-                "---- 全链路 trace（回复未成功时打印）----\n{}",
-                orchestrator.get_logs(500).await.join("\n")
+            eprintln!("---- 全链路 trace（回复未成功时打印）----\n{}", joined);
+        }
+        // 需求：从收到 @我 到发出回复，整条执行流都要有可查的日志。
+        // 这里逐个阶段断言，少打一个点就算回归。
+        for stage in [
+            "① 收到事件",
+            "② 去重",
+            "③ 落盘",
+            "④ 推流",
+            "⑤ 回复开关",
+            "⑥ 单条判定",
+            "⑦ 进攒批",
+            "⑧ 出批",
+            "⑨ 压缩判定",
+            "⑩ 拉上下文",
+            "⑪ 调 Agent",
+            "⑫ 生成返回",
+            "⑬ 清洗",
+            "⑮ 发送",
+            "⑯ 台账",
+        ] {
+            assert!(
+                joined.contains(stage),
+                "全链路日志缺少阶段「{}」，实际日志:\n{}",
+                stage,
+                joined
             );
         }
+        // 每条 trace 都要能定位到具体消息与耗时。
+        assert!(joined.contains("[trace msg-stub-1]"), "trace 应带 message_id");
+        assert!(joined.contains("+0ms"), "trace 应带「距收到多少毫秒」");
+
         let row = &rows[0];
         assert_eq!(row.project_id, "proj-A", "事件应归属到发起监听的项目");
         assert_eq!(row.conversation_id, "cid-1");
