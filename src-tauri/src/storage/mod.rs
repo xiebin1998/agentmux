@@ -308,6 +308,9 @@ impl Storage {
     }
 
     /// 会话汇总。传 project_id 时只统计该项目的会话（左侧树的「项目下挂会话」）。
+    ///
+    /// 会过滤掉 `conversation_id` 为空的行：那是缺会话标识的畸形事件，
+    /// 在左树里会表现为一个点了没反应的「空会话」。
     pub fn list_conversations(&self, project_id: Option<&str>) -> Result<Vec<ConversationSummary>> {
         let mut stmt = self.db.prepare(
             "SELECT conversation_id,
@@ -315,7 +318,8 @@ impl Storage {
                     MAX(received_at) AS last_received_at,
                     SUM(CASE WHEN reply_status = 'sent' THEN 1 ELSE 0 END) AS replied
              FROM events
-             WHERE (?1 IS NULL OR project_id = ?1)
+             WHERE conversation_id <> ''
+               AND (?1 IS NULL OR project_id = ?1)
              GROUP BY conversation_id
              ORDER BY last_received_at DESC",
         )?;

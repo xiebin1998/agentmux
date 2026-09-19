@@ -1098,6 +1098,35 @@ process.stdin.on("end", function () { process.exit(0); });
             "跨监听去重应拦住重复的 message_id"
         );
 
+        // 项目归属（问题 2/3 的数据基础）：哪个项目的监听收到就归哪个项目。
+        assert!(
+            rows.iter().all(|row| row.project_id == "test-project"),
+            "事件应归属到发起监听的项目，实际: {:?}",
+            rows.iter().map(|r| (&r.message_id, &r.project_id)).collect::<Vec<_>>()
+        );
+
+        // 左树「项目 → 会话」靠这个查询：本项目能看到会话，别的项目看不到。
+        // 注意 stub 里有一条畸形事件（conversation_id 为空），它**不该**成为会话。
+        let mine = storage
+            .lock()
+            .await
+            .list_conversations(Some("test-project"))
+            .unwrap();
+        assert_eq!(mine.len(), 1, "本项目应只看到 cid-1 这一个会话，实际 {:?}", mine);
+        assert_eq!(mine[0].conversation_id, "cid-1");
+        assert_eq!(
+            mine[0].events, 2,
+            "畸形事件（无会话标识）不应计入会话，实际 {:?}",
+            mine[0]
+        );
+
+        let others = storage
+            .lock()
+            .await
+            .list_conversations(Some("other-project"))
+            .unwrap();
+        assert!(others.is_empty(), "别的项目不应看到这个会话，实际 {:?}", others);
+
         let _ = std::fs::remove_dir_all(&stub_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
