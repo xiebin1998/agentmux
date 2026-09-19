@@ -2,9 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface CliCandidate {
+  /** 命令名，如 dws / qodercli —— 界面主显示这个 */
+  name: string;
+  /** 内部用于启动的可执行文件路径；解析不到时为空 */
   path: string;
   source: string;
-  /** direct=可直接启动；via_cmd=需 cmd /C；unsupported=本机无法直接启动（.ps1 等） */
   launch_mode: "direct" | "via_cmd" | "unsupported";
   version: string | null;
   auth_state: "logged_in" | "not_logged_in" | "unknown";
@@ -15,6 +17,7 @@ export interface PlatformCandidates {
   platform_id: string;
   display: string;
   kind: "im" | "agent";
+  command: string;
   candidates: CliCandidate[];
 }
 
@@ -60,17 +63,12 @@ export default function PlatformCliPicker({
       const result = await invoke<PlatformCandidates[]>("list_cli_platforms", { kind });
       setPlatforms(result);
 
-      // 默认选中第一个**能启动**的候选，用户不需要手输路径。
-      const firstPlatform = result.find((p) =>
-        p.candidates.some((c) => c.launch_mode !== "unsupported"),
-      );
-      if (firstPlatform) {
-        const stillValid = value && firstPlatform.candidates.some((c) => c.path === value.path);
+      // 默认选中第一个「能真正启动」的平台。
+      const usable = result.find((p) => p.candidates[0] && p.candidates[0].path !== "");
+      if (usable) {
+        const stillValid = value && value.platform === usable.platform_id;
         if (!stillValid) {
-          const launchable = firstPlatform.candidates.find(
-            (c) => c.launch_mode !== "unsupported",
-          )!;
-          onChange({ platform: firstPlatform.platform_id, path: launchable.path });
+          onChange({ platform: usable.platform_id, path: usable.candidates[0].path });
         }
       } else {
         onChange(null);
@@ -88,7 +86,9 @@ export default function PlatformCliPicker({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind]);
 
-  const total = platforms.reduce((sum, p) => sum + p.candidates.length, 0);
+  const usableCount = platforms.filter(
+    (p) => p.candidates[0] && p.candidates[0].path !== "",
+  ).length;
 
   return (
     <div style={{ marginBottom: "16px" }}>
@@ -131,112 +131,100 @@ export default function PlatformCliPicker({
           border: "1px solid var(--border)",
           borderRadius: "6px",
           backgroundColor: "var(--bg-input)",
-          maxHeight: "190px",
+          maxHeight: "210px",
           overflow: "auto",
         }}
       >
-        {total === 0 ? (
+        {usableCount === 0 ? (
           <div style={{ padding: "10px 12px", color: "var(--text-muted)", fontSize: "12px" }}>
             {loading
-              ? "正在从全局 PATH 与已知安装位置检测…"
-              : "未检测到可用的 CLI。请先在系统里全局安装（保证 PATH 中可直接执行）后点「重新检测」。"}
+              ? "正在按命令名检测（等价于在终端里敲 `命令 --version`）…"
+              : "未检测到可用 CLI。请在终端里确认对应命令能直接执行（如 `dws version`），然后点「重新检测」。"}
           </div>
         ) : (
-          platforms.map((platform) =>
-            platform.candidates.length === 0 ? null : (
-              <div key={platform.platform_id}>
-                <div
-                  style={{
-                    padding: "6px 12px",
-                    fontSize: "11px",
-                    fontWeight: 600,
-                    color: "var(--text-muted)",
-                    backgroundColor: "var(--bg-sidebar)",
-                    borderBottom: "1px solid var(--border)",
-                  }}
-                >
-                  {platform.display}
-                  <span style={{ fontWeight: 400, marginLeft: "6px" }}>
-                    {platform.platform_id}
-                  </span>
-                </div>
-                {platform.candidates.map((candidate) => {
-                  const selected =
-                    value?.platform === platform.platform_id && value?.path === candidate.path;
-                  const badge = authBadge(candidate.auth_state);
-                  const unusable = candidate.launch_mode === "unsupported";
-                  return (
-                    <label
-                      key={`${platform.platform_id}:${candidate.path}`}
+          platforms.map((platform) => {
+            const candidate = platform.candidates[0];
+            const usable = Boolean(candidate && candidate.path !== "");
+            const selected = value?.platform === platform.platform_id;
+            const badge = authBadge(candidate?.auth_state ?? "unknown");
+
+            return (
+              <label
+                key={platform.platform_id}
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: "8px",
+                  padding: "8px 12px",
+                  cursor: usable ? "pointer" : "not-allowed",
+                  borderBottom: "1px solid var(--border)",
+                  backgroundColor: selected ? "var(--bg-active)" : "transparent",
+                  opacity: usable ? 1 : 0.55,
+                }}
+              >
+                <input
+                  type="radio"
+                  name={`cli-${kind}`}
+                  checked={selected}
+                  disabled={!usable}
+                  onChange={() =>
+                    onChange({ platform: platform.platform_id, path: candidate.path })
+                  }
+                  style={{ marginTop: "3px", accentColor: "var(--accent)" }}
+                />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", gap: "8px", alignItems: "baseline", flexWrap: "wrap" }}>
+                    <span style={{ fontSize: "13px", color: "var(--text-primary)" }}>
+                      {platform.display}
+                    </span>
+                    <span
                       style={{
-                        display: "flex",
-                        alignItems: "flex-start",
-                        gap: "8px",
-                        padding: "8px 12px",
-                        cursor: unusable ? "not-allowed" : "pointer",
-                        borderBottom: "1px solid var(--border)",
-                        backgroundColor: selected ? "var(--bg-active)" : "transparent",
-                        opacity: unusable ? 0.6 : 1,
+                        fontFamily: "ui-monospace, Consolas, monospace",
+                        fontSize: "11px",
+                        color: "var(--text-secondary)",
                       }}
                     >
-                      <input
-                        type="radio"
-                        name={`cli-${kind}`}
-                        checked={selected}
-                        disabled={unusable}
-                        onChange={() =>
-                          onChange({ platform: platform.platform_id, path: candidate.path })
-                        }
-                        style={{ marginTop: "3px", accentColor: "var(--accent)" }}
-                      />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div
-                          style={{
-                            fontSize: "12px",
-                            color: "var(--text-primary)",
-                            wordBreak: "break-all",
-                            fontFamily: "ui-monospace, Consolas, monospace",
-                          }}
-                        >
-                          {candidate.path}
-                        </div>
-                        <div
-                          style={{
-                            display: "flex",
-                            flexWrap: "wrap",
-                            gap: "8px",
-                            marginTop: "4px",
-                            fontSize: "11px",
-                          }}
-                        >
-                          <span style={{ color: "var(--text-muted)" }}>{candidate.source}</span>
-                          {candidate.version && (
-                            <span style={{ color: "var(--text-secondary)" }}>
-                              {candidate.version}
-                            </span>
-                          )}
-                          {candidate.launch_mode === "unsupported" && (
-                            <span style={{ color: "var(--warn)" }}>
-                              本机无法直接启动（.ps1 / 脚本）
-                            </span>
-                          )}
-                          {candidate.launch_mode === "via_cmd" && (
-                            <span style={{ color: "var(--warn)" }}>包装脚本（经 cmd 启动）</span>
-                          )}
-                          {kind === "im" && (
-                            <span style={{ color: badge.color }}>{badge.label}</span>
-                          )}
-                          {!candidate.version && candidate.detail && (
-                            <span style={{ color: "var(--text-muted)" }}>{candidate.detail}</span>
-                          )}
-                        </div>
-                      </div>
-                    </label>
-                  );
-                })}
-              </div>
-            ),
-          )
+                      {platform.command}
+                    </span>
+                    {candidate?.version && (
+                      <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                        {candidate.version}
+                      </span>
+                    )}
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      flexWrap: "wrap",
+                      gap: "8px",
+                      marginTop: "3px",
+                      fontSize: "11px",
+                    }}
+                  >
+                    {kind === "im" && usable && (
+                      <span style={{ color: badge.color }}>{badge.label}</span>
+                    )}
+                    {!usable && (
+                      <span style={{ color: "var(--warn)" }}>
+                        {candidate?.detail ?? "未检测到"}
+                      </span>
+                    )}
+                    {usable && (
+                      <span
+                        style={{
+                          color: "var(--text-muted)",
+                          fontFamily: "ui-monospace, Consolas, monospace",
+                          wordBreak: "break-all",
+                        }}
+                      >
+                        {candidate.path}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </label>
+            );
+          })
         )}
       </div>
 

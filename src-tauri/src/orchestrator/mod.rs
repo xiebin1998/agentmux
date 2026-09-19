@@ -608,11 +608,9 @@ impl Shared {
             }
         }
 
-        if crate::reply::sanitize_reply(&event.content, 4000).is_empty() {
-            self.push_log("正文为空或仅 @，跳过回复").await;
-            self.finish_reply(&event, "skipped", None).await;
-            return;
-        }
+        // 注意：正文剥离 @ 后为空（对方只 @ 了一下）**不跳过**，
+        // 由 reply::build_prompt 用占位问句交给 Agent 自然回应。
+        // 之前在这里直接 skip，用户看到的就是「收到消息但没回复」。
 
         let Some(agent_cli) = reply.agent_cli_path.clone() else {
             self.finish_reply(&event, "failed", Some("未解析到 Agent CLI，无法生成回复"))

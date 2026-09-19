@@ -161,8 +161,11 @@ pub const PLATFORMS: &[PlatformSpec] = &[
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliCandidate {
+    /// 命令名（用户在终端里敲的那个），如 `dws` / `qodercli`。界面主显示这个。
+    pub name: String,
+    /// 内部用于 spawn 的可执行文件路径；解析不到时为空。
     pub path: String,
-    /// 来源：PATH / known（已知安装位置）。
+    /// 来源：PATH / known（已知安装位置）/ not_found。
     pub source: String,
     /// direct | via_cmd | unsupported —— 见 [`Launch`]。
     pub launch_mode: String,
@@ -176,6 +179,8 @@ pub struct PlatformCandidates {
     pub platform_id: String,
     pub display: String,
     pub kind: CliKind,
+    /// 该平台的启动命令名。
+    pub command: String,
     pub candidates: Vec<CliCandidate>,
 }
 
@@ -287,30 +292,62 @@ fn scan_path(name: &str) -> Vec<String> {
     out
 }
 
-async fn probe_version(path: &str, args: &[&str]) -> Option<String> {
-    let mut command = match launch_kind(path) {
-        Launch::Direct => Command::new(path),
-        Launch::ViaCmd => {
-            let mut c = Command::new("cmd");
-            c.arg("/C").arg(path);
-            c
-        }
-        // 绝不 spawn：`.ps1` 会被文件关联打开，无扩展名脚本也跑不起来。
-        Launch::Unsupported => return None,
+/// 按命令名走 PATH 探测，等价于用户在终端里敲 `<命令> <args>`。
+async fn probe_by_name(name: &str, args: &[&str]) -> Option<String> {
+    if name.trim().is_empty() {
+        return None;
+    }
+
+    let mut command = if cfg!(windows) {
+        // 经 cmd 才能用上 PATH + PATHEXT（`dws` 实际是 `dws.cmd`）
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(name);
+        c
+    } else {
+        Command::new(name)
     };
 
+    command.args(args);
+    run_probe(command).await
+}
+
+async fn probe_auth_by_name(name: &str) -> AuthState {
+    let mut command = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(name);
+        c
+    } else {
+        Command::new(name)
+    };
+
+    command.args(["auth", "status", "-f", "json"]);
+
+    match run_probe_raw(command, 10).await {
+        Some(stdout) => match serde_json::from_str::<serde_json::Value>(&stdout) {
+            Ok(json) => {
+                if json.get("authenticated").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    AuthState::LoggedIn
+                } else {
+                    AuthState::NotLoggedIn
+                }
+            }
+            Err(_) => AuthState::Unknown,
+        },
+        None => AuthState::Unknown,
+    }
+}
+
+async fn run_probe_raw(mut command: Command, timeout_secs: u64) -> Option<String> {
     command
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // 探测可能超时（有些 CLI 会等输入），超时后必须连带杀掉子进程，
-        // 否则会留下孤儿子进程把测试/宿主卡住。
+        // 超时必须连带杀掉子进程，否则会留下孤儿子进程把宿主/测试卡住。
         .kill_on_drop(true);
 
     crate::process::hide_console(&mut command);
 
-    let output = tokio::time::timeout(Duration::from_secs(3), command.output())
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), command.output())
         .await
         .ok()?
         .ok()?;
@@ -318,8 +355,12 @@ async fn probe_version(path: &str, args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+async fn run_probe(command: Command) -> Option<String> {
+    let stdout = run_probe_raw(command, 3).await?;
+
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -334,104 +375,100 @@ async fn probe_version(path: &str, args: &[&str]) -> Option<String> {
     None
 }
 
-async fn probe_auth(path: &str) -> AuthState {
-    let mut command = match launch_kind(path) {
-        Launch::Direct => Command::new(path),
-        Launch::ViaCmd => {
-            let mut c = Command::new("cmd");
-            c.arg("/C").arg(path);
-            c
+/// 解析出一个**能直接 spawn** 的路径。
+///
+/// PATH 上按命令名命中的往往是脚本（`.ps1`）或包装脚本（`.cmd`），Windows 下都
+/// 不能不带 shell 直接启动，所以启动这一步仍需要解析到真实可执行文件。
+/// 这一步只服务于「启动」，不暴露给用户。
+fn resolve_spawnable(spec: &PlatformSpec) -> Option<(String, &'static str)> {
+    let mut hits: Vec<(String, &'static str)> = Vec::new();
+
+    for name in spec.commands {
+        for path in scan_path(name) {
+            hits.push((path, "PATH"));
         }
-        Launch::Unsupported => return AuthState::Unknown,
-    };
-
-    command
-        .args(["auth", "status", "-f", "json"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    crate::process::hide_console(&mut command);
-
-    let output = match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
-        Ok(Ok(output)) if output.status.success() => output,
-        _ => return AuthState::Unknown,
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    match serde_json::from_str::<serde_json::Value>(&stdout) {
-        Ok(json) => {
-            if json.get("authenticated").and_then(|v| v.as_bool()).unwrap_or(false) {
-                AuthState::LoggedIn
-            } else {
-                AuthState::NotLoggedIn
-            }
-        }
-        Err(_) => AuthState::Unknown,
     }
+    for path in (spec.fallbacks)() {
+        if Path::new(&path).is_file() {
+            hits.push((path, "known"));
+        }
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    hits.retain(|(path, _)| {
+        let key = normalize(path);
+        if seen.contains(&key) {
+            return false;
+        }
+        seen.push(key);
+        launch_kind(path) != Launch::Unsupported
+    });
+
+    // 可直接启动的优先；同为 direct 时 PATH 命中优先于已知位置。
+    hits.sort_by_key(|(path, source)| {
+        (launch_kind(path).rank(), if *source == "PATH" { 0 } else { 1 })
+    });
+
+    hits.into_iter().next()
 }
 
 pub async fn list_platform(kind: CliKind) -> Vec<PlatformCandidates> {
     let mut result = Vec::new();
 
     for spec in PLATFORMS.iter().filter(|s| s.kind == kind) {
-        let mut seen: Vec<String> = Vec::new();
-        let mut candidates: Vec<CliCandidate> = Vec::new();
+        // 用户在终端里敲的就是命令名；检测也按命令名走 PATH，不暴露目录。
+        let command = spec
+            .commands
+            .first()
+            .map(|c| c.trim_end_matches(".exe").to_string())
+            .unwrap_or_default();
 
-        let mut push = |path: String, source: &str| {
-            let key = normalize(&path);
-            if seen.iter().any(|s| s == &key) {
-                return;
-            }
-            seen.push(key);
-            let launch_mode = launch_kind(&path).as_str().to_string();
-            candidates.push(CliCandidate {
-                path,
-                source: source.to_string(),
-                launch_mode,
-                version: None,
-                auth_state: AuthState::Unknown,
-                detail: None,
-            });
+        let version = probe_by_name(&command, spec.version_args).await;
+        let auth_state = if spec.id == "dingtalk" {
+            probe_auth_by_name(&command).await
+        } else {
+            AuthState::Unknown
         };
 
-        for name in spec.commands {
-            for path in scan_path(name) {
-                push(path, "PATH");
-            }
-        }
-        for path in (spec.fallbacks)() {
-            if Path::new(&path).is_file() {
-                push(path, "known");
-            }
-        }
+        let spawnable = resolve_spawnable(spec);
 
-        // 能直接启动的优先，其次是 .cmd，无法启动的排最后。
-        candidates.sort_by_key(|c| launch_kind(&c.path).rank());
+        let (path, source, launch_mode) = match spawnable {
+            Some((path, source)) => {
+                let mode = launch_kind(&path).as_str().to_string();
+                (path, source.to_string(), mode)
+            }
+            None => (
+                String::new(),
+                "not_found".to_string(),
+                Launch::Unsupported.as_str().to_string(),
+            ),
+        };
 
-        for candidate in candidates.iter_mut() {
-            candidate.version = probe_version(&candidate.path, spec.version_args).await;
-            if candidate.version.is_none() {
-                candidate.detail = Some(
-                    match launch_kind(&candidate.path) {
-                        Launch::Unsupported => {
-                            "本机无法直接启动（.ps1 / 无扩展名脚本），未探测".to_string()
-                        }
-                        _ => "无法获取版本（可能不可执行）".to_string(),
-                    },
-                );
-            }
-            if spec.id == "dingtalk" {
-                candidate.auth_state = probe_auth(&candidate.path).await;
-            }
-        }
+        let detail = if version.is_some() {
+            None
+        } else if path.is_empty() {
+            Some(format!("未在 PATH 中找到 `{}`", command))
+        } else {
+            Some(format!(
+                "`{}` 未能返回版本，但已解析到可启动文件",
+                command
+            ))
+        };
 
         result.push(PlatformCandidates {
             platform_id: spec.id.to_string(),
             display: spec.display.to_string(),
             kind: spec.kind,
-            candidates,
+            command: command.clone(),
+            candidates: vec![CliCandidate {
+                name: command,
+                path,
+                source,
+                launch_mode,
+                version,
+                auth_state,
+                detail,
+            }],
         });
     }
 
@@ -480,12 +517,14 @@ mod tests {
         );
 
         let best = &dingtalk.candidates[0];
+        assert_eq!(dingtalk.command, "dws", "钉钉平台的启动命令名应为 dws");
+        assert_eq!(best.name, "dws", "候选对外以命令名标识");
         assert_eq!(
             best.launch_mode, "direct",
-            "首选候选应可直接启动，实际选中的是 {}",
+            "内部解析出的启动文件应可直接执行，实际是 {}",
             best.path
         );
-        assert!(best.version.is_some(), "首选候选应能取到版本号");
+        assert!(best.version.is_some(), "`dws version` 应能取到版本号");
         assert_eq!(
             best.auth_state,
             AuthState::LoggedIn,
@@ -503,34 +542,52 @@ mod tests {
         assert_eq!(launch_kind(r"C:\x\bin\dws"), Launch::Unsupported);
     }
 
-    /// 回归：曾经对所有候选都跑 `cmd /C <path> --version`，导致 `.ps1`
-    /// 被文件关联打开、弹出编辑器。这类候选必须完全不 spawn。
+    /// 回归：曾经对所有 PATH 命中都跑 `cmd /C <path> --version`，导致 `.ps1`
+    /// 被文件关联打开、弹出编辑器。现在只保留**能启动**的候选，脚本类不再进入列表。
     #[tokio::test]
-    async fn script_wrappers_are_never_probed() {
+    async fn candidates_never_include_unlaunchable_scripts() {
         for kind in [CliKind::Im, CliKind::Agent] {
             for platform in list_platform(kind).await {
+                assert!(
+                    !platform.command.is_empty(),
+                    "{} 应带启动命令名",
+                    platform.platform_id
+                );
                 for candidate in platform.candidates {
-                    if launch_kind(&candidate.path) != Launch::Unsupported {
-                        continue;
-                    }
+                    assert_eq!(candidate.name, platform.command);
                     assert!(
-                        candidate.version.is_none(),
-                        "不应探测无法启动的候选: {}",
+                        !candidate.path.to_ascii_lowercase().ends_with(".ps1"),
+                        "绝不应把 .ps1 当作可启动候选: {}",
                         candidate.path
                     );
-                    assert_eq!(candidate.auth_state, AuthState::Unknown);
-                    assert!(
-                        candidate
-                            .detail
-                            .as_deref()
-                            .unwrap_or_default()
-                            .contains("无法直接启动"),
-                        "应如实说明未探测的原因: {:?}",
-                        candidate.detail
+                    if candidate.path.is_empty() {
+                        continue;
+                    }
+                    assert_ne!(
+                        launch_kind(&candidate.path),
+                        Launch::Unsupported,
+                        "只应保留能直接启动的候选: {}",
+                        candidate.path
                     );
                 }
             }
         }
+    }
+
+    /// 检测按命令名走 PATH（等价于终端里敲 `qodercli --version`），不暴露目录。
+    #[tokio::test]
+    async fn detection_is_command_name_based() {
+        let agents = list_platform(CliKind::Agent).await;
+        let qoder = agents
+            .iter()
+            .find(|p| p.platform_id == "qoder")
+            .expect("Qoder 平台应在注册表里");
+        assert_eq!(qoder.command, "qodercli");
+        assert_eq!(qoder.candidates[0].name, "qodercli");
+        assert!(
+            qoder.candidates[0].version.is_some(),
+            "`qodercli --version` 应能取到版本"
+        );
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 interface CliCandidate {
+  name: string;
   path: string;
   source: string;
   launch_mode: "direct" | "via_cmd" | "unsupported";
@@ -14,6 +15,7 @@ interface PlatformCandidates {
   platform_id: string;
   display: string;
   kind: "im" | "agent";
+  command: string;
   candidates: CliCandidate[];
 }
 
@@ -250,30 +252,31 @@ function PlatformCard({
         </div>
       ) : (
         <div style={{ marginTop: "8px" }}>
+          <div style={{ fontSize: "12px", color: "var(--text-primary)" }}>
+            命令{" "}
+            <span style={{ fontFamily: "ui-monospace, Consolas, monospace" }}>
+              {best?.name ?? platform.command}
+            </span>
+            {" · 版本 "}
+            {best?.version ?? "未知（不显示推测值）"}
+          </div>
           <div
             style={{
               fontFamily: "ui-monospace, Consolas, monospace",
               fontSize: "11px",
-              color: "var(--text-primary)",
+              color: "var(--text-muted)",
+              marginTop: "4px",
               wordBreak: "break-all",
             }}
           >
-            {best.path}
+            启动文件：{best?.path || "未解析到"}
           </div>
-          <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "4px" }}>
-            版本：{best.version ?? "未知（不显示推测值）"} · 来源：{best.source} · 候选{" "}
-            {platform.candidates.length} 个
-            {best.launch_mode === "via_cmd" && (
-              <span style={{ color: "var(--warn)" }}> · 首选是包装脚本（经 cmd 启动）</span>
-            )}
-            {best.launch_mode === "unsupported" && (
-              <span style={{ color: "var(--warn)" }}>
-                {" "}
-                · 首选本机无法直接启动（.ps1 / 脚本），请装 CLI 的 .exe 版本
-              </span>
-            )}
-          </div>
-          {best.detail && (
+          {best?.launch_mode === "via_cmd" && (
+            <div style={{ fontSize: "11px", color: "var(--warn)", marginTop: "4px" }}>
+              该命令是包装脚本，启动时经 cmd 转发
+            </div>
+          )}
+          {best?.detail && (
             <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginTop: "4px" }}>
               {best.detail}
             </div>

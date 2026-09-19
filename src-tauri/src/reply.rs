@@ -98,6 +98,13 @@ pub fn sanitize_reply(raw: &str, max_chars: usize) -> String {
     flattened.chars().take(max_chars).collect()
 }
 
+/// 剥离 @ 之后正文为空时的占位问句。
+///
+/// 对方只 @ 了一下、没写具体内容时，**不要直接跳过**：用户看到的是「收到消息但
+/// 没回复」。交给 Agent 自然回应更符合预期。
+pub const EMPTY_MENTION_PLACEHOLDER: &str =
+    "（对方只是 @ 了我，没有写具体内容；请自然打个招呼，并询问需要什么帮助）";
+
 pub fn build_prompt(content: &str, context_lines: &[String], context_enabled: bool) -> String {
     build_prompt_with_summary(content, None, context_lines, context_enabled)
 }
@@ -109,7 +116,12 @@ pub fn build_prompt_with_summary(
     context_lines: &[String],
     context_enabled: bool,
 ) -> String {
-    let question = sanitize_reply(content, 4000);
+    let stripped = sanitize_reply(content, 4000);
+    let question = if stripped.is_empty() {
+        EMPTY_MENTION_PLACEHOLDER.to_string()
+    } else {
+        stripped
+    };
 
     let mut blocks: Vec<String> = Vec::new();
     if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
@@ -358,6 +370,18 @@ mod tests {
     fn prompt_omits_context_when_disabled() {
         let prompt = build_prompt("@我 你好", &["甲: 旧消息".to_string()], false);
         assert_eq!(prompt, "你好");
+    }
+
+    #[test]
+    fn bare_mention_gets_a_placeholder_instead_of_an_empty_question() {
+        // 回归：裸 @ 曾经被上层直接跳过，导致「收到消息但没回复」
+        let prompt = build_prompt("@谢斌 ", &[], false);
+        assert!(!prompt.trim().is_empty(), "裸 @ 不应产生空 prompt");
+        assert!(
+            prompt.contains("只是 @ 了我"),
+            "应使用占位说明，实际: {}",
+            prompt
+        );
     }
 
     #[test]
