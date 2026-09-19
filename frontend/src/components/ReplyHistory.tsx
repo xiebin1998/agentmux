@@ -207,6 +207,23 @@ export default function ReplyHistory() {
                     </div>
                   )}
 
+                  {/* 跳过的原因要显示出来，否则用户只看到「已跳过」，
+                      查不出「为什么收到了却没有回复」 */}
+                  {event.reply_status === "skipped" && event.reply_text && (
+                    <div
+                      style={{
+                        marginTop: "4px",
+                        fontSize: "11px",
+                        color: "var(--text-muted)",
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      <span>跳过原因：</span>
+                      {event.reply_text}
+                    </div>
+                  )}
+
                   {/* A5.3.2：失败原因保留原文，不做美化 */}
                   {event.reply_status === "failed" && (
                     <div

@@ -317,6 +317,10 @@ pub async fn set_im_identity(platform_id: String, identity: Option<String>) -> R
 
 /// 把 settings.json 快照成回复引擎需要的配置。
 /// Agent 工作目录留空时回退到程序配置目录下的专用子目录，而不是宿主任意目录。
+///
+/// **仅供手工实测的测试用**：真实链路走 `reply_settings_for_project`（按项目取），
+/// 这里的 `enabled` 读的是全局字段，与项目级开关无关。
+#[cfg(test)]
 pub fn reply_settings() -> crate::reply::ReplySettings {
     let config = load_config().unwrap_or_default();
 

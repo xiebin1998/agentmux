@@ -580,6 +580,16 @@ impl Shared {
             let shared = self.clone();
             let event = event.clone();
             tokio::spawn(async move { shared.process_reply(event).await });
+        } else {
+            // 项目没开自动回复时，此前什么都不写，界面只看到「收到消息但没回复」
+            // 却查不到原因（用户实际反馈过）。把原因记进台账，让它可见。
+            let shared = self.clone();
+            let event = event.clone();
+            tokio::spawn(async move {
+                shared
+                    .finish_reply(&event, "skipped", Some("该项目未启用自动回复"))
+                    .await
+            });
         }
     }
 
@@ -757,7 +767,17 @@ impl Shared {
                 ))
                 .await
             }
-            "skipped" => {}
+            "skipped" => {
+                // 有原因才写日志：绝大多数跳过是正常的「自己发的消息」，
+                // 全记会淹掉监听日志。带原因的跳过要留痕，否则查不出为什么没回复。
+                if let Some(reason) = text {
+                    self.push_log(&format!(
+                        "跳过回复 message_id={} 原因={}",
+                        event.message_id, reason
+                    ))
+                    .await
+                }
+            }
             _ => {}
         }
     }

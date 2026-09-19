@@ -293,6 +293,12 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
               启用自动回复
             </label>
 
+            {!replyEnabled && (
+              <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "10px" }}>
+                未勾选时只记录不回复：消息照常收下并落盘，但不会驱动 Agent 生成回复。
+              </div>
+            )}
+
             <div style={{ display: "flex", gap: "16px", marginBottom: "10px" }}>
               <div style={{ flex: 1 }}>
                 <label style={fieldLabel}>生成超时</label>
