@@ -258,11 +258,6 @@ pub fn launch_kind(path: &str) -> Launch {
     }
 }
 
-/// 非「可直接启动」的都算包装脚本，界面上要如实标注。
-pub fn is_wrapper_path(path: &str) -> bool {
-    launch_kind(path) != Launch::Direct
-}
-
 fn normalize(path: &str) -> String {
     path.replace('\\', "/").to_ascii_lowercase()
 }
@@ -506,10 +501,6 @@ mod tests {
         // 这两类用 cmd /C 会被文件关联"打开"，绝不能当可执行文件对待
         assert_eq!(launch_kind(r"C:\x\claude.ps1"), Launch::Unsupported);
         assert_eq!(launch_kind(r"C:\x\bin\dws"), Launch::Unsupported);
-
-        assert!(!is_wrapper_path(r"C:\x\dws.exe"));
-        assert!(is_wrapper_path(r"C:\x\claude.cmd"));
-        assert!(is_wrapper_path(r"C:\x\claude.ps1"));
     }
 
     /// 回归：曾经对所有候选都跑 `cmd /C <path> --version`，导致 `.ps1`
