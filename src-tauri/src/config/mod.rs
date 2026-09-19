@@ -211,3 +211,61 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
         compress_trigger_chars: global.compress_trigger_chars,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::Project;
+
+    fn sample_project(work_dir: &str) -> Project {
+        Project::new(
+            "示例项目".to_string(),
+            work_dir.to_string(),
+            r"C:\tools\qodercli\qodercli.exe".to_string(),
+            r"C:\tools\dws\dws.exe".to_string(),
+            "dingtalk".to_string(),
+            "qoder".to_string(),
+        )
+    }
+
+    /// 回归（问题 5）：驱动 Agent CLI 必须用**创建项目时指定的工作目录**，
+    /// 不能被全局的 agent_cwd 顶替。
+    #[test]
+    fn project_settings_use_the_projects_work_dir() {
+        let project = sample_project(r"D:\work\my-project");
+        let settings = reply_settings_for_project(&project);
+
+        assert_eq!(
+            settings.agent_cwd, r"D:\work\my-project",
+            "Agent 工作目录必须来自项目的 work_dir"
+        );
+        assert_eq!(
+            settings.agent_cli_path.as_deref(),
+            Some(r"C:\tools\qodercli\qodercli.exe")
+        );
+        assert_eq!(settings.agent_platform, "qoder");
+        assert_eq!(settings.enabled, project.reply_enabled);
+        assert_eq!(settings.max_chars, project.reply_max_chars);
+        assert_eq!(settings.timeout_ms, project.reply_timeout_ms);
+    }
+
+    /// 两个不同项目解析出的工作目录必须各自独立。
+    #[test]
+    fn different_projects_resolve_to_their_own_work_dirs() {
+        let a = reply_settings_for_project(&sample_project(r"D:\work\a"));
+        let b = reply_settings_for_project(&sample_project(r"D:\work\b"));
+        assert_eq!(a.agent_cwd, r"D:\work\a");
+        assert_eq!(b.agent_cwd, r"D:\work\b");
+    }
+
+    /// 身份是用户级信息，仍取全局，不随项目变化。
+    #[test]
+    fn identity_still_comes_from_global_settings() {
+        let settings = reply_settings_for_project(&sample_project(r"D:\work\a"));
+        let global = load_config().unwrap_or_default();
+        assert_eq!(
+            settings.self_open_dingtalk_id, global.self_open_dingtalk_id,
+            "自身身份应取自全局设置"
+        );
+    }
+}
