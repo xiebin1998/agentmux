@@ -28,11 +28,17 @@ interface ListenerStatus {
 }
 
 interface EventRow {
+  project_id: string;
   message_id: string;
   received_at: string;
   malformed: boolean;
   reply_status: string | null;
   sender: string;
+}
+
+interface ProjectOption {
+  id: string;
+  name: string;
 }
 
 const ANOMALY_LIMIT = 200;
@@ -80,20 +86,35 @@ function stateText(status: ListenerStatus | undefined) {
   );
 }
 
-export default function OverviewView() {
+export default function OverviewView({ projects }: { projects: ProjectOption[] }) {
   const [stats, setStats] = useState<Stats | null>(null);
   const [listeners, setListeners] = useState<ListenerStatus[]>([]);
   const [anomalies, setAnomalies] = useState<EventRow[]>([]);
+  const [statsProjectId, setStatsProjectId] = useState("");
 
   const { platforms, loading, error, checkedAt, refresh } = useProviders();
 
+  const projectName = useCallback(
+    (id: string) => projects.find((project) => project.id === id)?.name ?? (id || "未归类"),
+    [projects],
+  );
+
   const loadRuntime = useCallback(async () => {
     try {
+      const scope = statsProjectId || null;
       const [nextStats, nextListeners, malformed, failed] = await Promise.all([
-        invoke<Stats>("get_stats"),
+        invoke<Stats>("get_stats", { projectId: scope }),
         invoke<ListenerStatus[]>("listener_status"),
-        invoke<EventRow[]>("list_events", { limit: ANOMALY_LIMIT, malformedOnly: true }),
-        invoke<EventRow[]>("list_events", { limit: ANOMALY_LIMIT, failedOnly: true }),
+        invoke<EventRow[]>("list_events", {
+          limit: ANOMALY_LIMIT,
+          malformedOnly: true,
+          projectId: scope,
+        }),
+        invoke<EventRow[]>("list_events", {
+          limit: ANOMALY_LIMIT,
+          failedOnly: true,
+          projectId: scope,
+        }),
       ]);
       setStats(nextStats);
       setListeners(nextListeners);
@@ -101,7 +122,7 @@ export default function OverviewView() {
     } catch (e) {
       console.error("Failed to load overview:", e);
     }
-  }, []);
+  }, [statsProjectId]);
 
   useEffect(() => {
     loadRuntime();
@@ -189,6 +210,9 @@ export default function OverviewView() {
                 flexWrap: "wrap",
               }}
             >
+              <span style={{ color: "var(--text-primary)", minWidth: "100px" }}>
+                {projectName(listener.project_id)}
+              </span>
               <span style={{ color: "var(--text-secondary)", minWidth: "70px" }}>
                 {listener.kind}
               </span>
@@ -206,7 +230,21 @@ export default function OverviewView() {
       </div>
 
       <div style={sectionStyle}>
-        <div style={sectionTitle}>事件与回复统计</div>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: "10px" }}>
+          <span style={{ ...sectionTitle, marginBottom: 0 }}>事件与回复统计</span>
+          <select
+            value={statsProjectId}
+            onChange={(e) => setStatsProjectId(e.target.value)}
+            style={{ marginLeft: "10px", padding: "2px 8px", fontSize: "12px" }}
+          >
+            <option value="">全部项目</option>
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))}
+          </select>
+        </div>
         <div style={{ display: "flex", gap: "24px", flexWrap: "wrap" }}>
           <Metric label="累计事件" value={stats?.total_events ?? 0} />
           <Metric label="已处理" value={stats?.processed_events ?? 0} />
@@ -216,7 +254,9 @@ export default function OverviewView() {
           <Metric label="会话数" value={stats?.conversations ?? 0} />
         </div>
         <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "10px" }}>
-          统计口径含全部已落盘事件；回复结果单独计数，不并入已处理。
+          {statsProjectId
+            ? `只统计「${projectName(statsProjectId)}」的已落盘事件。`
+            : "统计口径含全部已落盘事件；回复结果单独计数，不并入已处理。"}
         </div>
       </div>
 
@@ -237,6 +277,7 @@ export default function OverviewView() {
                 <span style={{ color: event.malformed ? "var(--warn)" : "var(--danger)" }}>
                   {event.malformed ? "畸形" : "回复失败"}
                 </span>{" "}
+                {projectName(event.project_id)} ·{" "}
                 {new Date(event.received_at).toLocaleString()} · {event.sender || "(未知发送人)"}
               </div>
             ))}

@@ -5,6 +5,7 @@ type ListenerState = "stopped" | "starting" | "running" | "backing_off" | "aband
 
 interface ListenerStatus {
   id: string;
+  project_id: string;
   kind: string;
   state: ListenerState;
   ready: boolean;
@@ -14,6 +15,17 @@ interface ListenerStatus {
   last_error: string | null;
   cli_path: string | null;
   dropped_before_ready: number;
+}
+
+interface LogLine {
+  project_id: string;
+  kind: string;
+  line: string;
+}
+
+interface ProjectOption {
+  id: string;
+  name: string;
 }
 
 const STATE_TEXT: Record<ListenerState, string> = {
@@ -34,16 +46,17 @@ const STATE_COLOR: Record<ListenerState, string> = {
 
 const BACKOFF = "5s / 10s / 20s / 40s / 60s（连续失败 5 次后放弃）";
 
-export default function ListenerLogs() {
-  const [logs, setLogs] = useState<string[]>([]);
+export default function ListenerLogs({ projects }: { projects: ProjectOption[] }) {
+  const [logs, setLogs] = useState<LogLine[]>([]);
   const [statuses, setStatuses] = useState<ListenerStatus[]>([]);
+  const [projectId, setProjectId] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(async () => {
     try {
       const [nextLogs, nextStatuses] = await Promise.all([
-        invoke<string[]>("listener_logs", { limit: 1000 }),
+        invoke<LogLine[]>("listener_logs", { limit: 1000 }),
         invoke<ListenerStatus[]>("listener_status"),
       ]);
       setLogs(nextLogs);
@@ -64,7 +77,7 @@ export default function ListenerLogs() {
   }, [logs.length, autoScroll]);
 
   const handleClear = async () => {
-    if (!confirm("清空监听日志缓冲？（已落盘的事件不受影响）")) return;
+    if (!confirm("清空监听日志缓冲？（全部项目共用同一缓冲，已落盘的事件不受影响）")) return;
     try {
       await invoke("clear_listener_logs");
       await load();
@@ -73,7 +86,16 @@ export default function ListenerLogs() {
     }
   };
 
-  const droppedTotal = statuses.reduce((sum, s) => sum + s.dropped_before_ready, 0);
+  const projectName = (id: string) =>
+    projects.find((project) => project.id === id)?.name ?? (id || "全局");
+
+  const shownStatuses = projectId
+    ? statuses.filter((status) => status.project_id === projectId)
+    : statuses;
+  const shownLogs = projectId ? logs.filter((entry) => entry.project_id === projectId) : logs;
+
+  const droppedTotal = shownStatuses.reduce((sum, s) => sum + s.dropped_before_ready, 0);
+  const backingOff = shownStatuses.some((s) => s.state === "backing_off");
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -91,10 +113,22 @@ export default function ListenerLogs() {
         <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary)" }}>
           监听日志
         </span>
-        {statuses.length === 0 && (
+        <select
+          value={projectId}
+          onChange={(e) => setProjectId(e.target.value)}
+          style={{ padding: "4px 8px", fontSize: "12px" }}
+        >
+          <option value="">全部项目</option>
+          {projects.map((project) => (
+            <option key={project.id} value={project.id}>
+              {project.name}
+            </option>
+          ))}
+        </select>
+        {shownStatuses.length === 0 && (
           <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>当前没有监听实例</span>
         )}
-        {statuses.map((status) => (
+        {shownStatuses.map((status) => (
           <span
             key={status.id}
             style={{
@@ -106,13 +140,11 @@ export default function ListenerLogs() {
             }}
             title={status.last_error ?? undefined}
           >
-            {status.kind}: {STATE_TEXT[status.state]}
+            {projectName(status.project_id)} · {status.kind}: {STATE_TEXT[status.state]}
             {status.subscribe_id ? ` · ${status.subscribe_id.slice(0, 12)}…` : ""}
           </span>
         ))}
-        <label
-          style={{ marginLeft: "auto", fontSize: "12px", color: "var(--text-secondary)" }}
-        >
+        <label style={{ marginLeft: "auto", fontSize: "12px", color: "var(--text-secondary)" }}>
           <input
             type="checkbox"
             checked={autoScroll}
@@ -137,8 +169,8 @@ export default function ListenerLogs() {
         </button>
       </div>
 
-      {/* A3.2.3：恢复期可能丢消息，必须明示而不是装作没发生 */}
-      {(droppedTotal > 0 || statuses.some((s) => s.state === "backing_off")) && (
+      {/* 恢复期可能丢消息，必须明示而不是装作没发生 */}
+      {(droppedTotal > 0 || backingOff) && (
         <div
           style={{
             padding: "6px 16px",
@@ -163,25 +195,28 @@ export default function ListenerLogs() {
           backgroundColor: "var(--bg-app)",
         }}
       >
-        {logs.length === 0 ? (
+        {shownLogs.length === 0 ? (
           <div style={{ color: "var(--text-muted)" }}>
             暂无日志。启动监听后，dws 的 stderr / 运行事件会实时出现在这里。
           </div>
         ) : (
-          logs.map((line, index) => (
+          shownLogs.map((entry, index) => (
             <div
               key={index}
               style={{
-                color: line.includes("失败") || line.includes("错误")
+                color: entry.line.includes("失败") || entry.line.includes("错误")
                   ? "var(--danger)"
-                  : line.includes("ready")
+                  : entry.line.includes("ready")
                     ? "var(--success)"
                     : "var(--text-secondary)",
                 whiteSpace: "pre-wrap",
                 wordBreak: "break-word",
               }}
             >
-              {line}
+              {!projectId && (
+                <span style={{ color: "var(--text-muted)" }}>[{projectName(entry.project_id)}] </span>
+              )}
+              {entry.line}
             </div>
           ))
         )}

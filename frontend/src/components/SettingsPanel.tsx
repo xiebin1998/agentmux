@@ -15,8 +15,6 @@ interface AppConfig {
   agent_platform: string;
   im_cli_path: string | null;
   agent_cli_path: string | null;
-  im_identities?: Record<string, string>;
-  self_open_dingtalk_id?: string | null;
   agent_cwd: string | null;
   agent_args: string[] | null;
   reply_enabled: boolean;
@@ -225,7 +223,8 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
           <Row k="实际使用的 IM CLI" v={runtime?.im_cli_path ?? "未解析到"} />
           <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "8px" }}>
             回复开关、工作目录、超时、字数、上下文预算在项目的「编辑」里改；
-            <strong>改完需重启该项目的监听才生效</strong>。自身身份在「提供方检测」页按 IM 平台设置。
+            <strong>改完需重启该项目的监听才生效</strong>。自身身份用于跳过自己发的消息，
+            由配置文件提供，界面不提供修改入口。
           </div>
         </div>
       ) : (

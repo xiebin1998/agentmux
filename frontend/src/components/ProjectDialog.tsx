@@ -2,22 +2,7 @@ import { useEffect, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import PlatformCliPicker, { type CliSelection } from "./PlatformCliPicker";
-
-interface Project {
-  id: string;
-  name: string;
-  work_dir: string;
-  agent_cli_path: string;
-  dingtalk_cli_path: string;
-  im_platform: string;
-  agent_platform: string;
-  reply_enabled: boolean;
-  reply_timeout_ms: number;
-  reply_max_chars: number;
-  context_enabled: boolean;
-  context_message_limit: number;
-  context_max_chars: number;
-}
+import type { NamedId, Project, SourceCandidates } from "../types";
 
 interface ProjectDialogProps {
   project: Project | null;
@@ -51,7 +36,30 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
   const [contextEnabled, setContextEnabled] = useState(true);
   const [contextLimit, setContextLimit] = useState(50);
   const [contextMaxChars, setContextMaxChars] = useState(8000);
+  const [groupIds, setGroupIds] = useState<string[]>([]);
+  const [memberIds, setMemberIds] = useState<string[]>([]);
+  const [candidates, setCandidates] = useState<SourceCandidates>({ groups: [], people: [] });
+  const [loadingCandidates, setLoadingCandidates] = useState(false);
   const [saving, setSaving] = useState(false);
+
+  const loadCandidates = async (refreshMeta: boolean) => {
+    setLoadingCandidates(true);
+    try {
+      if (refreshMeta) {
+        // 先拉一次会话名/类型，候选列表才有群名可显示（会真起一次 dws，是显式动作）。
+        await invoke("refresh_conversation_meta").catch(() => {});
+      }
+      setCandidates(await invoke<SourceCandidates>("list_source_candidates"));
+    } catch (e) {
+      console.error("Failed to load source candidates:", e);
+    } finally {
+      setLoadingCandidates(false);
+    }
+  };
+
+  useEffect(() => {
+    loadCandidates(false);
+  }, []);
 
   useEffect(() => {
     if (!project) {
@@ -65,6 +73,8 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
     setContextEnabled(project.context_enabled);
     setContextLimit(project.context_message_limit);
     setContextMaxChars(project.context_max_chars);
+    setGroupIds(project.group_ids ?? []);
+    setMemberIds(project.member_ids ?? []);
     if (project.dingtalk_cli_path) {
       setImSelection({ platform: project.im_platform || "dingtalk", path: project.dingtalk_cli_path });
     }
@@ -98,6 +108,8 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
         contextEnabled,
         contextMessageLimit: contextLimit,
         contextMaxChars,
+        groupIds,
+        memberIds,
       };
 
       if (project) {
@@ -116,6 +128,8 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
             context_enabled: payload.contextEnabled,
             context_message_limit: payload.contextMessageLimit,
             context_max_chars: payload.contextMaxChars,
+            group_ids: payload.groupIds,
+            member_ids: payload.memberIds,
           },
         });
       } else {
@@ -268,6 +282,75 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
                 fontSize: "11px",
                 fontWeight: 600,
                 color: "var(--text-muted)",
+                marginBottom: "6px",
+                textTransform: "uppercase",
+              }}
+            >
+              监听范围
+            </div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "10px" }}>
+              都不选 = 监听<strong>所有群、所有人</strong>。选了之后只处理命中的消息：命中「指定的群」
+              <strong>或</strong>「指定的人」其一即可，其余消息在落盘前就被丢弃
+              （可在「监听日志」里看到丢弃记录）。候选来自本机已有的会话与历史发送人。
+            </div>
+
+            <div style={{ display: "flex", gap: "16px", alignItems: "flex-start" }}>
+              <IdPicker
+                title="指定群"
+                options={candidates.groups}
+                selected={groupIds}
+                loading={loadingCandidates}
+                placeholder="也可手输群会话 id"
+                onChange={setGroupIds}
+              />
+              <IdPicker
+                title="指定人"
+                options={candidates.people}
+                selected={memberIds}
+                loading={loadingCandidates}
+                placeholder="也可手输 open id"
+                onChange={setMemberIds}
+              />
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", marginTop: "8px" }}>
+              <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                已选：{groupIds.length} 个群 / {memberIds.length} 个人
+              </span>
+              <button
+                type="button"
+                onClick={() => loadCandidates(true)}
+                disabled={loadingCandidates}
+                style={{
+                  marginLeft: "auto",
+                  padding: "2px 10px",
+                  fontSize: "11px",
+                  backgroundColor: "transparent",
+                  color: "var(--text-secondary)",
+                  border: "1px solid var(--border)",
+                  borderRadius: "4px",
+                  cursor: loadingCandidates ? "not-allowed" : "pointer",
+                }}
+              >
+                {loadingCandidates ? "刷新中…" : "刷新候选（拉一次会话名）"}
+              </button>
+            </div>
+          </div>
+
+          <div
+            style={{
+              marginTop: "4px",
+              marginBottom: "16px",
+              padding: "12px",
+              border: "1px solid var(--border)",
+              borderRadius: "6px",
+            }}
+          >
+            <div
+              style={{
+                fontSize: "11px",
+                fontWeight: 600,
+                color: "var(--text-muted)",
                 marginBottom: "10px",
                 textTransform: "uppercase",
               }}
@@ -402,6 +485,151 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
             </button>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 「指定群 / 指定人」的选择器：候选勾选 + 手输 id 兜底。
+ * 手输是必要的：首次使用还没有任何会话记录时，候选是空的。
+ */
+function IdPicker({
+  title,
+  options,
+  selected,
+  loading,
+  placeholder,
+  onChange,
+}: {
+  title: string;
+  options: NamedId[];
+  selected: string[];
+  loading: boolean;
+  placeholder: string;
+  onChange: (next: string[]) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const has = (id: string) => selected.includes(id);
+
+  const toggle = (id: string) =>
+    onChange(has(id) ? selected.filter((item) => item !== id) : [...selected, id]);
+
+  const add = () => {
+    const id = draft.trim();
+    if (!id) return;
+    if (!has(id)) onChange([...selected, id]);
+    setDraft("");
+  };
+
+  // 已选但不在候选里的（手输的、或候选刷新后消失的）也要显示，否则删不掉。
+  const extras = selected.filter((id) => !options.some((option) => option.id === id));
+
+  const idStyle: CSSProperties = {
+    color: "var(--text-muted)",
+    fontFamily: "ui-monospace, Consolas, monospace",
+    fontSize: "10px",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  };
+
+  return (
+    <div style={{ flex: 1, minWidth: 0 }}>
+      <label style={fieldLabel}>{title}</label>
+      <div
+        style={{
+          maxHeight: "120px",
+          overflow: "auto",
+          border: "1px solid var(--border)",
+          borderRadius: "4px",
+          padding: "6px 8px",
+          backgroundColor: "var(--bg-app)",
+        }}
+      >
+        {loading && options.length === 0 && (
+          <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>加载中…</div>
+        )}
+        {!loading && options.length === 0 && extras.length === 0 && (
+          <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+            暂无可选记录，可在下面手输 id
+          </div>
+        )}
+        {options.map((option) => (
+          <label
+            key={option.id}
+            title={option.id}
+            style={{
+              display: "flex",
+              gap: "6px",
+              alignItems: "baseline",
+              fontSize: "12px",
+              padding: "2px 0",
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={has(option.id)}
+              onChange={() => toggle(option.id)}
+              style={{ accentColor: "var(--accent)" }}
+            />
+            <span style={{ color: "var(--text-primary)" }}>{option.name || "(未命名)"}</span>
+            <span style={idStyle}>{option.id}</span>
+          </label>
+        ))}
+        {extras.map((id) => (
+          <label
+            key={id}
+            title={id}
+            style={{
+              display: "flex",
+              gap: "6px",
+              alignItems: "baseline",
+              fontSize: "12px",
+              padding: "2px 0",
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked
+              onChange={() => toggle(id)}
+              style={{ accentColor: "var(--accent)" }}
+            />
+            <span style={{ color: "var(--text-secondary)" }}>(手输)</span>
+            <span style={idStyle}>{id}</span>
+          </label>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: "6px", marginTop: "6px" }}>
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              add();
+            }
+          }}
+          placeholder={placeholder}
+          style={{ flex: 1, minWidth: 0, padding: "4px 8px", fontSize: "12px" }}
+        />
+        <button
+          type="button"
+          onClick={add}
+          style={{
+            padding: "4px 10px",
+            fontSize: "12px",
+            backgroundColor: "transparent",
+            color: "var(--text-secondary)",
+            border: "1px solid var(--border)",
+            borderRadius: "4px",
+            cursor: "pointer",
+          }}
+        >
+          添加
+        </button>
       </div>
     </div>
   );

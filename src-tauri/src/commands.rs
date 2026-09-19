@@ -1,7 +1,7 @@
 use tauri::ipc::Channel;
 use tauri::State;
 
-use crate::orchestrator::{ListenerStatus, ListenerUpdate};
+use crate::orchestrator::{ListenerStatus, ListenerUpdate, LogLine};
 use crate::providers::ListenKind;
 use crate::storage::{ConversationSummary, EventQuery, EventRow, Stats};
 use crate::AppState;
@@ -190,7 +190,7 @@ pub async fn listener_status(state: State<'_, AppState>) -> Result<Vec<ListenerS
 pub async fn listener_logs(
     state: State<'_, AppState>,
     limit: Option<usize>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<LogLine>, String> {
     let orchestrator = state.orchestrator.lock().await;
     Ok(orchestrator.get_logs(limit.unwrap_or(500)).await)
 }
@@ -227,10 +227,16 @@ pub async fn current_im_cli(state: State<'_, AppState>) -> Result<Option<String>
     Ok(orchestrator.dws_path().await)
 }
 
+/// 事件与回复统计。传 project_id 只统计该项目，不传统计全部。
 #[tauri::command]
-pub async fn get_stats(state: State<'_, AppState>) -> Result<Stats, String> {
+pub async fn get_stats(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+) -> Result<Stats, String> {
     let storage = state.storage.lock().await;
-    storage.get_stats().map_err(|e| e.to_string())
+    storage
+        .get_stats(project_id.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -307,6 +313,28 @@ pub async fn assign_conversation(
     storage
         .assign_conversation(&conversation_id, &project_id)
         .map_err(|e| e.to_string())
+}
+
+/// 删除会话：从左树与统计里去掉（记墓碑），并清掉它的 Agent 会话记录。
+/// 事件不删；之后收到新消息会话会自己回来。
+#[tauri::command]
+pub async fn delete_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<(), String> {
+    let storage = state.storage.lock().await;
+    storage
+        .delete_conversation(&conversation_id)
+        .map_err(|e| e.to_string())
+}
+
+/// 建项目时「指定群 / 指定人」的候选名单（来自会话列表与历史发送人）。
+#[tauri::command]
+pub async fn list_source_candidates(
+    state: State<'_, AppState>,
+) -> Result<crate::storage::SourceCandidates, String> {
+    let storage = state.storage.lock().await;
+    storage.source_candidates().map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize)]

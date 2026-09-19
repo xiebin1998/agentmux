@@ -56,7 +56,12 @@ jobs:
             - `AgentMux_*_x64_en-US.msi` —— MSI 安装包
             - `AgentMux_*_x64-setup.exe` —— NSIS 安装程序
 
-            安装后首次运行请到「提供方检测」页确认钉钉 CLI 与 Agent CLI 都被检测到。
-          # 先建草稿，确认无误后再手动发布
-          releaseDraft: true
+            装完首次使用：
+
+            1. 「运行总览」里确认钉钉 `dws` 与 Agent CLI 都被检测到（需要重检点该区域的 ⟳）
+            2. 「创建项目」选平台与工作目录；**监听范围**可指定群 / 指定人，留空就是所有群、所有人
+            3. 在左侧项目行内点「@我」或「单聊」启动监听；一个项目最多两路
+            4. 「事件与回复」可按项目与会话筛选，「监听日志」按项目筛选
+          # 直接发布（非草稿），安装包作为 Release 资产对外可见
+          releaseDraft: false
           prerelease: false

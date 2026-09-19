@@ -114,7 +114,6 @@ fn main() {
             config::set_config,
             config::data_paths,
             config::set_data_dir,
-            config::set_im_identity,
             // 平台 CLI 自动检测
             resolve::list_cli_platforms,
             providers::detect_im_provider,
@@ -138,6 +137,8 @@ fn main() {
             commands::list_agent_models,
             commands::set_agent_model,
             commands::assign_conversation,
+            commands::delete_conversation,
+            commands::list_source_candidates,
             commands::reset_conversation,
             commands::conversation_session,
             // 运行期设置（按项目）
@@ -157,6 +158,16 @@ fn main() {
             project::update_project,
             project::delete_project,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                // 退出前必须把 dws 子进程收干净。留着它们就会变成孤儿进程继续订阅，
+                // 下次启动 App 时同一事件被多个监听抢 —— 表现就是「监听重复创建」。
+                let orchestrator = app_handle.state::<AppState>().orchestrator.clone();
+                tauri::async_runtime::block_on(async move {
+                    orchestrator.lock().await.shutdown_all_listeners().await;
+                });
+            }
+        });
 }

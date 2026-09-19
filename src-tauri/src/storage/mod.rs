@@ -72,6 +72,19 @@ pub struct ConversationMeta {
     pub name_known: bool,
 }
 
+/// 「指定群 / 指定人」的候选项：id 是会话 id 或 open id，name 只用于显示。
+#[derive(Debug, Clone, Serialize)]
+pub struct NamedId {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCandidates {
+    pub groups: Vec<NamedId>,
+    pub people: Vec<NamedId>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Summary {
     pub conversation_id: String,
@@ -166,6 +179,9 @@ impl Storage {
             "ALTER TABLE events ADD COLUMN malformed INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE events ADD COLUMN raw TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE events ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
+            // 「删掉的会话」墓碑：记删除时的最大事件序号。之后又来了新消息
+            // （序号更大）会话会自己回来，见 list_conversations。
+            "ALTER TABLE conversations ADD COLUMN deleted_seq INTEGER",
         ] {
             let _ = db.execute(stmt, []);
         }
@@ -260,6 +276,78 @@ impl Storage {
             })),
             None => Ok(None),
         }
+    }
+
+    /// 删除会话：记下删除时该会话的最大事件序号当墓碑，并清掉它的 Agent 会话记录。
+    ///
+    /// 事件不删（归档与审计照旧）。之后又收到新消息（序号更大）会话会自己回来，
+    /// 不会因为删过就永久收不到。
+    pub fn delete_conversation(&self, conversation_id: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO conversations (conversation_id, name, kind, name_known, updated_at, deleted_seq)
+             VALUES (
+                ?1, '', 'unknown', 0, ?2,
+                COALESCE((SELECT MAX(id) FROM events WHERE conversation_id = ?1), 0)
+             )
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                deleted_seq = excluded.deleted_seq,
+                updated_at = excluded.updated_at",
+            params![conversation_id, chrono::Local::now().to_rfc3339()],
+        )?;
+        // Agent 会话记录一起清掉：会话回来时从干净状态重新开始，不带旧上下文。
+        self.db.execute(
+            "DELETE FROM sessions WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        Ok(())
+    }
+
+    /// 建项目时「指定群 / 指定人」的候选名单。全部来自本地已有数据，不起 CLI 子进程。
+    ///
+    /// 人有两个来源：会话列表里的单聊（id 是会话 id）+ 历史事件的发送者（id 是 open id）。
+    /// 过滤时两者都能命中，所以这里都收进来。
+    pub fn source_candidates(&self) -> Result<SourceCandidates> {
+        let mut stmt = self.db.prepare(
+            "SELECT conversation_id, name FROM conversations
+             WHERE kind = ?1 AND conversation_id <> ''",
+        )?;
+        let mut collect = |kind: &str| -> Result<Vec<NamedId>> {
+            let rows = stmt.query_map(params![kind], |row| {
+                Ok(NamedId {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        };
+        let mut groups = collect("group")?;
+
+        let mut people = collect("direct")?;
+        let mut sender_stmt = self.db.prepare(
+            "SELECT sender_open_dingtalk_id, sender FROM events
+             WHERE sender_open_dingtalk_id <> ''
+             GROUP BY sender_open_dingtalk_id",
+        )?;
+        let senders = sender_stmt.query_map([], |row| {
+            Ok(NamedId {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })?;
+        for sender in senders {
+            people.push(sender?);
+        }
+
+        let dedupe = |mut items: Vec<NamedId>| {
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            items.dedup_by(|a, b| a.id == b.id);
+            items.retain(|item| !item.id.trim().is_empty());
+            items
+        };
+        groups = dedupe(groups);
+        people = dedupe(people);
+
+        Ok(SourceCandidates { groups, people })
     }
 
     /// 已知会话元的最近更新时间；界面据此判断要不要再拉一次。
@@ -400,23 +488,26 @@ impl Storage {
         unassigned_only: bool,
     ) -> Result<Vec<ConversationSummary>> {
         let scope = if unassigned_only {
-            " AND (project_id IS NULL OR project_id = '')"
+            " AND (e.project_id IS NULL OR e.project_id = '')"
         } else if project_id.map(|p| !p.is_empty()).unwrap_or(false) {
-            " AND project_id = ?1"
+            " AND e.project_id = ?1"
         } else {
             ""
         };
 
+        // 删掉的会话（deleted_seq >= 该会话最大事件序号）不再列出；
+        // 删除之后又收到新消息的会自动回来 —— 序号比墓碑大。
         let sql = format!(
-            "SELECT conversation_id,
+            "SELECT e.conversation_id,
                     COUNT(*) AS events,
-                    MAX(received_at) AS last_received_at,
-                    SUM(CASE WHEN reply_status = 'sent' THEN 1 ELSE 0 END) AS replied
-             FROM events
-             WHERE conversation_id <> ''{}
-             GROUP BY conversation_id
+                    MAX(e.received_at) AS last_received_at,
+                    SUM(CASE WHEN e.reply_status = 'sent' THEN 1 ELSE 0 END) AS replied
+             FROM events e
+             LEFT JOIN conversations c ON c.conversation_id = e.conversation_id
+             WHERE e.conversation_id <> ''{scope}
+             GROUP BY e.conversation_id
+             HAVING MAX(e.id) > COALESCE(MAX(c.deleted_seq), 0)
              ORDER BY last_received_at DESC",
-            scope
         );
 
         let mut stmt = self.db.prepare(&sql)?;
@@ -668,18 +759,54 @@ impl Storage {
         Ok(())
     }
 
-    pub fn get_stats(&self) -> Result<Stats> {
-        let count = |sql: &str| -> Result<i64> {
-            Ok(self.db.query_row(sql, [], |row| row.get(0))?)
+    /// 统计口径：传 project_id 只统计该项目的已落盘事件，不传则统计全部。
+    pub fn get_stats(&self, project_id: Option<&str>) -> Result<Stats> {
+        let scoped = project_id.filter(|p| !p.is_empty());
+        let and = if scoped.is_some() {
+            " AND project_id = ?1"
+        } else {
+            ""
+        };
+        // 带表别名的查询（会话数那条要 JOIN conversations）得用带别名的写法。
+        let and_e = if scoped.is_some() {
+            " AND e.project_id = ?1"
+        } else {
+            ""
+        };
+
+        let count = |where_clause: &str| -> Result<i64> {
+            let sql = format!("SELECT COUNT(*) FROM events WHERE {}{}", where_clause, and);
+            match scoped {
+                Some(p) => Ok(self.db.query_row(&sql, params![p], |row| row.get(0))?),
+                None => Ok(self.db.query_row(&sql, [], |row| row.get(0))?),
+            }
         };
 
         Ok(Stats {
-            total_events: count("SELECT COUNT(*) FROM events")?,
-            malformed_events: count("SELECT COUNT(*) FROM events WHERE malformed = 1")?,
-            processed_events: count("SELECT COUNT(*) FROM events WHERE processed = TRUE")?,
-            replied_events: count("SELECT COUNT(*) FROM events WHERE reply_status = 'sent'")?,
-            failed_replies: count("SELECT COUNT(*) FROM events WHERE reply_status = 'failed'")?,
-            conversations: count("SELECT COUNT(DISTINCT conversation_id) FROM events")?,
+            total_events: count("1=1")?,
+            malformed_events: count("malformed = 1")?,
+            processed_events: count("processed = TRUE")?,
+            replied_events: count("reply_status = 'sent'")?,
+            failed_replies: count("reply_status = 'failed'")?,
+            conversations: {
+                // 与左树的口径一致：无会话标识的畸形事件不算会话，
+                // 已经删掉的会话（墓碑 >= 最大事件序号）也不算。
+                let sql = format!(
+                    "SELECT COUNT(*) FROM (
+                        SELECT e.conversation_id
+                        FROM events e
+                        LEFT JOIN conversations c ON c.conversation_id = e.conversation_id
+                        WHERE e.conversation_id <> ''{}
+                        GROUP BY e.conversation_id
+                        HAVING MAX(e.id) > COALESCE(MAX(c.deleted_seq), 0)
+                     )",
+                    and_e
+                );
+                match scoped {
+                    Some(p) => self.db.query_row(&sql, params![p], |row| row.get(0))?,
+                    None => self.db.query_row(&sql, [], |row| row.get(0))?,
+                }
+            },
         })
     }
 }
@@ -803,6 +930,112 @@ mod tests {
 
     fn conversation_ids(rows: &[ConversationSummary]) -> Vec<String> {
         rows.iter().map(|row| row.conversation_id.clone()).collect()
+    }
+
+    fn meta(conversation_id: &str, name: &str, kind: &str) -> ConversationMeta {
+        ConversationMeta {
+            conversation_id: conversation_id.to_string(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            name_known: true,
+        }
+    }
+
+    /// 删除会话：立刻从左树与统计里消失；之后再收到新消息要能自己回来
+    /// （不能因为删过一次就永久收不到）。
+    #[test]
+    fn deleted_conversation_hides_until_a_new_event_arrives() {
+        let dir = std::env::temp_dir().join("agentmux-delete-conversation-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir.clone()).unwrap();
+
+        storage
+            .save_event(&sample_event("msg-1", "cid-1", "p1"))
+            .unwrap();
+        storage.save_session("p1", "cid-1", "sess-1", "D:\\a").unwrap();
+        storage
+            .upsert_conversations(&[meta("cid-1", "客服一群", "group")])
+            .unwrap();
+
+        assert_eq!(conversation_ids(&storage.list_conversations(Some("p1"), false).unwrap()).len(), 1);
+        assert_eq!(storage.get_stats(Some("p1")).unwrap().conversations, 1);
+
+        storage.delete_conversation("cid-1").unwrap();
+
+        assert!(
+            storage.list_conversations(Some("p1"), false).unwrap().is_empty(),
+            "删掉的会话不应再出现在左树"
+        );
+        assert_eq!(
+            storage.get_stats(Some("p1")).unwrap().conversations,
+            0,
+            "统计口径也要跟着少掉"
+        );
+        assert!(
+            storage.get_session("p1", "cid-1").unwrap().is_none(),
+            "删除会话应同时清掉 Agent 会话记录"
+        );
+        assert_eq!(
+            storage.get_stats(Some("p1")).unwrap().total_events,
+            1,
+            "事件本身不删，归档与审计照旧"
+        );
+        assert_eq!(
+            storage.conversation_meta("cid-1").unwrap().unwrap().name,
+            "客服一群",
+            "名字要留着，会话回来时还能显示"
+        );
+
+        // 新消息（序号更大）让它自己回来。
+        storage
+            .save_event(&sample_event("msg-2", "cid-1", "p1"))
+            .unwrap();
+        let after = storage.list_conversations(Some("p1"), false).unwrap();
+        assert_eq!(
+            conversation_ids(&after),
+            vec!["cid-1".to_string()],
+            "删除后又收到新消息，会话应重新出现"
+        );
+        assert_eq!(after[0].name, "客服一群");
+        assert_eq!(storage.get_stats(Some("p1")).unwrap().conversations, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 建项目时给的候选名单：群来自会话列表，人同时来自单聊会话与历史发送人。
+    #[test]
+    fn source_candidates_cover_groups_and_people() {
+        let dir = std::env::temp_dir().join("agentmux-source-candidates-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir.clone()).unwrap();
+
+        storage
+            .upsert_conversations(&[
+                meta("cid-group", "客服一群", "group"),
+                meta("cid-direct", "李四", "direct"),
+            ])
+            .unwrap();
+        storage
+            .save_event(&sample_event("msg-1", "cid-group", "p1"))
+            .unwrap();
+
+        let candidates = storage.source_candidates().unwrap();
+        let group_ids: Vec<&str> = candidates.groups.iter().map(|g| g.id.as_str()).collect();
+        let people_ids: Vec<&str> = candidates.people.iter().map(|p| p.id.as_str()).collect();
+
+        assert_eq!(group_ids, vec!["cid-group"], "群候选来自会话列表的 group");
+        assert!(
+            people_ids.contains(&"cid-direct"),
+            "单聊会话应出现在人候选里: {:?}",
+            people_ids
+        );
+        assert!(
+            people_ids.contains(&"open-other"),
+            "历史发送人的 open id 也要出现: {:?}",
+            people_ids
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 回归（问题 5）：升级前的历史会话 `project_id` 为空，既不归属任何项目，

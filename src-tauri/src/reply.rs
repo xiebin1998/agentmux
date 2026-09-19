@@ -36,6 +36,9 @@ pub struct ReplySettings {
     /// 滑块给的「上下文占用百分比」。有它且 Agent 回报过占比时，
     /// 压缩只按占比判定（自适应），字符阈值退成没有基线时的兜底。
     pub compress_trigger_percent: Option<u8>,
+    /// 监听范围：只处理这些群的会话 / 这些人的消息。两个都空 = 不限制。
+    pub group_ids: Vec<String>,
+    pub member_ids: Vec<String>,
 }
 
 impl Default for ReplySettings {
@@ -57,6 +60,8 @@ impl Default for ReplySettings {
             compress_trigger_turns: None,
             compress_trigger_chars: None,
             compress_trigger_percent: None,
+            group_ids: Vec::new(),
+            member_ids: Vec::new(),
         }
     }
 }

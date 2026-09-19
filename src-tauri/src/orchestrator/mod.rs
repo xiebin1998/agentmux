@@ -20,6 +20,8 @@ const MAX_ATTEMPTS: u32 = 5;
 const BACKOFF_SECS: [u64; 5] = [5, 10, 20, 40, 60];
 const LOG_BUFFER_LIMIT: usize = 5000;
 const READY_BUFFER_LIMIT: usize = 1000;
+/// 退出时留给 dws 自行退订的时间，到点还没走就强杀。
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -78,8 +80,35 @@ struct ListenerTask {
     stop_requested: Arc<AtomicBool>,
 }
 
+/// 日志缓冲里的一行。带上归属，界面才能按项目筛选：
+/// 监听产生的日志归它所属项目，全局日志（如手动压缩）没有项目。
+#[derive(Debug, Clone, Serialize)]
+pub struct LogLine {
+    pub project_id: String,
+    pub kind: String,
+    pub line: String,
+}
+
 struct LogBuffer {
-    lines: VecDeque<String>,
+    lines: VecDeque<LogLine>,
+}
+
+async fn push_log_line(logs: &Arc<Mutex<LogBuffer>>, project_id: &str, kind: &str, line: &str) {
+    let stamped = format!("{} {}", chrono::Local::now().format("%H:%M:%S"), line);
+    let mut logs = logs.lock().await;
+    if logs.lines.len() >= LOG_BUFFER_LIMIT {
+        logs.lines.pop_front();
+    }
+    logs.lines.push_back(LogLine {
+        project_id: project_id.to_string(),
+        kind: kind.to_string(),
+        line: stamped,
+    });
+}
+
+/// 终态：没有进程在跑、也不会自己再起来的状态。
+fn is_terminal(state: &ListenerState) -> bool {
+    matches!(state, ListenerState::Stopped | ListenerState::Abandoned)
 }
 
 pub struct Orchestrator {
@@ -153,12 +182,7 @@ impl Orchestrator {
     }
 
     pub async fn push_global_log(&self, line: &str) {
-        let stamped = format!("{} {}", chrono::Local::now().format("%H:%M:%S"), line);
-        let mut logs = self.logs.lock().await;
-        if logs.lines.len() >= LOG_BUFFER_LIMIT {
-            logs.lines.pop_front();
-        }
-        logs.lines.push_back(stamped);
+        push_log_line(&self.logs, "", "", line).await;
     }
 
     /// 压缩某会话的上下文并落盘为最新一版摘要（A7.1.3 / A7.2.1）。
@@ -208,6 +232,27 @@ impl Orchestrator {
         channel: Option<Channel<ListenerUpdate>>,
     ) -> anyhow::Result<String> {
         let path = self.ensure_dws_path().await?;
+
+        // 同一项目 + 同一种监听只保留一路：重复点「启动」直接复用已有实例。
+        // 否则会出现两个进程同时订阅同一事件，界面上也多出一行。
+        {
+            let mut listeners = self.listeners.lock().await;
+            if let Some(existing) = listeners.values().find(|task| {
+                task.status.project_id == project_id
+                    && task.status.kind == kind
+                    && !is_terminal(&task.status.state)
+            }) {
+                return Ok(existing.status.id.clone());
+            }
+            // 终态实例（已停止/已放弃）不占位：重新启动时清掉，
+            // 不然界面会同时挂着「已放弃」和新起的一行。
+            listeners.retain(|_, task| {
+                !(task.status.project_id == project_id
+                    && task.status.kind == kind
+                    && is_terminal(&task.status.state))
+            });
+        }
+
         let id = uuid::Uuid::new_v4().to_string();
 
         let stdin = Arc::new(Mutex::new(None));
@@ -315,14 +360,65 @@ impl Orchestrator {
         }
     }
 
+    /// 退出前把监听收干净：先对所有实例关 stdin（dws 收到 EOF 会自行退订退出），
+    /// 等一小会儿仍活着的按 pid 强杀。
+    ///
+    /// 不这么做就会留下**孤儿 dws 进程**：它还在订阅同一事件，下次启动 App
+    /// 就变成「一个事件被多个监听抢」，看起来就是监听重复。
+    pub async fn shutdown_all_listeners(&self) {
+        let snapshot: Vec<(Arc<Mutex<Option<ChildStdin>>>, Arc<Mutex<Option<u32>>>, Arc<AtomicBool>)> = {
+            let listeners = self.listeners.lock().await;
+            listeners
+                .values()
+                .map(|task| (task.stdin.clone(), task.pid.clone(), task.stop_requested.clone()))
+                .collect()
+        };
+
+        for (stdin, _, stop_requested) in &snapshot {
+            stop_requested.store(true, Ordering::SeqCst);
+            if let Some(stdin) = stdin.lock().await.take() {
+                drop(stdin);
+            }
+        }
+
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        loop {
+            let mut alive: Vec<u32> = Vec::new();
+            for (_, pid, _) in &snapshot {
+                if let Some(pid) = *pid.lock().await {
+                    if process_alive(pid) {
+                        alive.push(pid);
+                    }
+                }
+            }
+            if alive.is_empty() || Instant::now() >= deadline {
+                for pid in alive {
+                    kill_pid(pid).await;
+                }
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     pub async fn get_all_listener_status(&self) -> Vec<ListenerStatus> {
         let listeners = self.listeners.lock().await;
-        let mut out: Vec<ListenerStatus> = listeners.values().map(|t| t.status.clone()).collect();
-        out.sort_by(|a, b| a.kind.to_string().cmp(&b.kind.to_string()));
+        // 已停止的实例不再上报：否则「停止再启动」会在界面上留下两行，
+        // 看起来像启动监听重复创建。
+        let mut out: Vec<ListenerStatus> = listeners
+            .values()
+            .map(|t| t.status.clone())
+            .filter(|s| s.state != ListenerState::Stopped)
+            .collect();
+        out.sort_by(|a, b| {
+            a.project_id
+                .cmp(&b.project_id)
+                .then_with(|| a.kind.to_string().cmp(&b.kind.to_string()))
+        });
         out
     }
 
-    pub async fn get_logs(&self, limit: usize) -> Vec<String> {
+    pub async fn get_logs(&self, limit: usize) -> Vec<LogLine> {
         let logs = self.logs.lock().await;
         let skip = logs.lines.len().saturating_sub(limit);
         logs.lines.iter().skip(skip).cloned().collect()
@@ -630,14 +726,33 @@ impl Shared {
         self.trace(&event.message_id, "② 去重", " 新消息，继续处理")
             .await;
 
+        // ③ 范围过滤：项目指定了群/人名单时，只处理命中的消息；名单为空 = 不限制。
+        // 不落盘也不推流 —— 不在这个项目的监听范围内，存下来只会污染会话与统计。
+        if !event_in_scope(&self.reply.group_ids, &self.reply.member_ids, &event) {
+            self.trace(
+                &event.message_id,
+                "③ 范围过滤",
+                &format!(
+                    " 未命中指定名单（群 {} 个 / 人 {} 个），丢弃不落盘",
+                    self.reply.group_ids.len(),
+                    self.reply.member_ids.len()
+                ),
+            )
+            .await;
+            self.trace_started.lock().await.remove(&event.message_id);
+            return;
+        }
+        self.trace(&event.message_id, "③ 范围过滤", " 在监听范围内（或未限制），继续处理")
+            .await;
+
         {
             let storage = self.storage.lock().await;
             if let Err(err) = storage.save_event(&event) {
-                self.trace(&event.message_id, "③ 落盘", &format!(" 失败: {}", err))
+                self.trace(&event.message_id, "④ 落盘", &format!(" 失败: {}", err))
                     .await;
                 self.push_log(&format!("落盘失败: {}", err)).await;
             } else {
-                self.trace(&event.message_id, "③ 落盘", " 成功（SQLite + ndjson）")
+                self.trace(&event.message_id, "④ 落盘", " 成功（SQLite + ndjson）")
                     .await;
             }
         }
@@ -669,10 +784,10 @@ impl Shared {
             let _ = channel.send(ListenerUpdate::Event {
                 event: event.clone(),
             });
-            self.trace(&event.message_id, "④ 推流", " 已推给界面（实时事件流）")
+            self.trace(&event.message_id, "⑤ 推流", " 已推给界面（实时事件流）")
                 .await;
         } else {
-            self.trace(&event.message_id, "④ 推流", " 无界面通道，跳过")
+            self.trace(&event.message_id, "⑤ 推流", " 无界面通道，跳过")
                 .await;
         }
 
@@ -680,7 +795,7 @@ impl Shared {
         if self.reply.enabled {
             self.trace(
                 &event.message_id,
-                "⑤ 回复开关",
+                "⑥ 回复开关",
                 " 本项目已启用自动回复，进入回复链路",
             )
             .await;
@@ -690,7 +805,7 @@ impl Shared {
         } else {
             self.trace(
                 &event.message_id,
-                "⑤ 回复开关",
+                "⑥ 回复开关",
                 " 本项目未启用自动回复，只记录不回复",
             )
             .await;
@@ -714,7 +829,7 @@ impl Shared {
         if event.malformed || event.conversation_id.is_empty() {
             self.trace(
                 &event.message_id,
-                "⑥ 单条判定",
+                "⑦ 单条判定",
                 " 畸形或会话为空，跳过",
             )
             .await;
@@ -724,7 +839,7 @@ impl Shared {
 
         if let Some(self_id) = self.reply.self_open_id.as_ref() {
             if !self_id.is_empty() && *self_id == event.sender_open_dingtalk_id {
-                self.trace(&event.message_id, "⑥ 单条判定", " 发送者是本人，跳过")
+                self.trace(&event.message_id, "⑦ 单条判定", " 发送者是本人，跳过")
                     .await;
                 self.push_log("跳过自己发送的消息").await;
                 self.finish_reply(&event, "skipped", None).await;
@@ -738,7 +853,7 @@ impl Shared {
         if self.reply.agent_cli_path.is_none() {
             self.trace(
                 &event.message_id,
-                "⑥ 单条判定",
+                "⑦ 单条判定",
                 " 未解析到 Agent CLI，无法生成回复",
             )
             .await;
@@ -749,7 +864,7 @@ impl Shared {
 
         self.trace(
             &event.message_id,
-            "⑥ 单条判定",
+            "⑦ 单条判定",
             " 通过（非畸形、非本人发送、Agent CLI 就绪）",
         )
         .await;
@@ -774,7 +889,7 @@ impl Shared {
         if !first_in_window {
             self.trace(
                 &conversation,
-                "⑦ 进攒批",
+                "⑧ 进攒批",
                 &format!(
                     " 已有窗口在等，并入当前批（本批已 {} 条），窗口 {}ms",
                     size,
@@ -787,7 +902,7 @@ impl Shared {
 
         self.trace(
             &conversation,
-            "⑦ 进攒批",
+            "⑧ 进攒批",
             &format!(
                 " 开新窗口：本批第 {} 条，等 {}ms 收齐同会话消息",
                 size,
@@ -830,7 +945,7 @@ impl Shared {
 
         self.trace(
             conversation,
-            "⑧ 出批",
+            "⑨ 出批",
             &format!(
                 " 窗口结束，本批 {} 条（message_id: {}）",
                 batch.len(),
@@ -880,7 +995,7 @@ impl Shared {
         };
         self.trace(
             &event.conversation_id,
-            "⑨ 压缩判定",
+            "⑩ 压缩判定",
             &format!(
                 " 开关={} 阈值={} 上次占比={} 字符阈值={:?}",
                 reply.auto_compress,
@@ -903,7 +1018,7 @@ impl Shared {
         )
         .await
         {
-            self.trace(&event.conversation_id, "⑨ 压缩判定", " → 触发压缩")
+            self.trace(&event.conversation_id, "⑩ 压缩判定", " → 触发压缩")
                 .await;
             match compress_with(&self.storage, reply.clone(), &event.conversation_id).await {
                 Ok(_) => *self.compress_failures.lock().await = 0,
@@ -941,7 +1056,7 @@ impl Shared {
 
         self.trace(
             &event.conversation_id,
-            "⑩ 拉上下文",
+            "⑪ 拉上下文",
             &format!(
                 " 上下文={}（开关={} 上限 {} 条 / {} 字）",
                 if reply.context_enabled {
@@ -998,7 +1113,7 @@ impl Shared {
 
         self.trace(
             &event.conversation_id,
-            "⑪ 调 Agent",
+            "⑫ 调 Agent",
             &format!(
                 " CLI={} 会话模式={} prompt={}字 超时={}ms 工作目录={}",
                 settings
@@ -1019,7 +1134,7 @@ impl Shared {
             Err(err) => {
                 self.trace(
                     &event.conversation_id,
-                    "⑫ 生成失败",
+                    "⑬ 生成失败",
                     &format!(
                         " 耗时 {}ms，错误: {}",
                         generation_started.elapsed().as_millis(),
@@ -1035,7 +1150,7 @@ impl Shared {
 
         self.trace(
             &event.conversation_id,
-            "⑫ 生成返回",
+            "⑬ 生成返回",
             &format!(
                 " 耗时 {}ms 模型={} 上下文占比={} 输出={}字",
                 generation_started.elapsed().as_millis(),
@@ -1077,7 +1192,7 @@ impl Shared {
         if text.is_empty() {
             self.trace(
                 &event.conversation_id,
-                "⑬ 清洗",
+                "⑭ 清洗",
                 &format!(
                     " → 空（原始 {} 字），判为失败",
                     raw.text.chars().count()
@@ -1090,7 +1205,7 @@ impl Shared {
 
         self.trace(
             &event.conversation_id,
-            "⑬ 清洗",
+            "⑭ 清洗",
             &format!(
                 " {}字 → {}字（上限 {}）",
                 raw.text.chars().count(),
@@ -1110,7 +1225,7 @@ impl Shared {
             .await;
             self.trace(
                 &event.conversation_id,
-                "⑭ 拒答重试",
+                "⑮ 拒答重试",
                 &format!(" 命中拒答特征，原文: {}", truncate(&text, 120)),
             )
             .await;
@@ -1124,7 +1239,7 @@ impl Shared {
                         self.push_log("新会话重试得到空回复，保留原回复").await;
                         self.trace(
                             &event.conversation_id,
-                            "⑭ 拒答重试",
+                            "⑮ 拒答重试",
                             " 新会话返回空，保留原回复",
                         )
                         .await;
@@ -1140,7 +1255,7 @@ impl Shared {
                         self.push_log("已切换到新会话").await;
                         self.trace(
                             &event.conversation_id,
-                            "⑭ 拒答重试",
+                            "⑮ 拒答重试",
                             &format!(
                                 " 成功，耗时 {}ms，已换成新会话 {}",
                                 retry_started.elapsed().as_millis(),
@@ -1155,7 +1270,7 @@ impl Shared {
                         .await;
                     self.trace(
                         &event.conversation_id,
-                        "⑭ 拒答重试",
+                        "⑮ 拒答重试",
                         &format!(" 失败: {}", err),
                     )
                     .await;
@@ -1184,7 +1299,7 @@ impl Shared {
                     .await;
                 self.trace(
                     &event.conversation_id,
-                    "⑮ 发送",
+                    "⑯ 发送",
                     &format!(
                         " 成功，耗时 {}ms，正文={}字",
                         send_started.elapsed().as_millis(),
@@ -1193,14 +1308,14 @@ impl Shared {
                 )
                 .await;
                 self.finish_batch(&events, "sent", Some(&text)).await;
-                self.trace(&event.conversation_id, "⑯ 台账", " 已标记 sent（批次内每条都写）")
+                self.trace(&event.conversation_id, "⑰ 台账", " 已标记 sent（批次内每条都写）")
                     .await;
                 self.forget_trace(&events).await;
             }
             Err(err) => {
                 self.trace(
                     &event.conversation_id,
-                    "⑮ 发送",
+                    "⑯ 发送",
                     &format!(" 失败，耗时 {}ms: {}", send_started.elapsed().as_millis(), err),
                 )
                 .await;
@@ -1281,18 +1396,11 @@ impl Shared {
     }
 
     async fn push_log(&self, line: &str) {
-        let stamped = format!("{} {}", chrono::Local::now().format("%H:%M:%S"), line);
-        {
-            let mut logs = self.logs.lock().await;
-            if logs.lines.len() >= LOG_BUFFER_LIMIT {
-                logs.lines.pop_front();
-            }
-            logs.lines.push_back(stamped.clone());
-        }
+        push_log_line(&self.logs, &self.project_id, &self.kind.to_string(), line).await;
         if let Some(channel) = &self.channel {
             let _ = channel.send(ListenerUpdate::Log {
                 listener_id: self.id.clone(),
-                line: stamped,
+                line: format!("{} {}", chrono::Local::now().format("%H:%M:%S"), line),
             });
         }
     }
@@ -1324,6 +1432,29 @@ fn truncate(input: &str, max: usize) -> String {
         return input.to_string();
     }
     input.chars().take(max).collect::<String>() + "…"
+}
+
+/// 事件是否落在项目的监听范围内。
+///
+/// 两个名单都空 = 不限制（监听所有群、所有人）。只要指定了名单，命中其一就放行：
+/// - 群名单按**会话 id** 命中（群聊会话、单聊会话都能配）；
+/// - 人名单按**发送者 open id** 或**会话 id** 命中（前者来自历史发送人，后者来自会话列表里的单聊）。
+///
+/// 取并集而不是交集：指定「群 A + 人 B」表示 A 群和 B 人的消息都处理，
+/// 交集会让「同时属于指定群又是指定人」这种组合几乎永远不成立。
+pub fn event_in_scope(group_ids: &[String], member_ids: &[String], event: &ChatEvent) -> bool {
+    if group_ids.is_empty() && member_ids.is_empty() {
+        return true;
+    }
+    let conversation = event.conversation_id.as_str();
+    if !conversation.is_empty()
+        && (group_ids.iter().any(|id| id == conversation)
+            || member_ids.iter().any(|id| id == conversation))
+    {
+        return true;
+    }
+    let sender = event.sender_open_dingtalk_id.as_str();
+    !sender.is_empty() && member_ids.iter().any(|id| id == sender)
 }
 
 /// 压缩某会话：调 Agent 生成摘要并落盘为最新一版。
@@ -1517,6 +1648,153 @@ mod tests {
     /// 用一把锁把「改 cwd 的窗口」串起来，否则这是测试环境问题而非产品缺陷。
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// 监听范围过滤的判定规则（纯函数，不需要起进程）。
+    ///
+    /// 空名单 = 不限制；指定了名单就要求命中其一（群按会话 id、人按发送者 open id 或单聊会话 id）。
+    #[test]
+    fn scope_filter_keeps_only_listed_groups_and_people() {
+        let event = |conversation: &str, sender: &str| ChatEvent {
+            project_id: "p1".to_string(),
+            message_id: "msg-1".to_string(),
+            conversation_id: conversation.to_string(),
+            sender: "同事".to_string(),
+            sender_open_dingtalk_id: sender.to_string(),
+            content: "@我 在吗".to_string(),
+            create_time: String::new(),
+            received_at: String::new(),
+            listen_kind: "at-me".to_string(),
+            malformed: false,
+            raw: String::new(),
+        };
+        let ids = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let none: Vec<String> = Vec::new();
+
+        assert!(
+            event_in_scope(&none, &none, &event("cid-any", "open-9")),
+            "两个名单都空 = 监听所有群、所有人"
+        );
+
+        let groups = ids(&["cid-group"]);
+        assert!(event_in_scope(&groups, &none, &event("cid-group", "open-9")));
+        assert!(
+            !event_in_scope(&groups, &none, &event("cid-other", "open-9")),
+            "没在指定群里的事件应被丢弃"
+        );
+
+        let people = ids(&["open-1"]);
+        assert!(event_in_scope(&none, &people, &event("cid-other", "open-1")));
+        assert!(
+            !event_in_scope(&none, &people, &event("cid-other", "open-2")),
+            "不是指定人发的事件应被丢弃"
+        );
+        assert!(
+            event_in_scope(&none, &people, &event("cid-direct-1", "open-1")),
+            "单聊里指定人发来的也算命中"
+        );
+        assert!(
+            event_in_scope(&none, &people, &event("open-1", "open-2")),
+            "从会话列表挑的单聊（人名单里存的是会话 id）也要命中"
+        );
+
+        // 指定了群 + 人：命中其一即可（并集），不是要求同时满足。
+        let both_groups = ids(&["cid-group"]);
+        let both_people = ids(&["open-1"]);
+        assert!(event_in_scope(&both_groups, &both_people, &event("cid-group", "open-2")));
+        assert!(event_in_scope(&both_groups, &both_people, &event("cid-other", "open-1")));
+        assert!(
+            !event_in_scope(&both_groups, &both_people, &event("cid-other", "open-2")),
+            "群和人都不命中才丢弃"
+        );
+    }
+
+    /// 用桩起一路监听，跑一小会儿就停，返回（落盘条数, 日志）。
+    async fn run_scoped_listener(
+        node: String,
+        data_name: &str,
+        settings: ReplySettings,
+    ) -> (usize, String) {
+        let data_dir = std::env::temp_dir().join(data_name);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let orchestrator = Orchestrator::new(storage.clone());
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let id = orchestrator
+            .start_listener("p1".to_string(), ListenKind::AtMe, settings, None)
+            .await
+            .expect("应能启动监听");
+        sleep(Duration::from_millis(900)).await;
+        let _ = orchestrator.stop_listener(&id).await;
+
+        let rows = storage
+            .lock()
+            .await
+            .list_events(&EventQuery {
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        let logs = orchestrator
+            .get_logs(500)
+            .await
+            .iter()
+            .map(|entry| entry.line.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        (rows.len(), logs)
+    }
+
+    /// 指定了群/人名单后，不在范围内的事件必须在**落盘之前**就被丢掉：
+    /// 存下来只会污染会话列表与统计，用户会以为「指定了范围却没生效」。
+    #[tokio::test]
+    async fn out_of_scope_events_are_dropped_before_storage() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let stub_dir = std::env::temp_dir().join("agentmux-scope-stub");
+        let _ = std::fs::remove_dir_all(&stub_dir);
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::write(stub_dir.join("event"), STUB).unwrap();
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        // 群名单写了一个不存在的会话 → 桩里的消息全都不该落盘。
+        let (dropped_rows, dropped_logs) = run_scoped_listener(
+            node.clone(),
+            "agentmux-scope-dropped",
+            ReplySettings {
+                group_ids: vec!["cid-not-listen".to_string()],
+                ..ReplySettings::default()
+            },
+        )
+        .await;
+        // 人名单命中桩里的发送者（open-1）→ 事件正常入库（3 条：2 正常 + 1 畸形，重复被去重）。
+        let (kept_rows, _) = run_scoped_listener(
+            node,
+            "agentmux-scope-kept",
+            ReplySettings {
+                member_ids: vec!["open-1".to_string()],
+                ..ReplySettings::default()
+            },
+        )
+        .await;
+
+        std::env::set_current_dir(previous).unwrap();
+
+        assert_eq!(dropped_rows, 0, "不在指定群里的事件不应落盘");
+        assert!(
+            dropped_logs.contains("③ 范围过滤") && dropped_logs.contains("未命中指定名单"),
+            "范围过滤必须留痕，否则用户查不出「为什么没收到」:\n{}",
+            dropped_logs
+        );
+        assert_eq!(kept_rows, 3, "命中指定人的事件应照常落盘");
+    }
+
     fn node_exe() -> Option<String> {
         let path_var = std::env::var("PATH").ok()?;
         for dir in std::env::split_paths(&path_var) {
@@ -1665,6 +1943,237 @@ process.stdin.on("end", function () { process.exit(0); });
             .unwrap();
         assert!(others.is_empty(), "别的项目不应看到这个会话，实际 {:?}", others);
 
+        // 日志要带归属，界面才能按项目筛选（问题 3）。
+        let logs = orchestrator.get_logs(500).await;
+        assert!(!logs.is_empty(), "监听应产生日志");
+        assert!(
+            logs.iter().all(|entry| entry.project_id == "test-project"),
+            "监听产生的日志应归到该项目，实际: {:?}",
+            logs.iter().map(|e| (&e.project_id, &e.line)).collect::<Vec<_>>()
+        );
+
+        // 统计按项目分口径（问题 5）。
+        let scoped = storage.lock().await.get_stats(Some("test-project")).unwrap();
+        let unscoped = storage.lock().await.get_stats(None).unwrap();
+        assert_eq!(scoped.total_events, 3, "本项目口径应为 3 条");
+        assert_eq!(unscoped.total_events, 3, "只有这一个项目有数据");
+        assert_eq!(scoped.conversations, 1, "无会话标识的畸形事件不计入会话");
+        assert_eq!(
+            storage
+                .lock()
+                .await
+                .get_stats(Some("other-project"))
+                .unwrap()
+                .total_events,
+            0,
+            "别的项目口径应为 0"
+        );
+
+        let _ = std::fs::remove_dir_all(&stub_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// 同一项目 + 同一种监听重复启动必须复用同一实例（问题 4）：
+    /// 否则会起两个 dws 抢同一事件，界面上也会多出一行。
+    #[tokio::test]
+    async fn duplicate_start_reuses_the_same_listener() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let stub_dir = std::env::temp_dir().join("agentmux-dedupe-stub");
+        let _ = std::fs::remove_dir_all(&stub_dir);
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::write(stub_dir.join("event"), STUB).unwrap();
+
+        let data_dir = std::env::temp_dir().join("agentmux-dedupe-data");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let orchestrator = Orchestrator::new(storage);
+        // 必须把 dws 指到桩脚本上：否则会真的起 dws 订阅（抢真实事件、脏环境）。
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let start = |project: &'static str, kind: ListenKind| {
+            let orchestrator = &orchestrator;
+            async move {
+                orchestrator
+                    .start_listener(project.to_string(), kind, ReplySettings::default(), None)
+                    .await
+                    .expect("应能启动监听")
+            }
+        };
+
+        let first = start("p1", ListenKind::AtMe).await;
+        let second = start("p1", ListenKind::AtMe).await;
+        let other_kind = start("p1", ListenKind::DirectMessage).await;
+        let other_project = start("p2", ListenKind::AtMe).await;
+
+        let statuses = orchestrator.get_all_listener_status().await;
+        let same_scope = statuses
+            .iter()
+            .filter(|s| s.project_id == "p1" && s.kind == ListenKind::AtMe)
+            .count();
+
+        // 放弃掉的实例是终态，不该挡住重新启动，也不该和新起的那行同时挂在界面上。
+        // 这里直接造一个「上一轮失败已放弃」的实例（没有进程，只有状态）。
+        let abandoned_id = "p3-abandoned-instance".to_string();
+        {
+            let mut listeners = orchestrator.listeners.lock().await;
+            listeners.insert(
+                abandoned_id.clone(),
+                ListenerTask {
+                    status: ListenerStatus {
+                        id: abandoned_id.clone(),
+                        project_id: "p3".to_string(),
+                        kind: ListenKind::AtMe,
+                        state: ListenerState::Abandoned,
+                        ready: false,
+                        subscribe_id: None,
+                        bus_pid: None,
+                        attempts: MAX_ATTEMPTS,
+                        last_error: Some("连续失败，已放弃".to_string()),
+                        cli_path: None,
+                        dropped_before_ready: 0,
+                    },
+                    stdin: Arc::new(Mutex::new(None)),
+                    pid: Arc::new(Mutex::new(None)),
+                    stop_requested: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        let restarted_after_abandon = start("p3", ListenKind::AtMe).await;
+        let p3_statuses: Vec<ListenerStatus> = orchestrator
+            .get_all_listener_status()
+            .await
+            .into_iter()
+            .filter(|s| s.project_id == "p3")
+            .collect();
+
+        let _ = orchestrator.stop_listener(&first).await;
+        let _ = orchestrator.stop_listener(&other_kind).await;
+        let _ = orchestrator.stop_listener(&other_project).await;
+        let _ = orchestrator.stop_listener(&restarted_after_abandon).await;
+
+        // 停掉之后旧实例不再占位，可以重新起一路（不能复用已停止的 id）。
+        let restarted = start("p1", ListenKind::AtMe).await;
+        let after_restart = orchestrator.get_all_listener_status().await;
+        std::env::set_current_dir(previous).unwrap();
+
+        assert_eq!(first, second, "重复启动应复用同一路监听");
+        assert_ne!(first, other_kind, "同项目的另一类监听应各自独立");
+        assert_ne!(first, other_project, "另一个项目的同类监听应各自独立");
+        assert_eq!(same_scope, 1, "同项目同类型只应上报一路，实际: {:?}", statuses);
+        assert_ne!(
+            restarted_after_abandon, abandoned_id,
+            "已放弃的实例不应被复用"
+        );
+        assert_eq!(
+            p3_statuses.len(),
+            1,
+            "放弃后重启只应剩新起的一路，实际: {:?}",
+            p3_statuses
+        );
+        assert_ne!(restarted, first, "已停止的实例不应被复用");
+        assert_eq!(
+            after_restart
+                .iter()
+                .filter(|s| s.project_id == "p1" && s.kind == ListenKind::AtMe)
+                .count(),
+            1,
+            "重启后仍只应有一路，实际: {:?}",
+            after_restart
+        );
+
+        let _ = orchestrator.stop_listener(&restarted).await;
+        let _ = std::fs::remove_dir_all(&stub_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// 退出时必须把监听子进程收干净：留成孤儿进程会继续订阅同一事件，
+    /// 下次启动就成了「一个事件被多个监听抢」。
+    #[tokio::test]
+    async fn shutdown_closes_every_listener_process() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let stub_dir = std::env::temp_dir().join("agentmux-shutdown-stub");
+        let _ = std::fs::remove_dir_all(&stub_dir);
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::write(stub_dir.join("event"), STUB).unwrap();
+
+        let data_dir = std::env::temp_dir().join("agentmux-shutdown-data");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let orchestrator = Orchestrator::new(storage);
+        // 同上：这里要断言的是「子进程被杀掉」，用桩就够，不要碰真实 dws。
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let at_me = orchestrator
+            .start_listener(
+                "p1".to_string(),
+                ListenKind::AtMe,
+                ReplySettings::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let direct = orchestrator
+            .start_listener(
+                "p1".to_string(),
+                ListenKind::DirectMessage,
+                ReplySettings::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 等两路子进程都真的起来了（bash 里 spawn 是异步的）。
+        let mut pids: Vec<u32> = Vec::new();
+        for _ in 0..60 {
+            sleep(Duration::from_millis(100)).await;
+            let handles = {
+                let listeners = orchestrator.listeners.lock().await;
+                [&at_me, &direct]
+                    .iter()
+                    .filter_map(|id| listeners.get(*id).map(|task| task.pid.clone()))
+                    .collect::<Vec<_>>()
+            };
+            let mut current = Vec::new();
+            for handle in handles {
+                if let Some(pid) = *handle.lock().await {
+                    current.push(pid);
+                }
+            }
+            if current.len() == 2 {
+                pids = current;
+                break;
+            }
+        }
+        assert_eq!(pids.len(), 2, "两路监听都应起出子进程");
+        assert!(
+            pids.iter().all(|pid| process_alive(*pid)),
+            "监听起来后子进程应活着: {:?}",
+            pids
+        );
+
+        orchestrator.shutdown_all_listeners().await;
+        std::env::set_current_dir(previous).unwrap();
+
+        for pid in &pids {
+            assert!(!process_alive(*pid), "退出后不应残留子进程: pid {}", pid);
+        }
+
         let _ = std::fs::remove_dir_all(&stub_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -1784,7 +2293,11 @@ process.stdout.write("收到 " + process.cwd());
 
         assert_eq!(rows.len(), 1, "应只落盘 1 条事件，实际 {:?}", rows);
         let logs = orchestrator.get_logs(500).await;
-        let joined = logs.join("\n");
+        let joined = logs
+            .iter()
+            .map(|entry| entry.line.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
         // 失败时把全链路 trace 打出来，直接看出卡在哪一步
         // （加 --nocapture 可见）。这正是 trace 要解决的问题。
         if rows[0].reply_status.as_deref() != Some("sent") {
@@ -1795,19 +2308,20 @@ process.stdout.write("收到 " + process.cwd());
         for stage in [
             "① 收到事件",
             "② 去重",
-            "③ 落盘",
-            "④ 推流",
-            "⑤ 回复开关",
-            "⑥ 单条判定",
-            "⑦ 进攒批",
-            "⑧ 出批",
-            "⑨ 压缩判定",
-            "⑩ 拉上下文",
-            "⑪ 调 Agent",
-            "⑫ 生成返回",
-            "⑬ 清洗",
-            "⑮ 发送",
-            "⑯ 台账",
+            "③ 范围过滤",
+            "④ 落盘",
+            "⑤ 推流",
+            "⑥ 回复开关",
+            "⑦ 单条判定",
+            "⑧ 进攒批",
+            "⑨ 出批",
+            "⑩ 压缩判定",
+            "⑪ 拉上下文",
+            "⑫ 调 Agent",
+            "⑬ 生成返回",
+            "⑭ 清洗",
+            "⑯ 发送",
+            "⑰ 台账",
         ] {
             assert!(
                 joined.contains(stage),
@@ -2194,7 +2708,7 @@ process.stdout.write(JSON.stringify({
         }
 
         let _ = orchestrator.stop_listener(&id).await;
-        let logs = orchestrator.get_logs(500).await.join("\n");
+        let logs = orchestrator.get_logs(500).await.iter().map(|entry| entry.line.clone()).collect::<Vec<_>>().join("\n");
         let ratio = {
             let map = orchestrator.last_context_ratio.lock().await;
             map.get("cid-ratio").copied()
@@ -2387,7 +2901,7 @@ process.stdout.write(JSON.stringify({
 
         let logs = orchestrator.get_logs(200).await;
         assert!(
-            logs.iter().any(|line| line.contains("[event] ready")),
+            logs.iter().any(|entry| entry.line.contains("[event] ready")),
             "日志里应保留 ready 原文"
         );
 
@@ -2399,8 +2913,11 @@ process.stdout.write(JSON.stringify({
         );
 
         let after = orchestrator.get_all_listener_status().await;
-        assert_eq!(after[0].state, ListenerState::Stopped);
-        assert!(!after[0].ready);
+        assert!(
+            after.iter().all(|status| status.id != id),
+            "停止后不应再上报该路监听（否则界面会残留一行），实际: {:?}",
+            after
+        );
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

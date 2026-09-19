@@ -1,34 +1,5 @@
 import { useState } from "react";
-
-interface Project {
-  id: string;
-  name: string;
-  work_dir: string;
-  agent_cli_path: string;
-  dingtalk_cli_path: string;
-  im_platform: string;
-  agent_platform: string;
-  reply_enabled: boolean;
-  reply_timeout_ms: number;
-  reply_max_chars: number;
-  context_enabled: boolean;
-  context_message_limit: number;
-  context_max_chars: number;
-  created_at: string;
-  updated_at: string;
-}
-
-interface Session {
-  id: string;
-  project_id: string;
-  name: string;
-  conversation_id: string;
-  created_at: string;
-  /** group / direct / unknown */
-  kind: string;
-  /** 名字是否已知；未知时显示会话 id 作提示 */
-  name_known: boolean;
-}
+import type { Project, Session } from "../types";
 
 /** 群聊 / 单聊标签：样式与文案都在这里，列表里两处复用。 */
 function KindTag({ kind }: { kind: string }) {
@@ -108,6 +79,7 @@ interface ProjectListProps {
   busyKey: string | null;
   onSelectSession: (session: Session, project: Project | null) => void;
   onAssignConversation: (conversationId: string, projectId: string) => void;
+  onDeleteSession: (session: Session) => void;
   onEditProject: (project: Project) => void;
   onDeleteProject: (id: string) => void;
   onToggleListener: (project: Project, kind: ListenKind, active: boolean) => void;
@@ -132,6 +104,7 @@ export default function ProjectList({
   busyKey,
   onSelectSession,
   onAssignConversation,
+  onDeleteSession,
   onEditProject,
   onDeleteProject,
   onToggleListener,
@@ -203,7 +176,14 @@ export default function ProjectList({
                 <div style={{ display: "flex", gap: "6px", marginTop: "6px", flexWrap: "wrap" }}>
                   {KINDS.map(({ kind, label }) => {
                     const status = statuses[kind];
-                    const active = Boolean(status?.ready);
+                    // 「有实例在跑/正在起」就算开着，按钮给「停止」。
+                    // 只看 ready 的话，启动中（最长 30s）和退避重试期间按钮还是「启动」，
+                    // 再点一次就会又起一路监听 —— 这正是「一个项目出现多个监听」的来源。
+                    const live =
+                      status?.state === "starting" ||
+                      status?.state === "running" ||
+                      status?.state === "backing_off";
+                    const active = live;
                     const key = `${project.id}:${kind}`;
                     const busy = busyKey === key;
                     return (
@@ -247,6 +227,13 @@ export default function ProjectList({
 
                 <div style={{ fontSize: "10px", color: "var(--text-muted)", marginTop: "4px" }}>
                   工作目录：{project.work_dir}
+                  {/* 监听范围：留空就是「所有群、所有人」，要说清楚 */}
+                  <span style={{ marginLeft: "6px", color: "var(--text-secondary)" }}>
+                    · 监听范围：
+                    {project.group_ids.length === 0 && project.member_ids.length === 0
+                      ? "所有群 / 所有人"
+                      : `${project.group_ids.length} 个群 / ${project.member_ids.length} 个人`}
+                  </span>
                 </div>
               </div>
 
@@ -276,9 +263,36 @@ export default function ProjectList({
                             backgroundColor: selected ? "var(--bg-active)" : "transparent",
                           }}
                         >
-                          <div style={{ fontSize: "12px", color: "var(--text-primary)" }}>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "6px",
+                              fontSize: "12px",
+                              color: "var(--text-primary)",
+                            }}
+                          >
                             <KindTag kind={session.kind} />
-                            {session.name}
+                            <span
+                              style={{
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {session.name}
+                            </span>
+                            <button
+                              title="删除这个会话"
+                              onClick={(e) => {
+                                // 别把点击冒泡成「选中会话」：删完就跳进空会话很困惑。
+                                e.stopPropagation();
+                                onDeleteSession(session);
+                              }}
+                              style={{ ...iconButton, marginLeft: "auto", color: "var(--danger)" }}
+                            >
+                              删除
+                            </button>
                           </div>
                           {/* 名字已知时不再重复显示会话 id，省一行视觉噪音 */}
                           {!session.name_known && (
@@ -332,9 +346,35 @@ export default function ProjectList({
                   onClick={() => onSelectSession(session, null)}
                   style={{ cursor: "pointer" }}
                 >
-                  <div style={{ fontSize: "12px", color: "var(--text-primary)" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "12px",
+                      color: "var(--text-primary)",
+                    }}
+                  >
                     <KindTag kind={session.kind} />
-                    {session.name}
+                    <span
+                      style={{
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {session.name}
+                    </span>
+                    <button
+                      title="删除这个会话"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDeleteSession(session);
+                      }}
+                      style={{ ...iconButton, marginLeft: "auto", color: "var(--danger)" }}
+                    >
+                      删除
+                    </button>
                   </div>
                   {!session.name_known && (
                     <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>

@@ -303,22 +303,6 @@ pub async fn set_data_dir(path: String) -> Result<DataPaths, String> {
     Ok(paths_snapshot())
 }
 
-/// 设置某个 IM 平台上的自身身份 id（用于跳过自己发的消息）。
-/// 身份是**按平台**存的：以后接入别的 IM，各自有自己的身份。
-#[tauri::command]
-pub async fn set_im_identity(platform_id: String, identity: Option<String>) -> Result<(), String> {
-    let mut config = load_config().unwrap_or_default();
-    match identity.filter(|id| !id.trim().is_empty()) {
-        Some(id) => {
-            config.im_identities.insert(platform_id, id);
-        }
-        None => {
-            config.im_identities.remove(&platform_id);
-        }
-    }
-    save_config(&config).map_err(|e| e.to_string())
-}
-
 /// 把 settings.json 快照成回复引擎需要的配置。
 /// Agent 工作目录留空时回退到程序配置目录下的专用子目录，而不是宿主任意目录。
 ///
@@ -354,6 +338,9 @@ pub fn reply_settings() -> crate::reply::ReplySettings {
         compress_trigger_turns: config.compress_trigger_turns,
         compress_trigger_chars: config.compress_trigger_chars,
         compress_trigger_percent: config.compress_trigger_percent,
+        // 监听范围是项目级的，这里没有项目上下文 → 不限制。
+        group_ids: Vec::new(),
+        member_ids: Vec::new(),
     }
 }
 
@@ -424,6 +411,9 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
         compress_trigger_turns: global.compress_trigger_turns,
         compress_trigger_chars,
         compress_trigger_percent,
+        // 监听范围随项目走：留空 = 所有群、所有人。
+        group_ids: project.group_ids.clone(),
+        member_ids: project.member_ids.clone(),
     }
 }
 

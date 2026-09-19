@@ -5,43 +5,12 @@ import ProjectList from "./components/ProjectList";
 import MessageView from "./components/MessageView";
 import ContextPanel from "./components/ContextPanel";
 import ProjectDialog from "./components/ProjectDialog";
-import EventStream from "./components/EventStream";
+import EventLog from "./components/EventLog";
 import ListenerLogs from "./components/ListenerLogs";
-import ReplyHistory from "./components/ReplyHistory";
-import ProvidersView from "./components/ProvidersView";
 import OverviewView from "./components/OverviewView";
 import SettingsPanel from "./components/SettingsPanel";
 import { ThemeToggle } from "./theme";
-
-interface Project {
-  id: string;
-  name: string;
-  work_dir: string;
-  agent_cli_path: string;
-  dingtalk_cli_path: string;
-  im_platform: string;
-  agent_platform: string;
-  reply_enabled: boolean;
-  reply_timeout_ms: number;
-  reply_max_chars: number;
-  context_enabled: boolean;
-  context_message_limit: number;
-  context_max_chars: number;
-  created_at: string;
-  updated_at: string;
-}
-
-interface Session {
-  id: string;
-  project_id: string;
-  name: string;
-  conversation_id: string;
-  created_at: string;
-  /** group / direct / unknown，用来打「群聊·单聊」标签 */
-  kind: string;
-  /** 是否已知名字；未知时界面回退显示会话 id */
-  name_known: boolean;
-}
+import type { Project, Session } from "./types";
 
 type ListenKind = "at-me" | "all-direct";
 
@@ -78,14 +47,12 @@ type ListenerUpdate =
   | { type: "event"; event: unknown }
   | { type: "log"; listener_id: string; line: string };
 
-type View = "overview" | "events" | "replies" | "logs" | "providers";
+type View = "overview" | "events" | "logs";
 
 const VIEWS: { view: View; label: string }[] = [
   { view: "overview", label: "运行总览" },
-  { view: "events", label: "实时事件流" },
-  { view: "replies", label: "回复历史" },
+  { view: "events", label: "事件与回复" },
   { view: "logs", label: "监听日志" },
-  { view: "providers", label: "提供方检测" },
 ];
 
 function App() {
@@ -261,6 +228,30 @@ function App() {
     }
   };
 
+  /** 删除会话：从左树与统计里去掉（事件仍在「事件与回复」里可查）。 */
+  const handleDeleteConversation = async (session: Session) => {
+    if (
+      !confirm(
+        `删除会话「${session.name}」？\n\n` +
+          "它会从左树与统计里消失，Agent 会话记录一并清掉；" +
+          "历史事件不会被删（仍可在「事件与回复」里查）。\n" +
+          "之后该会话再来新消息，它会自动重新出现。",
+      )
+    ) {
+      return;
+    }
+    try {
+      await invoke("delete_conversation", { conversationId: session.conversation_id });
+      const list = await loadProjects();
+      await loadSessions(list);
+      if (selectedSession?.conversation_id === session.conversation_id) {
+        setSelectedSession(null);
+      }
+    } catch (e) {
+      setBanner(String(e));
+    }
+  };
+
   const handleDeleteProject = async (id: string) => {
     if (!confirm("确定要删除这个项目吗？（已落盘的事件与会话记录不会删除）")) return;
     try {
@@ -370,6 +361,7 @@ function App() {
             busyKey={busyKey}
             onSelectSession={handleSelectSession}
             onAssignConversation={handleAssignConversation}
+            onDeleteSession={handleDeleteConversation}
             onEditProject={(project) => {
               setEditingProject(project);
               setShowProjectDialog(true);
@@ -431,15 +423,11 @@ function App() {
             {selectedSession ? (
               <MessageView session={selectedSession} />
             ) : view === "overview" ? (
-              <OverviewView />
+              <OverviewView projects={projects} />
             ) : view === "events" ? (
-              <EventStream refreshToken={refreshToken} />
-            ) : view === "replies" ? (
-              <ReplyHistory />
-            ) : view === "logs" ? (
-              <ListenerLogs />
+              <EventLog refreshToken={refreshToken} projects={projects} />
             ) : (
-              <ProvidersView />
+              <ListenerLogs projects={projects} />
             )}
           </div>
         </div>

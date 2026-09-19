@@ -18,6 +18,12 @@ pub struct Project {
     pub context_enabled: bool,
     pub context_message_limit: usize,
     pub context_max_chars: usize,
+    /// 监听范围：只处理这些群（会话 id）。空 = 不限群。
+    #[serde(default)]
+    pub group_ids: Vec<String>,
+    /// 监听范围：只处理这些人（open id，或单聊的会话 id）。空 = 不限人。
+    #[serde(default)]
+    pub member_ids: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -46,6 +52,8 @@ impl Project {
             context_enabled: true,
             context_message_limit: 50,
             context_max_chars: 8000,
+            group_ids: Vec::new(),
+            member_ids: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -54,7 +62,17 @@ impl Project {
 
 const SELECT_COLUMNS: &str = "id, name, work_dir, agent_cli_path, dingtalk_cli_path,
     im_platform, agent_platform, reply_enabled, reply_timeout_ms, reply_max_chars,
-    context_enabled, context_message_limit, context_max_chars, created_at, updated_at";
+    context_enabled, context_message_limit, context_max_chars, created_at, updated_at,
+    group_ids, member_ids";
+
+/// 名单列存的是 JSON 数组文本；解析失败按空名单处理（不限制）。
+fn parse_ids(raw: String) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+}
+
+fn ids_to_json(ids: &[String]) -> String {
+    serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())
+}
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -73,6 +91,8 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         context_max_chars: row.get(12)?,
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
+        group_ids: parse_ids(row.get(15)?),
+        member_ids: parse_ids(row.get(16)?),
     })
 }
 
@@ -101,6 +121,8 @@ impl ProjectStore {
                 context_enabled INTEGER NOT NULL DEFAULT 1,
                 context_message_limit INTEGER NOT NULL DEFAULT 50,
                 context_max_chars INTEGER NOT NULL DEFAULT 8000,
+                group_ids TEXT NOT NULL DEFAULT '[]',
+                member_ids TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );",
@@ -109,6 +131,8 @@ impl ProjectStore {
         for stmt in [
             "ALTER TABLE projects ADD COLUMN im_platform TEXT NOT NULL DEFAULT 'dingtalk'",
             "ALTER TABLE projects ADD COLUMN agent_platform TEXT NOT NULL DEFAULT 'qoder'",
+            "ALTER TABLE projects ADD COLUMN group_ids TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE projects ADD COLUMN member_ids TEXT NOT NULL DEFAULT '[]'",
         ] {
             let _ = db.execute(stmt, []);
         }
@@ -120,8 +144,9 @@ impl ProjectStore {
         self.db.execute(
             "INSERT INTO projects (id, name, work_dir, agent_cli_path, dingtalk_cli_path,
              im_platform, agent_platform, reply_enabled, reply_timeout_ms, reply_max_chars,
-             context_enabled, context_message_limit, context_max_chars, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             context_enabled, context_message_limit, context_max_chars, created_at, updated_at,
+             group_ids, member_ids)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 project.id,
                 project.name,
@@ -138,6 +163,8 @@ impl ProjectStore {
                 project.context_max_chars,
                 project.created_at,
                 project.updated_at,
+                ids_to_json(&project.group_ids),
+                ids_to_json(&project.member_ids),
             ],
         )?;
         Ok(())
@@ -173,8 +200,8 @@ impl ProjectStore {
              dingtalk_cli_path = ?4, im_platform = ?5, agent_platform = ?6,
              reply_enabled = ?7, reply_timeout_ms = ?8, reply_max_chars = ?9,
              context_enabled = ?10, context_message_limit = ?11, context_max_chars = ?12,
-             updated_at = ?13
-             WHERE id = ?14",
+             updated_at = ?13, group_ids = ?14, member_ids = ?15
+             WHERE id = ?16",
             params![
                 project.name,
                 project.work_dir,
@@ -189,6 +216,8 @@ impl ProjectStore {
                 project.context_message_limit,
                 project.context_max_chars,
                 now,
+                ids_to_json(&project.group_ids),
+                ids_to_json(&project.member_ids),
                 project.id,
             ],
         )?;
@@ -211,10 +240,12 @@ pub async fn create_project(
     dingtalk_cli_path: String,
     im_platform: Option<String>,
     agent_platform: Option<String>,
+    group_ids: Option<Vec<String>>,
+    member_ids: Option<Vec<String>>,
 ) -> Result<Project, String> {
     let data_dir = crate::config::data_dir();
     let store = ProjectStore::new(data_dir).map_err(|e| e.to_string())?;
-    let project = Project::new(
+    let mut project = Project::new(
         name,
         work_dir,
         agent_cli_path,
@@ -222,6 +253,9 @@ pub async fn create_project(
         im_platform.unwrap_or_else(|| "dingtalk".to_string()),
         agent_platform.unwrap_or_else(|| "qoder".to_string()),
     );
+    // 监听范围：留空 = 所有群、所有人。
+    project.group_ids = group_ids.unwrap_or_default();
+    project.member_ids = member_ids.unwrap_or_default();
     store.create(&project).map_err(|e| e.to_string())?;
     Ok(project)
 }
