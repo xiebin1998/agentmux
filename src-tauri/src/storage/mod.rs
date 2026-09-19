@@ -692,4 +692,78 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn sample_event(message_id: &str, conversation_id: &str, project_id: &str) -> ChatEvent {
+        ChatEvent {
+            project_id: project_id.to_string(),
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sender: "同事".to_string(),
+            sender_open_dingtalk_id: "open-other".to_string(),
+            content: "@我 看一下".to_string(),
+            create_time: "2026-09-19T10:00:00+08:00".to_string(),
+            received_at: "2026-09-19T10:00:01+08:00".to_string(),
+            listen_kind: "at_me".to_string(),
+            malformed: false,
+            raw: "{}".to_string(),
+        }
+    }
+
+    fn conversation_ids(rows: &[ConversationSummary]) -> Vec<String> {
+        rows.iter().map(|row| row.conversation_id.clone()).collect()
+    }
+
+    /// 回归（问题 5）：升级前的历史会话 `project_id` 为空，既不归属任何项目，
+    /// 又要能被看到并「归入」某个项目 —— 否则用户会觉得「我之前的会话不见了」。
+    #[test]
+    fn unassigned_conversations_are_visible_and_can_be_assigned() {
+        let dir = std::env::temp_dir().join("agentmux-assign-conversation-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir.clone()).unwrap();
+
+        // 一条升级前的遗留会话（project_id 为空）+ 一条已归属 p1 的会话。
+        storage
+            .save_event(&sample_event("msg-old", "cid-old", ""))
+            .unwrap();
+        storage
+            .save_event(&sample_event("msg-new", "cid-new", "p1"))
+            .unwrap();
+
+        // 未归类视图能看到遗留会话，且它不出现在任何项目下。
+        let unassigned = storage.list_conversations(None, true).unwrap();
+        assert_eq!(
+            conversation_ids(&unassigned),
+            vec!["cid-old".to_string()],
+            "遗留会话应出现在「未归类」里"
+        );
+        assert_eq!(
+            conversation_ids(&storage.list_conversations(Some("p1"), false).unwrap()),
+            vec!["cid-new".to_string()],
+            "未归属的会话不应混进项目列表"
+        );
+
+        // 归入 p1 之后，它从「未归类」消失、出现在 p1 下。
+        let changed = storage.assign_conversation("cid-old", "p1").unwrap();
+        assert_eq!(changed, 1, "应归类 1 条事件");
+
+        assert!(
+            storage.list_conversations(None, true).unwrap().is_empty(),
+            "归类后不应再留在「未归类」里"
+        );
+        let mut p1 = conversation_ids(&storage.list_conversations(Some("p1"), false).unwrap());
+        p1.sort();
+        assert_eq!(p1, vec!["cid-new".to_string(), "cid-old".to_string()]);
+
+        // 已有归属的会话不会被后来的归类改动（避免覆盖用户的选择）。
+        assert_eq!(
+            storage.assign_conversation("cid-new", "p2").unwrap(),
+            0,
+            "已归属会话不应被抢走"
+        );
+        let mut after = conversation_ids(&storage.list_conversations(Some("p1"), false).unwrap());
+        after.sort();
+        assert_eq!(after, vec!["cid-new".to_string(), "cid-old".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
