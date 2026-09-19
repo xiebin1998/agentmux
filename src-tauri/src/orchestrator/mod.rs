@@ -1131,6 +1131,157 @@ process.stdin.on("end", function () { process.exit(0); });
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    /// 桩 dws 的收事件端：stderr 打 ready，stdout 打一条真实形态的事件。
+    const EVENT_STUB: &str = r#"
+const READY = "[event] ready event_key=user_im_message_receive_at subscribe_id=subId-stub bus_pid=1";
+const EVT = JSON.stringify({
+  type: "user_im_message_receive_at",
+  subscribe_id: "subId-stub",
+  message_id: "msg-stub-1",
+  conversation_id: "cid-1",
+  sender: "张三",
+  sender_open_dingtalk_id: "open-1",
+  content: "@我 你好",
+  create_time: "2026-09-19 18:00:00"
+});
+process.stderr.write(READY + "\n");
+setTimeout(function () { process.stdout.write(EVT + "\n"); }, 200);
+process.stdin.resume();
+process.stdin.on("end", function () { process.exit(0); });
+"#;
+
+    /// 桩 dws 的发送端：把收到的参数原样记到 cwd 下的 send-record.json，并回一个 messageId。
+    const CHAT_STUB: &str = r#"
+const fs = require("fs");
+fs.writeFileSync("send-record.json", JSON.stringify(process.argv.slice(2)));
+process.stdout.write(JSON.stringify({ result: { messageId: "sent-stub-1" } }));
+"#;
+
+    /// 桩 Agent CLI：回显自己的工作目录，用来证明宿主用的是**项目的工作目录**。
+    ///
+    /// 必须是脚本文件而不是 `node -e`：宿主会在参数末尾追加 `--session-id <uuid>`，
+    /// 而 `node -e "code" --session-id x` 会被 node 当成自己的非法选项直接报错
+    /// （真实 CLI 是二进制，会把它们当脚本参数吃掉）。
+    const AGENT_STUB: &str = r#"
+process.stdout.write("收到 " + process.cwd());
+"#;
+
+    /// 项目级**完整回复闭环**（问题 1/2/3/5 的联合验证），全程用桩：
+    /// 桩 dws 收事件 → 落盘（带 project_id）→ 桩 Agent 生成（断言 cwd 是**项目工作目录**）
+    /// → 剔除 @ → 桩 dws 发送（断言发出的会话与幂等键）→ 台账标记 sent。
+    #[tokio::test]
+    async fn project_scoped_reply_loop_runs_end_to_end() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let base = std::env::temp_dir().join("agentmux-e2e-scoped");
+        let _ = std::fs::remove_dir_all(&base);
+        let stub_dir = base.join("stub");
+        let work_dir = base.join("project-workdir");
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        // 把 node 当作「dws」：它按第一个参数找脚本，所以 event / chat 两个桩都能被接住。
+        std::fs::write(stub_dir.join("event"), EVENT_STUB).unwrap();
+        std::fs::write(stub_dir.join("chat"), CHAT_STUB).unwrap();
+        std::fs::write(stub_dir.join("agentstub"), AGENT_STUB).unwrap();
+        // Agent 用绝对路径：它的 cwd 是**项目工作目录**（不是 stub 目录），
+        // 相对路径会找不到脚本。真实场景同样是指向 CLI 的绝对路径。
+        let agent_stub_path = stub_dir.join("agentstub").to_string_lossy().to_string();
+
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let orchestrator = Orchestrator::new(storage.clone());
+
+        let node_for_agent = node.clone();
+        orchestrator.set_dws_path(Some(node)).await;
+
+        // 模拟「创建项目时指定的工作目录」：Agent 必须在这个目录里被驱动。
+        let settings = ReplySettings {
+            enabled: true,
+            agent_platform: "stub".to_string(),
+            agent_cli_path: Some(node_for_agent),
+            agent_args: Some(vec![agent_stub_path]),
+            agent_cwd: work_dir.to_string_lossy().to_string(),
+            timeout_ms: 20_000,
+            max_chars: 500,
+            ..Default::default()
+        };
+
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener("proj-A".to_string(), ListenKind::AtMe, settings, None)
+            .await
+            .expect("应能启动监听");
+
+        // 等回复台账变成终态（生成与发送都要走桩进程）。
+        let mut rows = Vec::new();
+        for _ in 0..160 {
+            sleep(Duration::from_millis(250)).await;
+            rows = storage
+                .lock()
+                .await
+                .list_events(&EventQuery {
+                    limit: 10,
+                    project_id: Some("proj-A".to_string()),
+                    ..Default::default()
+                })
+                .unwrap();
+            if rows.iter().any(|row| row.reply_status.is_some()) {
+                break;
+            }
+        }
+
+        let _ = orchestrator.stop_listener(&id).await;
+        let record = std::fs::read_to_string(stub_dir.join("send-record.json")).ok();
+        std::env::set_current_dir(previous).unwrap();
+
+        assert_eq!(rows.len(), 1, "应只落盘 1 条事件，实际 {:?}", rows);
+        let row = &rows[0];
+        assert_eq!(row.project_id, "proj-A", "事件应归属到发起监听的项目");
+        assert_eq!(row.conversation_id, "cid-1");
+        assert_eq!(
+            row.reply_status.as_deref(),
+            Some("sent"),
+            "回复应真实发出，台账正文: {:?}",
+            row.reply_text
+        );
+
+        let reply = row.reply_text.clone().unwrap_or_default();
+        assert!(reply.contains("收到"), "回复应是 Agent 的输出，实际: {}", reply);
+        assert!(
+            reply.contains(&work_dir.file_name().unwrap().to_string_lossy().to_string()),
+            "Agent 必须在**项目的工作目录**里运行（回显 cwd），实际: {}",
+            reply
+        );
+        assert!(!reply.contains('@'), "回复正文里的 @ 应被剔除，实际: {}", reply);
+
+        // 断言真正发出去的参数：回到原会话、用原 message_id 做幂等键。
+        let record = record.expect("桩 dws 应记录到一次发送调用");
+        assert!(record.contains("+messages-send"), "应调用发送: {}", record);
+        assert!(record.contains("cid-1"), "应发回原会话: {}", record);
+        assert!(
+            record.contains("msg-stub-1"),
+            "幂等键应用原 message_id: {}",
+            record
+        );
+
+        // 左树的数据来源：会话按项目聚合，且统计到 1 条已回复。
+        let mine = storage
+            .lock()
+            .await
+            .list_conversations(Some("proj-A"))
+            .unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].replied, 1, "应统计到 1 条已回复");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn ready_line_parses_subscribe_id_and_bus_pid() {
         let line = "[event] ready event_key=user_im_message_receive_at bus_pid=22304 subscribe_id=subId-3a58";
