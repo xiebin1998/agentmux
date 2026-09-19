@@ -31,6 +31,9 @@ pub struct ReplySettings {
     /// D-59：阈值未定，None = 不按该维度自动触发（不拍脑袋定值）。
     pub compress_trigger_turns: Option<usize>,
     pub compress_trigger_chars: Option<usize>,
+    /// 滑块给的「上下文占用百分比」。有它且 Agent 回报过占比时，
+    /// 压缩只按占比判定（自适应），字符阈值退成没有基线时的兜底。
+    pub compress_trigger_percent: Option<u8>,
 }
 
 impl Default for ReplySettings {
@@ -50,6 +53,7 @@ impl Default for ReplySettings {
             auto_compress: false,
             compress_trigger_turns: None,
             compress_trigger_chars: None,
+            compress_trigger_percent: None,
         }
     }
 }
@@ -67,6 +71,91 @@ pub fn default_agent_args(platform_id: &str) -> Vec<String> {
         "claude" => vec!["-p".to_string()],
         // Codex 的默认参数标为待决：未实测，不做猜测。
         _ => vec!["-p".to_string()],
+    }
+}
+
+/// 让 CLI 用 JSON 输出结果的参数。
+///
+/// 只有拿到 JSON 才能读到**模型名**与 `context_usage_ratio`（CLI 自己算好的
+/// 上下文占用比例），压缩判定才能不靠估算。实测 qodercli 支持 `-o json`。
+/// 未实测的平台不猜：返回空，解析侧会退化成「把输出当纯文本」的老行为。
+pub fn json_output_args(platform_id: &str) -> Vec<String> {
+    match platform_id {
+        "qoder" => vec!["-o".to_string(), "json".to_string()],
+        "claude" => vec!["--output-format".to_string(), "json".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// 一次生成的结果：正文 + 可观测元信息。
+#[derive(Debug, Clone, Default)]
+pub struct Generation {
+    pub text: String,
+    /// Agent 实际用的模型名（JSON 的 modelUsage 键）。
+    pub model: Option<String>,
+    /// 上下文占用比例（0~1），CLI 自己算的，用来做自适应压缩。
+    pub context_usage_ratio: Option<f64>,
+}
+
+/// 解析 CLI 的输出。**必须容忍噪声**：实测 qodercli 的 stdout 第一行是
+/// `1 error loading agent configs. Use /agents to see details.`，真正的 JSON 在后面。
+/// 解析不出来就退回「整段当正文」，保证不支持的平台照旧能用。
+pub fn parse_generation(stdout: &str) -> Generation {
+    let fallback = Generation {
+        text: stdout.trim().to_string(),
+        model: None,
+        context_usage_ratio: None,
+    };
+
+    // 从后往前找第一个「含 result 字段的 JSON 对象」。
+    let parsed = stdout
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|value| value.get("result").is_some());
+
+    let Some(value) = parsed else {
+        // 输出里有 JSON 但挑不出 result：宁可让上层判失败，也不要把一整块
+        // JSON 当成回复发给对方。
+        let json_shaped = stdout
+            .lines()
+            .any(|line| serde_json::from_str::<serde_json::Value>(line.trim()).is_ok());
+        return if json_shaped {
+            Generation {
+                text: String::new(),
+                model: None,
+                context_usage_ratio: None,
+            }
+        } else {
+            fallback
+        };
+    };
+
+    let Some(text) = value.get("result").and_then(|item| item.as_str()) else {
+        return Generation {
+            text: String::new(),
+            model: None,
+            context_usage_ratio: None,
+        };
+    };
+
+    // 模型名：modelUsage 的键。可能一次返回多个，取第一个即可用于显示。
+    let model = value
+        .get("modelUsage")
+        .and_then(|usage| usage.as_object())
+        .and_then(|map| map.keys().next().cloned())
+        .filter(|name| !name.is_empty());
+
+    let context_usage_ratio = value
+        .get("usage")
+        .and_then(|usage| usage.get("context_usage_ratio"))
+        .and_then(|ratio| ratio.as_f64())
+        .filter(|ratio| *ratio > 0.0);
+
+    Generation {
+        text: text.trim().to_string(),
+        model,
+        context_usage_ratio,
     }
 }
 
@@ -267,21 +356,26 @@ pub fn context_lines(
     picked
 }
 
-/// 调 Agent CLI 生成回复。返回 (纯文本, 可能出现的会话 id)。
+/// 调 Agent CLI 生成回复。
 pub async fn generate(
     settings: &ReplySettings,
     prompt: &str,
     session_id: Option<&str>,
     resume: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Generation> {
     let bin = settings
         .agent_cli_path
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("未配置 Agent CLI 路径"))?;
 
+    // 用户显式覆盖了参数就不动它：强行追加可能和用户自己的输出格式冲突。
     let mut args = match settings.agent_args.as_ref() {
         Some(overridden) if !overridden.is_empty() => overridden.clone(),
-        _ => default_agent_args(&settings.agent_platform),
+        _ => {
+            let mut args = default_agent_args(&settings.agent_platform);
+            args.extend(json_output_args(&settings.agent_platform));
+            args
+        }
     };
     // 会话参数必须追加在末尾，理由见模块头注释。
     if let Some(session_id) = session_id {
@@ -351,7 +445,12 @@ pub async fn generate(
         anyhow::bail!("生成结果为空: {}", truncate(stderr.trim(), 300));
     }
 
-    Ok(stdout)
+    let generation = parse_generation(&stdout);
+    if generation.text.is_empty() {
+        anyhow::bail!("生成结果为空: {}", truncate(stderr.trim(), 300));
+    }
+
+    Ok(generation)
 }
 
 async fn read_pipe<R>(pipe: Option<R>) -> String
@@ -556,6 +655,46 @@ mod tests {
         assert!(has_cjk("ok，收到")); // 夹带英文但有中文，算通过
     }
 
+    /// 真实抓到的 qodercli `-o json` 输出：**第一行是噪声**，JSON 在后面。
+    /// 这段是实测原文（2026-09-19，qodercli 1.1.55），不是编的。
+    const REAL_QODERCLI_STDOUT: &str = "1 error loading agent configs. Use /agents to see details.\n{\"type\":\"result\",\"subtype\":\"success\",\"duration_ms\":4117,\"is_error\":false,\"num_turns\":1,\"result\":\"在的，还没吃呢，你吃了没？\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"context_usage_ratio\":0.01399},\"modelUsage\":{\"bailian/qwen3.7-plus-cp\":{\"inputTokens\":0,\"outputTokens\":0,\"contextWindow\":0,\"maxOutputTokens\":0}},\"session_id\":\"b79e026d-3368-48f4-86e0-8df609499741\"}";
+
+    #[test]
+    fn parses_real_qodercli_json_and_reads_model_and_ratio() {
+        let generation = parse_generation(REAL_QODERCLI_STDOUT);
+
+        assert_eq!(generation.text, "在的，还没吃呢，你吃了没？");
+        assert_eq!(
+            generation.model.as_deref(),
+            Some("bailian/qwen3.7-plus-cp"),
+            "模型名应取 modelUsage 的键"
+        );
+        let ratio = generation.context_usage_ratio.expect("应读到上下文占比");
+        assert!((ratio - 0.01399).abs() < 1e-9, "实际 {}", ratio);
+    }
+
+    /// 不支持 JSON 的 CLI（或用户自定义参数）：整段当正文，行为与改前一致。
+    #[test]
+    fn plain_text_output_still_works() {
+        let generation = parse_generation("收到 D:\\work\\my-project\n");
+
+        assert_eq!(generation.text, "收到 D:\\work\\my-project");
+        assert!(generation.model.is_none());
+        assert!(generation.context_usage_ratio.is_none());
+    }
+
+    /// 是 JSON 但拿不到 result：不能把整块 JSON 当回复发出去，应判为空让上层失败。
+    #[test]
+    fn json_without_result_yields_empty_text_instead_of_sending_raw_json() {
+        let generation = parse_generation("{\"type\":\"error\",\"message\":\"boom\"}");
+
+        assert!(
+            generation.text.is_empty(),
+            "不该把原始 JSON 当回复，实际: {}",
+            generation.text
+        );
+    }
+
     #[test]
     fn bare_mention_gets_a_placeholder_instead_of_an_empty_question() {
         // 回归：裸 @ 曾经被上层直接跳过，导致「收到消息但没回复」
@@ -633,7 +772,7 @@ mod tests {
             .expect("stub 生成应成功");
 
         std::env::remove_var("QODER_AGENT_SDK_ENTRYPOINT");
-        assert_eq!(output, "undefined", "子进程不应继承 SDK entrypoint 变量");
+        assert_eq!(output.text, "undefined", "子进程不应继承 SDK entrypoint 变量");
     }
 
     /// 默认 `#[ignore]`：会真的调一次模型（耗时且产生用量），
@@ -660,9 +799,13 @@ mod tests {
             .expect("真实 qodercli 应能非交互生成");
 
         assert!(
-            output.contains("收到"),
+            output.text.contains("收到"),
             "真实生成结果应包含预期文本，实际: {}",
-            output
+            output.text
+        );
+        assert!(
+            output.context_usage_ratio.is_some(),
+            "真实 qodercli 应回报 context_usage_ratio（自适应压缩的依据）"
         );
     }
 }

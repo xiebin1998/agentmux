@@ -348,6 +348,7 @@ pub fn reply_settings() -> crate::reply::ReplySettings {
         auto_compress: config.auto_compress,
         compress_trigger_turns: config.compress_trigger_turns,
         compress_trigger_chars: config.compress_trigger_chars,
+        compress_trigger_percent: config.compress_trigger_percent,
     }
 }
 
@@ -387,10 +388,11 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
             }
         });
 
-    // 压缩阈值：滑块给的是「上下文占预算的百分比」，换算成字符数交给压缩判定。
-    let compress_trigger_chars = global
-        .compress_trigger_percent
-        .filter(|percent| *percent > 0)
+    // 压缩阈值两条路：
+    // 1. 百分比——Agent 回报过上下文占比后，直接按真实占比判定（自适应）；
+    // 2. 字符数——由百分比按项目预算换算，只在还没有占比基线时兜底。
+    let compress_trigger_percent = global.compress_trigger_percent.filter(|percent| *percent > 0);
+    let compress_trigger_chars = compress_trigger_percent
         .map(|percent| {
             (project.context_max_chars as u64 * percent as u64 / 100).max(1) as usize
         })
@@ -412,6 +414,7 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
         auto_compress: global.auto_compress,
         compress_trigger_turns: global.compress_trigger_turns,
         compress_trigger_chars,
+        compress_trigger_percent,
     }
 }
 

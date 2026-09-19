@@ -98,6 +98,11 @@ pub struct Orchestrator {
     reply_inflight: Arc<Mutex<HashSet<String>>>,
     /// 攒批窗口长度，见 `DEFAULT_REPLY_BATCH_WINDOW`。
     reply_batch_window: Duration,
+    /// 每个会话最近一次生成时 CLI 报的**上下文占用比例**（0~1）。
+    /// 自适应压缩的依据：比按字符估算准，因为它是 Agent 自己算的。
+    last_context_ratio: Arc<Mutex<HashMap<String, f64>>>,
+    /// 追踪用：每条消息的接收时刻，用来在日志里打「距收到多少毫秒」。
+    trace_started: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 /// 攒批窗口：收到第一条后等这么久，把期间到达的同会话消息并成一次回复。
@@ -116,6 +121,8 @@ impl Orchestrator {
             reply_batches: Arc::new(Mutex::new(HashMap::new())),
             reply_inflight: Arc::new(Mutex::new(HashSet::new())),
             reply_batch_window: DEFAULT_REPLY_BATCH_WINDOW,
+            last_context_ratio: Arc::new(Mutex::new(HashMap::new())),
+            trace_started: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -230,6 +237,8 @@ impl Orchestrator {
             reply_batches: self.reply_batches.clone(),
             reply_inflight: self.reply_inflight.clone(),
             reply_batch_window: self.reply_batch_window,
+            last_context_ratio: self.last_context_ratio.clone(),
+            trace_started: self.trace_started.clone(),
             compress_failures: Arc::new(Mutex::new(0)),
             malformed_streak: Arc::new(Mutex::new(0)),
         };
@@ -327,6 +336,8 @@ struct Shared {
     reply_batches: Arc<Mutex<HashMap<String, Vec<ChatEvent>>>>,
     reply_inflight: Arc<Mutex<HashSet<String>>>,
     reply_batch_window: Duration,
+    last_context_ratio: Arc<Mutex<HashMap<String, f64>>>,
+    trace_started: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     compress_failures: Arc<Mutex<u32>>,
     /// 连续畸形事件计数：仅在连续出现时提示（D-40）。
     malformed_streak: Arc<Mutex<u32>>,
@@ -553,6 +564,33 @@ impl Shared {
         // 归属到「哪个项目的监听收到的」，左树与统计都按这个分。
         event.project_id = self.project_id.clone();
 
+        // 追踪起点：后面每一步都打「距收到多少毫秒」，哪一步后没有下一条
+        // 就是卡在哪一步。
+        if !event.message_id.is_empty() {
+            self.trace_started
+                .lock()
+                .await
+                .insert(event.message_id.clone(), std::time::Instant::now());
+        }
+        self.trace(
+            &event.message_id,
+            "① 收到事件",
+            &format!(
+                "监听={} kind={:?} 会话={} 发送者={}({}) 正文={}字",
+                self.id,
+                self.kind,
+                if event.conversation_id.is_empty() {
+                    "<空>"
+                } else {
+                    &event.conversation_id
+                },
+                event.sender,
+                event.sender_open_dingtalk_id,
+                event.content.chars().count()
+            ),
+        )
+        .await;
+
         let dedupe_key = if event.message_id.is_empty() {
             format!("raw:{}", trimmed)
         } else {
@@ -562,14 +600,23 @@ impl Shared {
         {
             let mut handled = self.handled.lock().await;
             if !handled.insert(dedupe_key) {
+                self.trace(&event.message_id, "② 去重", " 判定为重复消息，丢弃")
+                    .await;
                 return;
             }
         }
+        self.trace(&event.message_id, "② 去重", " 新消息，继续处理")
+            .await;
 
         {
             let storage = self.storage.lock().await;
             if let Err(err) = storage.save_event(&event) {
+                self.trace(&event.message_id, "③ 落盘", &format!(" 失败: {}", err))
+                    .await;
                 self.push_log(&format!("落盘失败: {}", err)).await;
+            } else {
+                self.trace(&event.message_id, "③ 落盘", " 成功（SQLite + ndjson）")
+                    .await;
             }
         }
 
@@ -604,10 +651,22 @@ impl Shared {
 
         // 先落盘再推流再回复：回复失败不影响事件已经安全落盘。
         if self.reply.enabled {
+            self.trace(
+                &event.message_id,
+                "⑤ 回复开关",
+                " 本项目已启用自动回复，进入回复链路",
+            )
+            .await;
             let shared = self.clone();
             let event = event.clone();
             tokio::spawn(async move { shared.schedule_reply(event).await });
         } else {
+            self.trace(
+                &event.message_id,
+                "⑤ 回复开关",
+                " 本项目未启用自动回复，只记录不回复",
+            )
+            .await;
             // 项目没开自动回复时，此前什么都不写，界面只看到「收到消息但没回复」
             // 却查不到原因（用户实际反馈过）。把原因记进台账，让它可见。
             let shared = self.clone();
@@ -626,12 +685,20 @@ impl Shared {
     /// `REPLY_BATCH_WINDOW` 内攒成一批，只生成并发送一条回复。
     async fn schedule_reply(&self, event: ChatEvent) {
         if event.malformed || event.conversation_id.is_empty() {
+            self.trace(
+                &event.message_id,
+                "⑥ 单条判定",
+                " 畸形或会话为空，跳过",
+            )
+            .await;
             self.finish_reply(&event, "skipped", None).await;
             return;
         }
 
         if let Some(self_id) = self.reply.self_open_id.as_ref() {
             if !self_id.is_empty() && *self_id == event.sender_open_dingtalk_id {
+                self.trace(&event.message_id, "⑥ 单条判定", " 发送者是本人，跳过")
+                    .await;
                 self.push_log("跳过自己发送的消息").await;
                 self.finish_reply(&event, "skipped", None).await;
                 return;
@@ -642,24 +709,58 @@ impl Shared {
         // 由 reply::build_prompt 用占位问句交给 Agent 自然回应。
         // 之前在这里直接 skip，用户看到的就是「收到消息但没回复」。
         if self.reply.agent_cli_path.is_none() {
+            self.trace(
+                &event.message_id,
+                "⑥ 单条判定",
+                " 未解析到 Agent CLI，无法生成回复",
+            )
+            .await;
             self.finish_reply(&event, "failed", Some("未解析到 Agent CLI，无法生成回复"))
                 .await;
             return;
         }
 
         let conversation = event.conversation_id.clone();
-        {
+        let batch = {
             let mut batches = self.reply_batches.lock().await;
-            batches
-                .entry(conversation.clone())
-                .or_default()
-                .push(event);
-            // 已经有窗口在等这个会话：这条会被那一次一起答掉，不再排新任务。
+            let bucket = batches.entry(conversation.clone()).or_default();
+            bucket.push(event);
+
+            // 已经在等窗口的会话不再排新任务，这条会被那一次一起答掉。
+            // 注意 HashSet::insert 返回 true 表示「新插入」——含义容易记反，
+            // 记反的后果是第一条消息就被当成「已有窗口」，flush 永远不排，
+            // 表现为「收到了但永远不回复」。
             let mut inflight = self.reply_inflight.lock().await;
-            if !inflight.insert(conversation.clone()) {
-                return;
-            }
+            let first_in_window = inflight.insert(conversation.clone());
+            let size = bucket.len();
+            (size, first_in_window)
+        };
+        let (size, first_in_window) = batch;
+
+        if !first_in_window {
+            self.trace(
+                &conversation,
+                "⑦ 进攒批",
+                &format!(
+                    " 已有窗口在等，并入当前批（本批已 {} 条），窗口 {}ms",
+                    size,
+                    self.reply_batch_window.as_millis()
+                ),
+            )
+            .await;
+            return;
         }
+
+        self.trace(
+            &conversation,
+            "⑦ 进攒批",
+            &format!(
+                " 开新窗口：本批第 {} 条，等 {}ms 收齐同会话消息",
+                size,
+                self.reply_batch_window.as_millis()
+            ),
+        )
+        .await;
 
         let shared = self.clone();
         tokio::spawn(async move { shared.flush_reply_batch(&conversation).await });
@@ -693,6 +794,21 @@ impl Shared {
             .await;
         }
 
+        self.trace(
+            conversation,
+            "⑧ 出批",
+            &format!(
+                " 窗口结束，本批 {} 条（message_id: {}）",
+                batch.len(),
+                batch
+                    .iter()
+                    .map(|item| item.message_id.chars().take(12).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .await;
+
         self.reply_to_batch(batch).await;
     }
 
@@ -715,15 +831,46 @@ impl Shared {
         // 全局串行：一次只处理一批回复。
         let _guard = self.reply_lock.lock().await;
 
+        // 这个会话上一次生成时 CLI 报的上下文占比，自适应压缩的依据。
+        let last_ratio = {
+            let ratios = self.last_context_ratio.lock().await;
+            ratios.get(&event.conversation_id).copied()
+        };
+        let compress_percent = if reply.auto_compress {
+            reply
+                .compress_trigger_percent
+                .map(|percent| format!("{}%", percent))
+                .unwrap_or_else(|| "未设".to_string())
+        } else {
+            "压缩已关".to_string()
+        };
+        self.trace(
+            &event.conversation_id,
+            "⑨ 压缩判定",
+            &format!(
+                " 开关={} 阈值={} 上次占比={} 字符阈值={:?}",
+                reply.auto_compress,
+                compress_percent,
+                last_ratio
+                    .map(|ratio| format!("{:.2}%", ratio * 100.0))
+                    .unwrap_or_else(|| "无基线".to_string()),
+                reply.compress_trigger_chars
+            ),
+        )
+        .await;
+
         // 自动压缩：失败只记日志，绝不阻塞本次回复（A7.2.3）。
         if compression_due_with(
             &self.storage,
             &self.compress_failures,
             &event.conversation_id,
             &reply,
+            last_ratio,
         )
         .await
         {
+            self.trace(&event.conversation_id, "⑨ 压缩判定", " → 触发压缩")
+                .await;
             match compress_with(&self.storage, reply.clone(), &event.conversation_id).await {
                 Ok(_) => *self.compress_failures.lock().await = 0,
                 Err(err) => {
@@ -757,6 +904,23 @@ impl Shared {
         } else {
             Vec::new()
         };
+
+        self.trace(
+            &event.conversation_id,
+            "⑩ 拉上下文",
+            &format!(
+                " 上下文={}（开关={} 上限 {} 条 / {} 字）",
+                if reply.context_enabled {
+                    format!("{} 条", context.len())
+                } else {
+                    "未启用".to_string()
+                },
+                reply.context_enabled,
+                reply.context_message_limit,
+                reply.context_max_chars
+            ),
+        )
+        .await;
 
         // 这一批里对方说的所有内容：多条并成一条回复时都要交给 Agent 看。
         let contents: Vec<String> = events.iter().map(|item| item.content.clone()).collect();
@@ -795,16 +959,68 @@ impl Shared {
 
         let mut settings = reply.clone();
         settings.agent_cli_path = Some(agent_cli);
+        let prompt_chars = prompt.chars().count();
+        let generation_started = std::time::Instant::now();
+
+        self.trace(
+            &event.conversation_id,
+            "⑪ 调 Agent",
+            &format!(
+                " CLI={} 会话模式={} prompt={}字 超时={}ms 工作目录={}",
+                settings
+                    .agent_cli_path
+                    .as_deref()
+                    .unwrap_or("<未配置>"),
+                if resume { "resume 复用" } else { "新建会话" },
+                prompt_chars,
+                settings.timeout_ms,
+                settings.agent_cwd
+            ),
+        )
+        .await;
 
         let raw = match crate::reply::generate(&settings, &prompt, Some(&session_id), resume).await
         {
             Ok(raw) => raw,
             Err(err) => {
+                self.trace(
+                    &event.conversation_id,
+                    "⑫ 生成失败",
+                    &format!(
+                        " 耗时 {}ms，错误: {}",
+                        generation_started.elapsed().as_millis(),
+                        err
+                    ),
+                )
+                .await;
                 self.finish_batch(&events, "failed", Some(&format!("生成失败: {}", err)))
                     .await;
                 return;
             }
         };
+
+        self.trace(
+            &event.conversation_id,
+            "⑫ 生成返回",
+            &format!(
+                " 耗时 {}ms 模型={} 上下文占比={} 输出={}字",
+                generation_started.elapsed().as_millis(),
+                raw.model.as_deref().unwrap_or("<CLI 未回报>"),
+                raw.context_usage_ratio
+                    .map(|ratio| format!("{:.2}%", ratio * 100.0))
+                    .unwrap_or_else(|| "<CLI 未回报>".to_string()),
+                raw.text.chars().count()
+            ),
+        )
+        .await;
+
+        // 记下这一轮的占比：下一轮压缩判定直接用，不再靠字符估算。
+        if let Some(ratio) = raw.context_usage_ratio {
+            self.last_context_ratio
+                .lock()
+                .await
+                .insert(event.conversation_id.clone(), ratio);
+        }
 
         if !resume {
             let storage = self.storage.lock().await;
@@ -816,11 +1032,32 @@ impl Shared {
             );
         }
 
-        let mut text = crate::reply::sanitize_reply(&raw, reply.max_chars);
+        let mut text = crate::reply::sanitize_reply(&raw.text, reply.max_chars);
         if text.is_empty() {
+            self.trace(
+                &event.conversation_id,
+                "⑬ 清洗",
+                &format!(
+                    " → 空（原始 {} 字），判为失败",
+                    raw.text.chars().count()
+                ),
+            )
+            .await;
             self.finish_batch(&events, "failed", Some("清洗后回复为空")).await;
             return;
         }
+
+        self.trace(
+            &event.conversation_id,
+            "⑬ 清洗",
+            &format!(
+                " {}字 → {}字（上限 {}）",
+                raw.text.chars().count(),
+                text.chars().count(),
+                reply.max_chars
+            ),
+        )
+        .await;
 
         // 会话是有记忆的：一旦某次按「我是编程助手」拒绝了，这条拒绝就留在会话里，
         // 之后 resume 同一会话会一直拒绝（实测）。识别到就换新会话重试一次，
@@ -830,13 +1067,26 @@ impl Shared {
                 "本次回复像是在拒绝（旧会话里可能有拒绝惯性），换新会话重试一次",
             )
             .await;
+            self.trace(
+                &event.conversation_id,
+                "⑭ 拒答重试",
+                &format!(" 命中拒答特征，原文: {}", truncate(&text, 120)),
+            )
+            .await;
 
             let fresh_id = uuid::Uuid::new_v4().to_string();
+            let retry_started = std::time::Instant::now();
             match crate::reply::generate(&settings, &prompt, Some(&fresh_id), false).await {
                 Ok(fresh_raw) => {
-                    let fresh_text = crate::reply::sanitize_reply(&fresh_raw, reply.max_chars);
+                    let fresh_text = crate::reply::sanitize_reply(&fresh_raw.text, reply.max_chars);
                     if fresh_text.is_empty() {
                         self.push_log("新会话重试得到空回复，保留原回复").await;
+                        self.trace(
+                            &event.conversation_id,
+                            "⑭ 拒答重试",
+                            " 新会话返回空，保留原回复",
+                        )
+                        .await;
                     } else {
                         text = fresh_text;
                         let storage = self.storage.lock().await;
@@ -847,11 +1097,27 @@ impl Shared {
                             &settings.agent_cwd,
                         );
                         self.push_log("已切换到新会话").await;
+                        self.trace(
+                            &event.conversation_id,
+                            "⑭ 拒答重试",
+                            &format!(
+                                " 成功，耗时 {}ms，已换成新会话 {}",
+                                retry_started.elapsed().as_millis(),
+                                &fresh_id[..8.min(fresh_id.len())]
+                            ),
+                        )
+                        .await;
                     }
                 }
                 Err(err) => {
                     self.push_log(&format!("新会话重试失败，保留原回复: {}", err))
                         .await;
+                    self.trace(
+                        &event.conversation_id,
+                        "⑭ 拒答重试",
+                        &format!(" 失败: {}", err),
+                    )
+                    .await;
                 }
             }
         }
@@ -863,6 +1129,7 @@ impl Shared {
                 .await;
         }
 
+        let send_started = std::time::Instant::now();
         match crate::reply::send(
             &self.path,
             &event.conversation_id,
@@ -874,9 +1141,28 @@ impl Shared {
             Ok(_) => {
                 self.push_log(&format!("已回复会话 {}", event.conversation_id))
                     .await;
+                self.trace(
+                    &event.conversation_id,
+                    "⑮ 发送",
+                    &format!(
+                        " 成功，耗时 {}ms，正文={}字",
+                        send_started.elapsed().as_millis(),
+                        text.chars().count()
+                    ),
+                )
+                .await;
                 self.finish_batch(&events, "sent", Some(&text)).await;
+                self.trace(&event.conversation_id, "⑯ 台账", " 已标记 sent（批次内每条都写）")
+                    .await;
+                self.forget_trace(&events).await;
             }
             Err(err) => {
+                self.trace(
+                    &event.conversation_id,
+                    "⑮ 发送",
+                    &format!(" 失败，耗时 {}ms: {}", send_started.elapsed().as_millis(), err),
+                )
+                .await;
                 self.finish_batch(&events, "failed", Some(&format!("{} | 正文: {}", err, text)))
                     .await;
             }
@@ -888,6 +1174,14 @@ impl Shared {
     async fn finish_batch(&self, events: &[ChatEvent], status: &str, text: Option<&str>) {
         for item in events {
             self.finish_reply(item, status, text).await;
+        }
+    }
+
+    /// 一批处理完就清掉追踪起点，避免这几十字节的记录无限攒着。
+    async fn forget_trace(&self, events: &[ChatEvent]) {
+        let mut started = self.trace_started.lock().await;
+        for item in events {
+            started.remove(&item.message_id);
         }
     }
 
@@ -961,6 +1255,27 @@ impl Shared {
             });
         }
     }
+
+    /// 全链路追踪：从收到 @我 到发出回复，每个阶段一条带 message_id 与耗时的日志。
+    ///
+    /// 目的是让用户能一眼看出「卡在哪一步」：哪一步之后就没有下一条了，
+    /// 就是卡住的位置。异常路径也都要留痕。
+    async fn trace(&self, message_id: &str, stage: &str, detail: &str) {
+        let short: String = if message_id.is_empty() {
+            "<无id>".to_string()
+        } else {
+            message_id.chars().take(14).collect()
+        };
+        let elapsed = {
+            let started = self.trace_started.lock().await;
+            started.get(message_id).copied()
+        }
+        .map(|start| format!("+{}ms ", start.elapsed().as_millis()))
+        .unwrap_or_default();
+
+        self.push_log(&format!("[trace {}] {}{}{}", short, elapsed, stage, detail))
+            .await;
+    }
 }
 
 fn truncate(input: &str, max: usize) -> String {
@@ -993,7 +1308,7 @@ async fn compress_with(
     let prompt = crate::reply::build_summary_prompt(&rows);
     // 摘要走独立会话，避免污染回复所用的 Agent 会话。
     let raw = crate::reply::generate(&settings, &prompt, None, false).await?;
-    let content = crate::reply::sanitize_reply(&raw, 4000);
+    let content = crate::reply::sanitize_reply(&raw.text, 4000);
     if content.is_empty() {
         anyhow::bail!("生成的摘要为空");
     }
@@ -1012,14 +1327,25 @@ async fn compression_due_with(
     failures: &Arc<Mutex<u32>>,
     conversation_id: &str,
     reply: &ReplySettings,
+    last_context_ratio: Option<f64>,
 ) -> bool {
     if !reply.auto_compress {
         return false;
     }
-    if reply.compress_trigger_turns.is_none() && reply.compress_trigger_chars.is_none() {
+    if *failures.lock().await >= 3 {
         return false;
     }
-    if *failures.lock().await >= 3 {
+
+    // 优先用 Agent 自己回报的上下文占比：这是真实占用，不用拿字符数猜。
+    // 有基线时只用占比判定，不再叠加字符/轮次估算，避免两套规则互相打架。
+    if let Some(percent) = reply.compress_trigger_percent.filter(|percent| *percent > 0) {
+        if let Some(ratio) = last_context_ratio {
+            return ratio * 100.0 >= percent as f64;
+        }
+        // 还没有基线（本项目这个会话第一次回复），退到字符估算。
+    }
+
+    if reply.compress_trigger_turns.is_none() && reply.compress_trigger_chars.is_none() {
         return false;
     }
 
@@ -1416,6 +1742,14 @@ process.stdout.write("收到 " + process.cwd());
         std::env::set_current_dir(previous).unwrap();
 
         assert_eq!(rows.len(), 1, "应只落盘 1 条事件，实际 {:?}", rows);
+        // 失败时把全链路 trace 打出来，直接看出卡在哪一步
+        // （加 --nocapture 可见）。这正是 trace 要解决的问题。
+        if rows[0].reply_status.as_deref() != Some("sent") {
+            eprintln!(
+                "---- 全链路 trace（回复未成功时打印）----\n{}",
+                orchestrator.get_logs(500).await.join("\n")
+            );
+        }
         let row = &rows[0];
         assert_eq!(row.project_id, "proj-A", "事件应归属到发起监听的项目");
         assert_eq!(row.conversation_id, "cid-1");
@@ -1618,6 +1952,73 @@ process.stdin.on("end", function () {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 自适应压缩：Agent 回报过上下文占比后，就按**占比**判，不再看字符估算。
+    /// 这是「压缩依据真实上下文占比」的核心回归。
+    #[tokio::test]
+    async fn compression_follows_the_reported_context_ratio() {
+        let dir = std::env::temp_dir().join("agentmux-compress-ratio-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Arc::new(Mutex::new(Storage::new(dir.clone()).unwrap()));
+        let failures = Arc::new(Mutex::new(0));
+
+        // 阈值 75%，字符阈值设得极小，用来证明「有基线时不再走字符估算」。
+        let settings = ReplySettings {
+            auto_compress: true,
+            compress_trigger_percent: Some(75),
+            compress_trigger_chars: Some(1),
+            ..Default::default()
+        };
+
+        // 字符阈值比的是「该会话实际累计的字符数」，所以先放一条消息进去。
+        storage
+            .lock()
+            .await
+            .save_event(&ChatEvent {
+                project_id: "p".to_string(),
+                message_id: "msg-ratio-1".to_string(),
+                conversation_id: "cid-x".to_string(),
+                sender: "同事".to_string(),
+                sender_open_dingtalk_id: "open-1".to_string(),
+                content: "你好呀".to_string(),
+                create_time: "2026-09-19 20:00:00".to_string(),
+                received_at: "2026-09-19T20:00:01+08:00".to_string(),
+                listen_kind: "at_me".to_string(),
+                malformed: false,
+                raw: "{}".to_string(),
+            })
+            .unwrap();
+
+        // 没有基线 → 退回字符估算（字符阈值 1，已累计 3 字，必然触发）。
+        assert!(
+            compression_due_with(&storage, &failures, "cid-x", &settings, None).await,
+            "没有占比基线时应退回字符估算"
+        );
+
+        // 有基线且低于阈值 → 不触发；哪怕字符阈值早就超了。
+        assert!(
+            !compression_due_with(&storage, &failures, "cid-x", &settings, Some(0.30)).await,
+            "占比 30% 低于阈值 75%，不该压缩"
+        );
+
+        // 有基线且达到阈值 → 触发。
+        assert!(
+            compression_due_with(&storage, &failures, "cid-x", &settings, Some(0.80)).await,
+            "占比 80% 超过阈值 75%，应压缩"
+        );
+
+        // 关掉开关就一律不压。
+        let off = ReplySettings {
+            auto_compress: false,
+            ..settings.clone()
+        };
+        assert!(
+            !compression_due_with(&storage, &failures, "cid-x", &off, Some(0.99)).await,
+            "压缩开关关闭时不该触发"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
