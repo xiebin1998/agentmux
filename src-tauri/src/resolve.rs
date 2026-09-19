@@ -105,7 +105,7 @@ fn npm_global_fallbacks() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(appdata) = std::env::var("APPDATA") {
         let npm = Path::new(&appdata).join("npm");
-        for name in ["claude.cmd", "codex.cmd", "codegraph.cmd"] {
+        for name in ["claude.cmd", "codex.cmd"] {
             let cand = npm.join(name);
             if cand.is_file() {
                 out.push(cand.to_string_lossy().to_string());
@@ -146,14 +146,6 @@ pub const PLATFORMS: &[PlatformSpec] = &[
         display: "Codex CLI",
         kind: CliKind::Agent,
         commands: &["codex", "codex.exe"],
-        fallbacks: no_fallback,
-        version_args: &["--version"],
-    },
-    PlatformSpec {
-        id: "codegraph",
-        display: "CodeGraph",
-        kind: CliKind::Agent,
-        commands: &["codegraph", "codegraph.exe"],
         fallbacks: no_fallback,
         version_args: &["--version"],
     },

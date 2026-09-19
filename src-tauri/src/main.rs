@@ -15,12 +15,37 @@ mod storage;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager};
+
 use crate::orchestrator::Orchestrator;
 use crate::storage::Storage;
 
 pub struct AppState {
     pub orchestrator: Arc<Mutex<Orchestrator>>,
     pub storage: Arc<Mutex<Storage>>,
+}
+
+/// 把主窗口收进托盘（程序继续在后台跑监听）。
+#[tauri::command]
+async fn hide_to_tray(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())
+}
+
+/// 真正退出进程。
+#[tauri::command]
+async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.exit(0);
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }
 
 fn main() {
@@ -41,8 +66,45 @@ fn main() {
         .manage(state)
         .setup(|app| {
             println!("AgentMux starting...");
-            let _ = app;
+
+            // 托盘：关掉窗口后仍能在后台跑监听，从这里再叫回来。
+            let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            let mut builder = TrayIconBuilder::new()
+                .tooltip("AgentMux")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+
+            if let Some(icon) = app.default_window_icon() {
+                builder = builder.icon(icon.clone());
+            }
+            builder.build(app)?;
+
             Ok(())
+        })
+        // 点 × 不直接退出：先问「最小化到托盘 / 退出」。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.emit("close-requested", ());
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // 配置
@@ -76,14 +138,14 @@ fn main() {
             commands::compress_now,
             commands::update_summary,
             commands::delete_summary,
-            // 插件
+            // 插件（本版只提供内置适配器）
             plugins::list_plugins,
-            plugins::scan_plugins,
             plugins::set_plugin_enabled,
-            plugins::plugin_env,
-            plugins::plugin_protocol_doc,
             // 旧版数据导入
             legacy::import_legacy,
+            // 窗口/托盘
+            hide_to_tray,
+            quit_app,
             // 项目
             project::create_project,
             project::list_projects,

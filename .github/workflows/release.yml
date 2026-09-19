@@ -1,0 +1,62 @@
+name: Release
+
+# 打 tag（如 v0.1.0）时自动构建 Windows 安装包并创建 Release。
+# 用 Actions 自带的 GITHUB_TOKEN，不需要任何个人令牌。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布用的 tag 名，例如 v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: 安装前端依赖
+        working-directory: frontend
+        run: npm ci
+
+      # tauri-action 会自动执行 build.beforeBuildCommand 构建前端、
+      # 编译 Rust、生成 msi/nsis 安装包，并把它们作为 Release 资产上传。
+      - name: 构建并发布
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "AgentMux ${{ github.event.inputs.tag || github.ref_name }}"
+          releaseBody: |
+            Windows 安装包（自动构建）：
+
+            - `AgentMux_*_x64_en-US.msi` —— MSI 安装包
+            - `AgentMux_*_x64-setup.exe` —— NSIS 安装程序
+
+            安装后首次运行请到「提供方检测」页确认钉钉 CLI 与 Agent CLI 都被检测到。
+          # 先建草稿，确认无误后再手动发布
+          releaseDraft: true
+          prerelease: false

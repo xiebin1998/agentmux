@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import ProjectList from "./components/ProjectList";
 import MessageView from "./components/MessageView";
 import ContextPanel from "./components/ContextPanel";
@@ -96,6 +97,15 @@ function App() {
   const [refreshToken, setRefreshToken] = useState(0);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
+  const [showCloseDialog, setShowCloseDialog] = useState(false);
+
+  // 点 × 时后端拦下关闭并通知前端，由用户选「最小化到托盘」还是「退出」。
+  useEffect(() => {
+    const pending = listen("close-requested", () => setShowCloseDialog(true));
+    return () => {
+      pending.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, []);
 
   const loadProjects = useCallback(async () => {
     try {
@@ -410,6 +420,87 @@ function App() {
         <SettingsPanel project={selectedProject} onClose={() => setShowSettings(false)} />
       )}
       {showPlugins && <PluginsPanel onClose={() => setShowPlugins(false)} />}
+
+      {showCloseDialog && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            backgroundColor: "var(--overlay)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1100,
+          }}
+        >
+          <div
+            style={{
+              backgroundColor: "var(--bg-elevated)",
+              border: "1px solid var(--border)",
+              borderRadius: "8px",
+              width: "400px",
+              padding: "20px",
+              boxShadow: "var(--shadow)",
+            }}
+          >
+            <h3 style={{ margin: "0 0 8px", fontSize: "15px", color: "var(--text-primary)" }}>
+              要关闭 AgentMux 吗？
+            </h3>
+            <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "16px" }}>
+              最小化到托盘可以继续在后台接收消息与回复；选择退出会停止所有监听。
+            </div>
+            <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
+              <button
+                onClick={() => setShowCloseDialog(false)}
+                style={{
+                  padding: "6px 12px",
+                  fontSize: "13px",
+                  backgroundColor: "transparent",
+                  color: "var(--text-secondary)",
+                  border: "1px solid var(--border)",
+                  borderRadius: "4px",
+                  cursor: "pointer",
+                }}
+              >
+                取消
+              </button>
+              <button
+                onClick={() => {
+                  setShowCloseDialog(false);
+                  invoke("hide_to_tray").catch((e) => setBanner(String(e)));
+                }}
+                style={{
+                  padding: "6px 12px",
+                  fontSize: "13px",
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-contrast)",
+                  border: "none",
+                  borderRadius: "4px",
+                  cursor: "pointer",
+                }}
+              >
+                最小化到托盘
+              </button>
+              <button
+                onClick={() => {
+                  invoke("quit_app").catch((e) => setBanner(String(e)));
+                }}
+                style={{
+                  padding: "6px 12px",
+                  fontSize: "13px",
+                  backgroundColor: "var(--danger-strong)",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: "4px",
+                  cursor: "pointer",
+                }}
+              >
+                退出
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showProjectDialog && (
         <ProjectDialog
