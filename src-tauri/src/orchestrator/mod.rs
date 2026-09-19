@@ -90,7 +90,19 @@ pub struct Orchestrator {
     dws_path: Arc<Mutex<Option<String>>>,
     /// 回复全局串行：一次只处理一条（与旧基准工程一致）。
     reply_lock: Arc<Mutex<()>>,
+    /// 按会话攒批：窗口内收到的多条消息合并成一条回复，避免连发 n 条就回 n 条。
+    /// 放在 Orchestrator 上而不是每个 listener 上：同一会话可能被同一个项目的
+    /// 「@我」和「单聊」两路监听同时看到，各自攒批会重复回复。
+    reply_batches: Arc<Mutex<HashMap<String, Vec<ChatEvent>>>>,
+    /// 已在等窗口的会话，避免同一会话排多个 flush 任务。
+    reply_inflight: Arc<Mutex<HashSet<String>>>,
+    /// 攒批窗口长度，见 `DEFAULT_REPLY_BATCH_WINDOW`。
+    reply_batch_window: Duration,
 }
+
+/// 攒批窗口：收到第一条后等这么久，把期间到达的同会话消息并成一次回复。
+/// 太短收不齐（对方连着打字），太长显得反应慢。
+const DEFAULT_REPLY_BATCH_WINDOW: Duration = Duration::from_secs(8);
 
 impl Orchestrator {
     pub fn new(storage: Arc<Mutex<Storage>>) -> Self {
@@ -101,7 +113,16 @@ impl Orchestrator {
             storage,
             dws_path: Arc::new(Mutex::new(None)),
             reply_lock: Arc::new(Mutex::new(())),
+            reply_batches: Arc::new(Mutex::new(HashMap::new())),
+            reply_inflight: Arc::new(Mutex::new(HashSet::new())),
+            reply_batch_window: DEFAULT_REPLY_BATCH_WINDOW,
         }
+    }
+
+    /// 缩短攒批窗口：端到端测试不该为生产用的 8 秒窗口白等。
+    #[cfg(test)]
+    pub fn set_reply_batch_window(&mut self, window: Duration) {
+        self.reply_batch_window = window;
     }
 
     pub async fn push_global_log(&self, line: &str) {
@@ -206,6 +227,9 @@ impl Orchestrator {
             pending: Arc::new(Mutex::new(VecDeque::new())),
             reply,
             reply_lock: self.reply_lock.clone(),
+            reply_batches: self.reply_batches.clone(),
+            reply_inflight: self.reply_inflight.clone(),
+            reply_batch_window: self.reply_batch_window,
             compress_failures: Arc::new(Mutex::new(0)),
             malformed_streak: Arc::new(Mutex::new(0)),
         };
@@ -300,6 +324,9 @@ struct Shared {
     /// 本项目的回复设置（启动监听时解析一次；改设置需重启该项目监听）。
     reply: ReplySettings,
     reply_lock: Arc<Mutex<()>>,
+    reply_batches: Arc<Mutex<HashMap<String, Vec<ChatEvent>>>>,
+    reply_inflight: Arc<Mutex<HashSet<String>>>,
+    reply_batch_window: Duration,
     compress_failures: Arc<Mutex<u32>>,
     /// 连续畸形事件计数：仅在连续出现时提示（D-40）。
     malformed_streak: Arc<Mutex<u32>>,
@@ -579,7 +606,7 @@ impl Shared {
         if self.reply.enabled {
             let shared = self.clone();
             let event = event.clone();
-            tokio::spawn(async move { shared.process_reply(event).await });
+            tokio::spawn(async move { shared.schedule_reply(event).await });
         } else {
             // 项目没开自动回复时，此前什么都不写，界面只看到「收到消息但没回复」
             // 却查不到原因（用户实际反馈过）。把原因记进台账，让它可见。
@@ -593,17 +620,17 @@ impl Shared {
         }
     }
 
-    /// 回复链路：判定 → 拉上下文 → 生成 → 清洗 → 发送 → 记账。
-    async fn process_reply(&self, event: ChatEvent) {
-        // 本项目的回复设置快照（启动监听时已解析）。
-        let reply = self.reply.clone();
-
+    /// 回复入口：先做单条判定，再按会话攒批等窗口。
+    ///
+    /// 之前是「来一条答一条」，对方连发 n 条就会回 n 条。现在同会话的消息在
+    /// `REPLY_BATCH_WINDOW` 内攒成一批，只生成并发送一条回复。
+    async fn schedule_reply(&self, event: ChatEvent) {
         if event.malformed || event.conversation_id.is_empty() {
             self.finish_reply(&event, "skipped", None).await;
             return;
         }
 
-        if let Some(self_id) = reply.self_open_id.as_ref() {
+        if let Some(self_id) = self.reply.self_open_id.as_ref() {
             if !self_id.is_empty() && *self_id == event.sender_open_dingtalk_id {
                 self.push_log("跳过自己发送的消息").await;
                 self.finish_reply(&event, "skipped", None).await;
@@ -614,14 +641,78 @@ impl Shared {
         // 注意：正文剥离 @ 后为空（对方只 @ 了一下）**不跳过**，
         // 由 reply::build_prompt 用占位问句交给 Agent 自然回应。
         // 之前在这里直接 skip，用户看到的就是「收到消息但没回复」。
-
-        let Some(agent_cli) = reply.agent_cli_path.clone() else {
+        if self.reply.agent_cli_path.is_none() {
             self.finish_reply(&event, "failed", Some("未解析到 Agent CLI，无法生成回复"))
                 .await;
             return;
+        }
+
+        let conversation = event.conversation_id.clone();
+        {
+            let mut batches = self.reply_batches.lock().await;
+            batches
+                .entry(conversation.clone())
+                .or_default()
+                .push(event);
+            // 已经有窗口在等这个会话：这条会被那一次一起答掉，不再排新任务。
+            let mut inflight = self.reply_inflight.lock().await;
+            if !inflight.insert(conversation.clone()) {
+                return;
+            }
+        }
+
+        let shared = self.clone();
+        tokio::spawn(async move { shared.flush_reply_batch(&conversation).await });
+    }
+
+    /// 等一个静默窗口，把这一批消息合成一条回复发出去。
+    async fn flush_reply_batch(&self, conversation: &str) {
+        tokio::time::sleep(self.reply_batch_window).await;
+
+        let batch = self
+            .reply_batches
+            .lock()
+            .await
+            .remove(conversation)
+            .unwrap_or_default();
+
+        // 先摘标记再处理：处理期间新到的消息会自己排下一次窗口，
+        // 不会卡在「有标记但没人处理」而永远不回。
+        self.reply_inflight.lock().await.remove(conversation);
+
+        if batch.is_empty() {
+            return;
+        }
+
+        if batch.len() > 1 {
+            self.push_log(&format!(
+                "收到 {} 条消息，合并成一条回复（会话 {}）",
+                batch.len(),
+                conversation
+            ))
+            .await;
+        }
+
+        self.reply_to_batch(batch).await;
+    }
+
+    /// 回复链路：判定 → 拉上下文 → 生成 → 清洗 → 发送 → 记账。
+    async fn reply_to_batch(&self, events: Vec<ChatEvent>) {
+        // 本项目的回复设置快照（启动监听时已解析）。
+        let reply = self.reply.clone();
+
+        let Some(event) = events.first().cloned() else {
+            return;
+        };
+        let Some(agent_cli) = reply.agent_cli_path.clone() else {
+            for item in &events {
+                self.finish_reply(item, "failed", Some("未解析到 Agent CLI，无法生成回复"))
+                    .await;
+            }
+            return;
         };
 
-        // 全局串行：一次只处理一条回复。
+        // 全局串行：一次只处理一批回复。
         let _guard = self.reply_lock.lock().await;
 
         // 自动压缩：失败只记日志，绝不阻塞本次回复（A7.2.3）。
@@ -667,6 +758,9 @@ impl Shared {
             Vec::new()
         };
 
+        // 这一批里对方说的所有内容：多条并成一条回复时都要交给 Agent 看。
+        let contents: Vec<String> = events.iter().map(|item| item.content.clone()).collect();
+
         let prompt = match self
             .storage
             .lock()
@@ -675,14 +769,14 @@ impl Shared {
             .ok()
             .flatten()
         {
-            Some(summary) => crate::reply::build_prompt_with_summary(
-                &event.content,
+            Some(summary) => crate::reply::build_prompt_for_batch(
+                &contents,
                 Some(&summary.content),
                 &context,
                 reply.context_enabled,
             ),
             None => {
-                crate::reply::build_prompt(&event.content, &context, reply.context_enabled)
+                crate::reply::build_prompt_for_batch(&contents, None, &context, reply.context_enabled)
             }
         };
 
@@ -706,7 +800,7 @@ impl Shared {
         {
             Ok(raw) => raw,
             Err(err) => {
-                self.finish_reply(&event, "failed", Some(&format!("生成失败: {}", err)))
+                self.finish_batch(&events, "failed", Some(&format!("生成失败: {}", err)))
                     .await;
                 return;
             }
@@ -724,8 +818,15 @@ impl Shared {
 
         let text = crate::reply::sanitize_reply(&raw, reply.max_chars);
         if text.is_empty() {
-            self.finish_reply(&event, "failed", Some("清洗后回复为空")).await;
+            self.finish_batch(&events, "failed", Some("清洗后回复为空")).await;
             return;
+        }
+
+        // 强制中文是 prompt 里的要求，模型有可能不遵守。这里只提醒不改写：
+        // 硬拦会变成「静默不回」，比回一句英文更糟。
+        if !crate::reply::has_cjk(&text) {
+            self.push_log("提醒：本次回复不含中文，模型可能没有遵守「强制中文」要求")
+                .await;
         }
 
         match crate::reply::send(
@@ -739,12 +840,20 @@ impl Shared {
             Ok(_) => {
                 self.push_log(&format!("已回复会话 {}", event.conversation_id))
                     .await;
-                self.finish_reply(&event, "sent", Some(&text)).await;
+                self.finish_batch(&events, "sent", Some(&text)).await;
             }
             Err(err) => {
-                self.finish_reply(&event, "failed", Some(&format!("{} | 正文: {}", err, text)))
+                self.finish_batch(&events, "failed", Some(&format!("{} | 正文: {}", err, text)))
                     .await;
             }
+        }
+    }
+
+    /// 一批消息共用一个结果。必须逐条写台账，否则这批里除第一条外的消息
+    /// 会一直停在「没状态」上，界面看起来又变成「收到了但没回复」。
+    async fn finish_batch(&self, events: &[ChatEvent], status: &str, text: Option<&str>) {
+        for item in events {
+            self.finish_reply(item, status, text).await;
         }
     }
 
@@ -1221,7 +1330,9 @@ process.stdout.write("收到 " + process.cwd());
         let agent_stub_path = stub_dir.join("agentstub").to_string_lossy().to_string();
 
         let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
-        let orchestrator = Orchestrator::new(storage.clone());
+        let mut orchestrator = Orchestrator::new(storage.clone());
+        // 单条消息的场景不必等生产用的 8 秒攒批窗口。
+        orchestrator.set_reply_batch_window(Duration::from_millis(200));
 
         let node_for_agent = node.clone();
         orchestrator.set_dws_path(Some(node)).await;
@@ -1308,6 +1419,169 @@ process.stdout.write("收到 " + process.cwd());
             .unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].replied, 1, "应统计到 1 条已回复");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 桩 dws 的事件端：**同一会话连发 3 条**，模拟「一次性收到 n 个 @我」。
+    const BURST_EVENT_STUB: &str = r#"
+const READY = "[event] ready event_key=user_im_message_receive_at subscribe_id=subId-burst bus_pid=1";
+function evt(id, text) {
+  return JSON.stringify({
+    type: "user_im_message_receive_at",
+    subscribe_id: "subId-burst",
+    message_id: id,
+    conversation_id: "cid-burst",
+    sender: "Maren",
+    sender_open_dingtalk_id: "open-other",
+    content: text,
+    create_time: "2026-09-19 20:00:00"
+  });
+}
+process.stderr.write(READY + "\n");
+setTimeout(function () { process.stdout.write(evt("msg-b1", "@我 你好") + "\n"); }, 100);
+setTimeout(function () { process.stdout.write(evt("msg-b2", "@我 在吗") + "\n"); }, 250);
+setTimeout(function () { process.stdout.write(evt("msg-b3", "@我 吃晚饭了吗") + "\n"); }, 400);
+process.stdin.resume();
+process.stdin.on("end", function () { process.exit(0); });
+"#;
+
+    /// 桩 dws 的发送端：**追加**记录每一次发送，这样才能数出到底发了几条。
+    const APPEND_CHAT_STUB: &str = r#"
+const fs = require("fs");
+fs.appendFileSync("send-log.jsonl", JSON.stringify(process.argv.slice(2)) + "\n");
+process.stdout.write(JSON.stringify({ result: { messageId: "sent-burst" } }));
+"#;
+
+    /// 桩 Agent CLI：把 stdin 收到的 prompt 原样落到**项目工作目录**，再回一句中文。
+    /// 落盘是为了断言「这几条消息都被交给了 Agent」，而不只是宿主内部合并了。
+    const PROMPT_AGENT_STUB: &str = r#"
+const fs = require("fs");
+let prompt = "";
+process.stdin.on("data", function (chunk) { prompt += chunk; });
+process.stdin.on("end", function () {
+  fs.writeFileSync("agent-prompt.txt", prompt);
+  process.stdout.write("你好呀，吃过啦，你吃了吗？");
+});
+"#;
+
+    /// 回归（问题 2）：一次性连收 n 条时，只生成并发送**一条**回复，
+    /// 且这批里的每条事件都要落到 sent（否则界面又会显示成「收到了没回复」）。
+    #[tokio::test]
+    async fn burst_messages_are_merged_into_a_single_reply() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let base = std::env::temp_dir().join("agentmux-e2e-burst");
+        let _ = std::fs::remove_dir_all(&base);
+        let stub_dir = base.join("stub");
+        let work_dir = base.join("project-workdir");
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        std::fs::write(stub_dir.join("event"), BURST_EVENT_STUB).unwrap();
+        std::fs::write(stub_dir.join("chat"), APPEND_CHAT_STUB).unwrap();
+        std::fs::write(stub_dir.join("agentstub"), PROMPT_AGENT_STUB).unwrap();
+        let agent_stub_path = stub_dir.join("agentstub").to_string_lossy().to_string();
+
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let mut orchestrator = Orchestrator::new(storage.clone());
+        // 生产默认是 8 秒，测试里缩短到 800ms：远大于 3 条事件的间隔（150ms），
+        // 又不用白等。
+        orchestrator.set_reply_batch_window(Duration::from_millis(800));
+
+        let settings = ReplySettings {
+            enabled: true,
+            agent_platform: "stub".to_string(),
+            agent_cli_path: Some(node.clone()),
+            agent_args: Some(vec![agent_stub_path]),
+            agent_cwd: work_dir.to_string_lossy().to_string(),
+            timeout_ms: 20_000,
+            max_chars: 500,
+            ..Default::default()
+        };
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener("proj-burst".to_string(), ListenKind::AtMe, settings, None)
+            .await
+            .expect("应能启动监听");
+
+        // 事件落盘 → 攒批 → 生成 → 发送需要点时间，轮询等这一批收尾。
+        let send_log = stub_dir.join("send-log.jsonl");
+        for _ in 0..120 {
+            sleep(Duration::from_millis(100)).await;
+            let rows = storage
+                .lock()
+                .await
+                .list_events(&EventQuery {
+                    limit: 10,
+                    project_id: Some("proj-burst".to_string()),
+                    ..Default::default()
+                })
+                .unwrap();
+            if rows.len() == 3 && rows.iter().all(|row| row.reply_status.is_some()) {
+                break;
+            }
+        }
+
+        let _ = orchestrator.stop_listener(&id).await;
+        let prompt = std::fs::read_to_string(work_dir.join("agent-prompt.txt")).ok();
+        let sends = std::fs::read_to_string(&send_log).ok();
+        std::env::set_current_dir(previous).unwrap();
+
+        let rows = storage
+            .lock()
+            .await
+            .list_events(&EventQuery {
+                limit: 10,
+                project_id: Some("proj-burst".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 3, "三条消息都应落盘");
+
+        // 只发一条：这是「合并回复」的核心证据。
+        let sends = sends.expect("桩 dws 应记录到发送调用");
+        let send_count = sends.lines().filter(|line| !line.trim().is_empty()).count();
+        assert_eq!(
+            send_count, 1,
+            "一批 3 条消息只应发出 1 条回复，实际 {} 条：{}",
+            send_count, sends
+        );
+
+        // 三条都标记 sent，且共用同一条回复正文。
+        for row in &rows {
+            assert_eq!(
+                row.reply_status.as_deref(),
+                Some("sent"),
+                "{} 也应标记为已回复，否则界面显示成「收到了没回复」",
+                row.message_id
+            );
+            assert_eq!(
+                row.reply_text.as_deref(),
+                Some("你好呀，吃过啦，你吃了吗？"),
+                "同一批应共用同一条回复"
+            );
+        }
+
+        // Agent 必须看到全部三条内容，否则合并就是假的。
+        let prompt = prompt.expect("桩 Agent 应收到 prompt");
+        assert!(prompt.contains("你好"), "prompt 缺少第 1 条：{}", prompt);
+        assert!(prompt.contains("在吗"), "prompt 缺少第 2 条：{}", prompt);
+        assert!(prompt.contains("吃晚饭了吗"), "prompt 缺少第 3 条：{}", prompt);
+        assert!(prompt.contains("只回一条"), "应要求合并成一条回复");
+        assert!(
+            prompt.contains("一律使用简体中文回复"),
+            "必须带强制中文的角色约束"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

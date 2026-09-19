@@ -107,6 +107,22 @@ pub fn sanitize_reply(raw: &str, max_chars: usize) -> String {
 pub const EMPTY_MENTION_PLACEHOLDER: &str =
     "（对方只是 @ 了我，没有写具体内容；请自然打个招呼，并询问需要什么帮助）";
 
+/// 回复生成的角色与硬约束。
+///
+/// 缺了这段时，Agent 会把来信当成一个「任务」来处理：面对「你好，吃晚饭了吗」这种
+/// 正常寒暄，它回的是「I'm a software engineering assistant, not the right tool
+/// for composing personal chat replies」——既拒绝了，还是英文。所以必须明确告诉它
+/// 「你在替本人回消息，寒暄就是你的职责」，并强制中文。
+pub const REPLY_PERSONA: &str = "\
+你是本人在钉钉里的回复助手：请代替本人，在这个会话里回一条消息给对方。
+
+必须遵守：
+1. 一律使用简体中文回复，任何情况下都不要输出英文。
+2. 日常寒暄、闲聊、问候、约时间、问事都属于你的职责范围，正常回应即可；\
+不要说自己是 AI、助手或软件工程助手，不要以「这不属于我的职责」为由拒绝，也不要解释你在做什么。
+3. 只输出要发出去的那句话本身：不要加引号、前缀、署名、括号说明或任何解释。
+4. 像真人在钉钉里打字，一到两句话说完，不要长篇大论，不要列点。";
+
 pub fn build_prompt(content: &str, context_lines: &[String], context_enabled: bool) -> String {
     build_prompt_with_summary(content, None, context_lines, context_enabled)
 }
@@ -118,14 +134,47 @@ pub fn build_prompt_with_summary(
     context_lines: &[String],
     context_enabled: bool,
 ) -> String {
-    let stripped = sanitize_reply(content, 4000);
-    let question = if stripped.is_empty() {
-        EMPTY_MENTION_PLACEHOLDER.to_string()
-    } else {
-        stripped
+    build_prompt_for_batch(&[content.to_string()], summary, context_lines, context_enabled)
+}
+
+/// 一批消息合成一条回复的 prompt。
+///
+/// 对方在很短时间内连发 n 条时，逐条各回一条会刷屏；这里把它们并成一次回复，
+/// 让 Agent 看到整批内容后只输出一条。
+pub fn build_prompt_for_batch(
+    contents: &[String],
+    summary: Option<&str>,
+    context_lines: &[String],
+    context_enabled: bool,
+) -> String {
+    let cleaned: Vec<String> = contents
+        .iter()
+        .map(|raw| sanitize_reply(raw, 4000))
+        .filter(|text| !text.is_empty())
+        .collect();
+
+    let ask = match cleaned.len() {
+        0 => format!(
+            "请回复对方：\n{}",
+            EMPTY_MENTION_PLACEHOLDER
+        ),
+        1 => format!("请回复对方这条消息：\n{}", cleaned[0]),
+        n => {
+            let listed = cleaned
+                .iter()
+                .enumerate()
+                .map(|(index, text)| format!("{}. {}", index + 1, text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "对方在一两分钟内连着发了 {} 条消息，请**只回一条**，把这几条一起回应，\
+不要逐条分别作答，也不要复述它们：\n{}",
+                n, listed
+            )
+        }
     };
 
-    let mut blocks: Vec<String> = Vec::new();
+    let mut blocks: Vec<String> = vec![REPLY_PERSONA.to_string()];
     if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
         blocks.push(format!("以下是该会话更早内容的摘要（不要复述）：\n{}", summary.trim()));
     }
@@ -135,13 +184,15 @@ pub fn build_prompt_with_summary(
             context_lines.join("\n")
         ));
     }
+    blocks.push(ask);
 
-    if blocks.is_empty() {
-        return question;
-    }
-
-    blocks.push(format!("请回复最后这条消息：\n{}", question));
     blocks.join("\n\n")
+}
+
+/// 是否包含中日韩文字。用来兜底检查「强制中文」有没有被模型绕过去。
+pub fn has_cjk(text: &str) -> bool {
+    text.chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
 }
 
 /// 生成摘要用的 prompt。要求保留关键事实且不得编造。
@@ -371,7 +422,54 @@ mod tests {
     #[test]
     fn prompt_omits_context_when_disabled() {
         let prompt = build_prompt("@我 你好", &["甲: 旧消息".to_string()], false);
-        assert_eq!(prompt, "你好");
+        assert!(!prompt.contains("旧消息"), "关掉上下文就不该带历史消息");
+        assert!(prompt.contains("你好"), "来信正文必须在 prompt 里");
+    }
+
+    /// 回归：不写角色约束时，Agent 会把「你好，吃晚饭了吗」当成任务并拒绝，
+    /// 而且用英文回。这段 persona 是强制中文 + 明确寒暄属于职责的唯一手段。
+    #[test]
+    fn prompt_always_requires_chinese_and_forbids_refusing() {
+        let prompt = build_prompt("@我 你好，吃晚饭了吗", &[], false);
+
+        assert!(prompt.starts_with(crate::reply::REPLY_PERSONA));
+        assert!(prompt.contains("一律使用简体中文回复"), "必须强制中文");
+        assert!(
+            prompt.contains("不要说自己是 AI、助手或软件工程助手"),
+            "必须禁止「我不是干这个的」式拒绝"
+        );
+        assert!(prompt.contains("日常寒暄"), "必须点明寒暄属于职责范围");
+    }
+
+    /// 多条消息合并成一条回复：一次给全部正文，并明确只回一条。
+    #[test]
+    fn batch_prompt_lists_all_messages_and_asks_for_a_single_reply() {
+        let prompt = build_prompt_for_batch(
+            &[
+                "@我 你好".to_string(),
+                "@我 在吗".to_string(),
+                "@我 吃晚饭了吗".to_string(),
+            ],
+            None,
+            &[],
+            false,
+        );
+
+        assert!(prompt.contains("1. 你好"), "应列出第 1 条：{}", prompt);
+        assert!(prompt.contains("2. 在吗"));
+        assert!(prompt.contains("3. 吃晚饭了吗"));
+        assert!(prompt.contains("只回一条"), "必须要求合并成一条");
+        assert!(prompt.contains("连着发了 3 条消息"));
+    }
+
+    /// 单条消息不能出现「合并」措辞，否则模型会莫名其妙地说自己合并了消息。
+    #[test]
+    fn single_message_batch_prompt_reads_naturally() {
+        let prompt = build_prompt_for_batch(&["@我 你好".to_string()], None, &[], false);
+
+        assert!(prompt.contains("请回复对方这条消息"));
+        assert!(!prompt.contains("只回一条"));
+        assert!(prompt.ends_with("你好"));
     }
 
     #[test]
