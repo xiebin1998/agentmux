@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentMux 架构说明</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f1f1f; --muted: #6b6b6b; --line: #e0e0e0;
+    --card: #f7f7f7; --accent: #0066b8; --ok: #137333; --warn: #a15c00; --bad: #c5221f;
+    --code-bg: #f2f2f2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1e1e1e; --fg: #e8e8e8; --muted: #9a9a9a; --line: #383838;
+      --card: #262626; --accent: #4da3e0; --ok: #6cc46c; --warn: #e0b060; --bad: #e07070;
+      --code-bg: #2a2a2a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 64px;
+    background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    line-height: 1.7; font-size: 14px;
+  }
+  main { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 18px; margin: 36px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  h3 { font-size: 15px; margin: 22px 0 8px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .lead { color: var(--muted); margin: 0 0 8px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0 4px; font-size: 13px; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--card); font-weight: 600; white-space: nowrap; }
+  code, pre { font-family: ui-monospace, Consolas, "Courier New", monospace; font-size: 12.5px; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; overflow: auto; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin: 12px 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+  .layer { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; background: var(--card); }
+  .layer b { display: block; margin-bottom: 6px; color: var(--accent); }
+  .layer small { color: var(--muted); display: block; }
+  ol.steps { padding-left: 22px; margin: 8px 0; }
+  ol.steps li { margin: 4px 0; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .tag { display: inline-block; font-size: 11px; border: 1px solid var(--line); border-radius: 10px; padding: 1px 8px; color: var(--muted); margin-right: 6px; }
+  footer { margin-top: 48px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>AgentMux 架构说明</h1>
+<p class="sub">桌面客户端 · Rust + Tauri v2 · React + TypeScript · 更新于 2026-09-19</p>
+<p class="lead">
+把「IM 里有人 @我 → 交给本机 AI Agent 处理 → 把回复发回原会话」从一次性脚本，
+做成常驻、可插拔、带界面的桌面客户端。
+</p>
+
+<h2>一、分层与进程拓扑</h2>
+<div class="grid">
+  <div class="layer">
+    <b>界面层  React + TS</b>
+    三栏布局：项目/会话树 · 视图区 · 上下文面板
+    <small>通过 <code>invoke</code> 调命令，监听层用 Tauri <code>Channel</code> 推流</small>
+  </div>
+  <div class="layer">
+    <b>宿主层  Rust 进程</b>
+    Orchestrator 监听生命周期 · 回复引擎 · 存储 · 配置 · 托盘
+    <small>所有持久化与子进程都发生在这一层</small>
+  </div>
+  <div class="layer">
+    <b>外部 CLI 子进程</b>
+    <code>dws</code>（钉钉事件与发送） · Agent CLI（Qoder/Claude/Codex）
+    <small>全部 <code>CREATE_NO_WINDOW</code>，stdin/stdout/stderr 走管道</small>
+  </div>
+  <div class="layer">
+    <b>外部服务</b>
+    钉钉开放平台（长连接订阅）
+    <small>由 <code>dws</code> 进程持有，宿主不直接联网</small>
+  </div>
+</div>
+
+<h2>二、模块职责</h2>
+<table>
+  <tr><th>模块</th><th>职责</th><th>关键点</th></tr>
+  <tr><td><code>main.rs</code></td><td>状态装配、命令注册、托盘、关闭拦截</td><td>点 × 时 <code>prevent_close</code> + 发 <code>close-requested</code> 事件交前端询问</td></tr>
+  <tr><td><code>resolve.rs</code></td><td>平台注册表 + CLI 自动解析</td><td>按<strong>命令名</strong>走 PATH 探测版本/登录态；另解析出真实可启动路径供 spawn</td></tr>
+  <tr><td><code>orchestrator/</code></td><td>监听生命周期</td><td>spawn → ready 门控(30s) → 退避(5/10/20/40/60s) → 停机阶梯 → 全局去重</td></tr>
+  <tr><td><code>reply.rs</code></td><td>回复引擎</td><td>prompt 走 stdin；剔除 @、压平空白、按字符截断；会话参数追加在参数末尾</td></tr>
+  <tr><td><code>storage/</code></td><td>SQLite + ndjson 归档</td><td>事件/会话/摘要；启动时幂等迁移旧库</td></tr>
+  <tr><td><code>config/</code></td><td>全局设置 + 设置解析</td><td><code>reply_settings_for_project</code>：项目优先、全局兜底</td></tr>
+  <tr><td><code>project.rs</code></td><td>项目模型与存储</td><td>工作目录 / CLI / 回复设置 / 平台选择</td></tr>
+  <tr><td><code>plugins.rs</code></td><td>内置适配器清单与启停</td><td>外部 manifest 插件本版不提供</td></tr>
+  <tr><td><code>legacy.rs</code></td><td>旧版数据导入</td><td>只导事件/台账/会话，不导日志；可按项目归类</td></tr>
+  <tr><td><code>process.rs</code></td><td>子进程工具</td><td>统一隐藏控制台窗口</td></tr>
+  <tr><td><code>providers/</code></td><td>提供方检测</td><td><code>DetectReport</code> 区分「未安装」与「已安装未登录」</td></tr>
+</table>
+
+<h2>三、两条关键数据流</h2>
+
+<h3>3.1 监听链路</h3>
+<ol class="steps">
+  <li>界面在<strong>某个项目</strong>里点「@我」或「单聊」→ <code>start_listener(project_id, kind, settings, channel)</code></li>
+  <li>宿主解析 IM CLI 路径（必要时按平台自动解析），spawn <code>dws event +listen-im --kind &lt;k&gt;</code></li>
+  <li>stderr 出现 <code>[event] ready …</code> 才算就绪；30s 未就绪判定失败并退避重试</li>
+  <li>stdout 的 NDJSON 逐行解析 → 打上 <code>project_id</code> → 全局去重 → 落盘 → 推流到界面</li>
+  <li>退出：关 stdin 等 10s → 未退则按 pid <code>taskkill /T /F</code>；退订按 <code>subscribe_id</code> 精准执行</li>
+</ol>
+
+<h3>3.2 回复链路</h3>
+<ol class="steps">
+  <li>判定：畸形事件/无会话 → 跳过；发送者等于自身身份 → 跳过；其余继续（<strong>裸 @ 不跳过</strong>，用占位问句）</li>
+  <li>全局串行（一次只处理一条）</li>
+  <li>按需自动压缩上下文</li>
+  <li>拼 prompt：会话摘要 + 最近若干条消息（受条数与字符预算约束）</li>
+  <li>取会话：按 <code>(project_id, conversation_id)</code> 建档，首次 <code>--session-id</code>，之后 <code>--resume</code></li>
+  <li>调 Agent CLI 生成（<b>工作目录 = 项目的 work_dir</b>，只读工具白名单，超时可配）</li>
+  <li>清洗正文（剔除 @、压平空白、按字符截断）</li>
+  <li>经 <code>dws chat +messages-send</code> 发回原会话，幂等键取原 <code>message_id</code></li>
+  <li>台账写 <code>sent</code> / <code>failed</code>（失败保留原文）</li>
+</ol>
+
+<h2>四、数据模型</h2>
+<table>
+  <tr><th>表</th><th>主键</th><th>说明</th></tr>
+  <tr><td><code>events</code></td><td><code>message_id</code> UNIQUE</td><td>含 <code>project_id</code>（归属项目）、<code>listen_kind</code>、<code>malformed</code>、<code>raw</code>、<code>processed</code>、<code>reply_status</code>、<code>reply_text</code></td></tr>
+  <tr><td><code>sessions</code></td><td><code>(project_id, conversation_id)</code></td><td>Agent 会话 id 与建档工作目录；两个项目对同一会话各自独立</td></tr>
+  <tr><td><code>summaries</code></td><td><code>conversation_id</code></td><td>压缩摘要，v1 每会话只留最新一版</td></tr>
+  <tr><td><code>settings</code></td><td><code>key</code></td><td>键值设置</td></tr>
+  <tr><td><code>projects</code></td><td><code>id</code></td><td>项目配置</td></tr>
+  <tr><td>ndjson 归档</td><td>—</td><td><code>archive/&lt;日期&gt;.ndjson</code>，与事件落盘同源</td></tr>
+</table>
+<p class="sub">旧库启动时按列存在性做幂等迁移；<code>sessions</code> 从「会话单列唯一」重建为「项目 + 会话」复合键。</p>
+
+<h2>五、扩展缝</h2>
+<div class="card">
+  <p><span class="tag">IM</span><code>ImProvider</code> —— <code>id / supported_kinds / detect / start_listen / fetch_history / send_message</code></p>
+  <p><span class="tag">Agent</span><code>AgentProvider</code> —— <code>id / supports_session_resume / detect / generate</code></p>
+  <p><span class="tag">平台</span><code>resolve::PLATFORMS</code> —— 新增一个 IM 或 Agent 平台 = 注册表加一行
+     （<code>id / display / kind / commands / fallbacks / version_args</code>），界面单选会自动出现。</p>
+  <p class="sub"><code>DetectReport</code> 必须区分「未安装」与「已安装未登录」（<code>logged_in / not_logged_in / unknown</code>，<code>unknown</code> 专表示探测失败）。</p>
+</div>
+
+<h2>六、关键设计决策与原因</h2>
+<table>
+  <tr><th>决策</th><th>原因（多为实测结论）</th></tr>
+  <tr><td>监听、回复设置、工作目录按项目隔离</td><td>全局单例做不到「项目下挂会话 / 每项目独立开关 / 用项目工作目录」</td></tr>
+  <tr><td>CLI 按命令名探测，另存可启动路径</td><td>界面不该暴露目录；但 Windows 上 PATH 里的 <code>dws</code> 是脚本、<code>dws.cmd</code> 是包装脚本，不带 shell 无法直接 spawn，启动这一步仍需真实可执行文件</td></tr>
+  <tr><td>不 spawn <code>.ps1</code> 与无扩展名脚本</td><td>实测：<code>cmd /C x.ps1</code> 不执行而是<strong>用文件关联打开</strong>（会弹编辑器）</td></tr>
+  <tr><td>子进程统一 <code>CREATE_NO_WINDOW</code></td><td>否则 Windows 上每次 spawn 都建控制台窗口，轮询时表现为「黑框一直闪」</td></tr>
+  <tr><td>提供方检测不轮询</td><td>检测会 spawn 进程，属显式动作、结果不缓存（需求 D-06）</td></tr>
+  <tr><td>Agent 子进程 <code>env_remove</code> SDK 变量</td><td>实测：宿主若带 <code>QODER_AGENT_SDK_ENTRYPOINT</code>，CLI 会被推入 SDK 模式并直接报 <code>sdk_invalid_args</code></td></tr>
+  <tr><td>停机阶梯 + 精准退订</td><td>关 stdin 优雅退出为优先；退订绝不 <code>event stop --all</code>，避免误伤其它订阅</td></tr>
+  <tr><td>裸 @ 不跳过</td><td>对方只 @ 一下时直接跳过，用户看到的是「收到消息但没回复」</td></tr>
+  <tr><td>会话列表过滤空 <code>conversation_id</code></td><td>畸形事件会形成一条点了没反应的「空会话」，出现在左树里</td></tr>
+</table>
+
+<h2>七、外部依赖与运行环境</h2>
+<table>
+  <tr><th>依赖</th><th>用途 / 说明</th></tr>
+  <tr><td><code>dws</code>（钉钉 Workspace CLI）</td><td>个人事件长连接订阅与消息发送；靠内置公共应用身份 + 个人 OAuth 登录态</td></tr>
+  <tr><td>Agent CLI</td><td>生成回复；v1 只用只读工具白名单</td></tr>
+  <tr><td><code>tauri-plugin-dialog</code></td><td>选择工作目录；权限在 <code>capabilities/default.json</code> 声明</td></tr>
+  <tr><td>WebView2</td><td>Windows 运行时；Win11 自带</td></tr>
+  <tr><td>WiX / NSIS</td><td>仅打包安装包时需要，首次构建自动下载</td></tr>
+</table>
+
+<h2>八、已知限制与待决项</h2>
+<h3>限制</h3>
+<ul>
+  <li>外部 manifest 插件本版不提供，只有内置适配器</li>
+  <li>改回复设置需重启该项目的监听才生效</li>
+  <li>升级前的历史事件 <code>project_id</code> 为空，不会出现在项目树下</li>
+</ul>
+<h3>待决（需长期观察或实际使用）</h3>
+<table>
+  <tr><th>编号</th><th>问题</th><th>为什么现在不拍板</th></tr>
+  <tr><td>D-23</td><td>单聊 conversation_id 形态</td><td>需从另一账号发单聊消息验证</td></tr>
+  <tr><td>D-33</td><td>断连重连 vs 保活</td><td>实测 bus 空闲 300s 会断，但保活是否有意义需长期观察</td></tr>
+  <tr><td>D-59</td><td>压缩触发阈值</td><td>需记录长度与回答质量的关系，不能拍脑袋</td></tr>
+  <tr><td>D-75</td><td>关闭上下文对回答质量的影响</td><td>需长期使用对比</td></tr>
+  <tr><td>D-76</td><td>哪些改动需要重启</td><td>实现期逐项确认，界面已如实标注</td></tr>
+</table>
+
+<h2>九、常用命令</h2>
+<pre># 开发
+cargo tauri dev                       # 起 Vite + 编译 + 开窗口
+cargo tauri dev --no-dev-server       # 复用自己起的 Vite
+
+# 校验
+cd src-tauri &amp;&amp; cargo test            # 单元 + 桩驱动端到端
+cd frontend  &amp;&amp; npm run build         # tsc + vite
+
+# 打包（必须在仓库根目录执行）
+cargo tauri build                     # exe + msi + nsis
+cargo tauri build --no-bundle         # 只要免安装 exe
+
+# 发版
+git tag v0.1.0 &amp;&amp; git push origin v0.1.0   # Actions 自动构建并创建 Release</pre>
+
+<footer>
+本文件由代码现状整理，随实现演进需同步更新。开发与打包的逐条命令见
+<code>docs/开发与打包指南.md</code>；需求归档见 <code>docs/需求/</code>。
+</footer>
+
+</main>
+</body>
+</html>
