@@ -119,7 +119,7 @@ export default function OverviewView() {
         <div style={{ display: "flex", alignItems: "center", marginBottom: "10px" }}>
           <span style={{ ...sectionTitle, marginBottom: 0 }}>内置 CLI</span>
           <span style={{ fontSize: "11px", color: "var(--text-muted)", marginLeft: "10px" }}>
-            {checkedAt ? `上次检测 ${checkedAt}` : "启动时检测一次"}
+            {loading ? "检测中…" : checkedAt ? `上次检测 ${checkedAt}` : "启动时检测一次"}
           </span>
           <button
             onClick={refresh}
@@ -127,9 +127,12 @@ export default function OverviewView() {
             title="重新检测"
             style={{
               marginLeft: "auto",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
               padding: "2px 10px",
-              fontSize: "14px",
-              lineHeight: 1.2,
+              fontSize: "12px",
+              lineHeight: 1.4,
               backgroundColor: loading ? "var(--bg-active)" : "transparent",
               color: loading ? "var(--accent)" : "var(--text-secondary)",
               border: "1px solid var(--border)",
@@ -138,6 +141,7 @@ export default function OverviewView() {
             }}
           >
             <span className={loading ? "spin" : undefined}>⟳</span>
+            {loading ? "检测中" : "重新检测"}
           </button>
         </div>
 

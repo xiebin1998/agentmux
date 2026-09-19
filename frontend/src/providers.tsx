@@ -59,15 +59,24 @@ export function ProvidersProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
 
+  // 检测本身可能很快返回（缓存命中时几毫秒），那样旋转动画一闪而过，
+  // 用户根本看不出是否在刷新。这里保证 loading 至少可见 700ms。
+  const MIN_SPIN_MS = 700;
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
+    const startedAt = Date.now();
     try {
       setPlatforms(await invoke<PlatformCandidates[]>("list_cli_platforms"));
       setCheckedAt(new Date().toLocaleTimeString());
     } catch (e) {
       setError(String(e));
     } finally {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < MIN_SPIN_MS) {
+        await new Promise((resolve) => setTimeout(resolve, MIN_SPIN_MS - elapsed));
+      }
       setLoading(false);
     }
   }, []);
