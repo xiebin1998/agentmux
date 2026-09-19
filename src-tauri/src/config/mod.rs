@@ -181,7 +181,28 @@ pub fn config_path() -> PathBuf {
     data_dir().join("settings.json")
 }
 
+/// 老版本把 settings.json 放在 app_root 根下（数据目录之外）。改成「配置跟数据目录走」
+/// 之后，若不认领这个老文件，升级上来的用户设置会被静默重置成默认值。
+fn adopt_legacy_config() {
+    let legacy = app_root().join("settings.json");
+    let target = config_path();
+    let _ = adopt_config_file(&legacy, &target);
+}
+
+/// 目标位置还没有配置、而老位置有，就把老配置复制过去。
+fn adopt_config_file(legacy: &std::path::Path, target: &std::path::Path) -> std::io::Result<bool> {
+    if target.exists() || !legacy.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(legacy, target)?;
+    Ok(true)
+}
+
 pub fn load_config() -> anyhow::Result<AppConfig> {
+    adopt_legacy_config();
     let path = config_path();
     if !path.exists() {
         return Ok(AppConfig::default());
@@ -444,5 +465,38 @@ mod tests {
                 "未设百分比时应沿用显式字符阈值"
             ),
         }
+    }
+
+    /// 回归：配置从 app_root 根下搬到数据目录里时，老文件必须被认领，
+    /// 否则升级上来的用户会看到设置被重置成默认值。
+    #[test]
+    fn legacy_config_is_adopted_into_the_data_dir() {
+        let root = std::env::temp_dir().join("agentmux-legacy-config-test");
+        let _ = fs::remove_dir_all(&root);
+        let legacy = root.join("settings.json");
+        let target = root.join("data").join("settings.json");
+
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&legacy, r#"{"theme":"light","agent_args":["--foo"]}"#).unwrap();
+
+        assert!(adopt_config_file(&legacy, &target).unwrap(), "应认领老配置");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            r#"{"theme":"light","agent_args":["--foo"]}"#
+        );
+        assert!(legacy.exists(), "老文件不删，保持可回退");
+
+        // 已有目标配置时不再覆盖，避免把用户新设置冲掉。
+        fs::write(&target, r#"{"theme":"dark"}"#).unwrap();
+        assert!(!adopt_config_file(&legacy, &target).unwrap());
+        assert_eq!(fs::read_to_string(&target).unwrap(), r#"{"theme":"dark"}"#);
+
+        // 老文件不存在时不应凭空造配置。
+        let absent = root.join("nope.json");
+        let fresh = root.join("fresh").join("settings.json");
+        assert!(!adopt_config_file(&absent, &fresh).unwrap());
+        assert!(!fresh.exists());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
