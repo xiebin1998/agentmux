@@ -232,7 +232,7 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
         <div style={section}>
           <div style={sectionTitle}>项目相关设置</div>
           <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
-            回复开关、工作目录、超时、字数上限、上下文预算、CLI 选择都是**按项目**配置的。
+            回复开关、工作目录、超时、字数上限、上下文预算、CLI 选择都是<strong>按项目</strong>配置的。
             请在左侧选中一个项目，或点项目上的「编辑」进行修改。
           </div>
         </div>
@@ -345,9 +345,9 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
           )}
         </div>
         <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "8px" }}>
-          配置文件、数据库与归档都放在这个目录下。**安装时选自定义位置不会被自动采用**
-          —— 安装到 `Program Files` 后写入需要管理员权限，所以默认仍放在用户目录；
-          这里改完**重启生效**，现有数据会复制过去（旧目录不会删）。
+          配置文件、数据库与归档都放在这个目录下。<strong>安装时选的自定义位置不会被自动采用</strong>
+          —— 装到 `Program Files` 后写入需要管理员权限，所以默认仍放在用户目录；
+          这里改完<strong>重启生效</strong>，现有数据会复制过去（旧目录不会删）。
         </div>
       </div>
 
