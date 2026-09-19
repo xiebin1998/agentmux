@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useProviders, type CliCandidate } from "../providers";
 
 interface Stats {
   total_events: number;
@@ -14,6 +15,7 @@ type ListenerState = "stopped" | "starting" | "running" | "backing_off" | "aband
 
 interface ListenerStatus {
   id: string;
+  project_id: string;
   kind: string;
   state: ListenerState;
   ready: boolean;
@@ -23,23 +25,6 @@ interface ListenerStatus {
   last_error: string | null;
   cli_path: string | null;
   dropped_before_ready: number;
-}
-
-interface CliCandidate {
-  path: string;
-  source: string;
-  is_wrapper: boolean;
-  version: string | null;
-  auth_state: "logged_in" | "not_logged_in" | "unknown";
-  detail: string | null;
-}
-
-interface PlatformCandidates {
-  platform_id: string;
-  display: string;
-  kind: "im" | "agent";
-  command: string;
-  candidates: CliCandidate[];
 }
 
 interface EventRow {
@@ -68,6 +53,11 @@ const sectionTitle: CSSProperties = {
   marginBottom: "10px",
 };
 
+const mono: CSSProperties = {
+  fontFamily: "ui-monospace, Consolas, monospace",
+  fontSize: "11px",
+};
+
 function stateColor(status: ListenerStatus | undefined) {
   if (!status) return "var(--text-muted)";
   if (status.ready) return "var(--success)";
@@ -93,12 +83,10 @@ function stateText(status: ListenerStatus | undefined) {
 export default function OverviewView() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [listeners, setListeners] = useState<ListenerStatus[]>([]);
-  const [platforms, setPlatforms] = useState<PlatformCandidates[]>([]);
   const [anomalies, setAnomalies] = useState<EventRow[]>([]);
-  const [rechecking, setRechecking] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
 
-  /** 便宜的运行时信息，可以轮询。 */
+  const { platforms, loading, error, checkedAt, refresh } = useProviders();
+
   const loadRuntime = useCallback(async () => {
     try {
       const [nextStats, nextListeners, malformed, failed] = await Promise.all([
@@ -109,29 +97,11 @@ export default function OverviewView() {
       ]);
       setStats(nextStats);
       setListeners(nextListeners);
-      // A1.1.4：异常保留上限 200 条，与归档同源。
       setAnomalies([...malformed, ...failed].slice(0, ANOMALY_LIMIT));
     } catch (e) {
       console.error("Failed to load overview:", e);
     }
   }, []);
-
-  /**
-   * 提供方检测会真的 spawn CLI 进程，**不能轮询**：
-   * D-06 要求「检测为显式动作、结果不缓存」。只在进入页面与点「一键重新检测」时跑。
-   */
-  const loadProviders = useCallback(async () => {
-    try {
-      const list = await invoke<PlatformCandidates[]>("list_cli_platforms");
-      setPlatforms(list);
-    } catch (e) {
-      console.error("Failed to detect providers:", e);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadProviders();
-  }, [loadProviders]);
 
   useEffect(() => {
     loadRuntime();
@@ -139,65 +109,61 @@ export default function OverviewView() {
     return () => clearInterval(timer);
   }, [loadRuntime]);
 
-  /** A1.1.3：串行重检全部提供方，不并发起进程。 */
-  const handleRecheckAll = async () => {
-    setRechecking(true);
-    setMessage(null);
-    try {
-      await loadProviders();
-      await invoke<string | null>("reset_im_cli");
-      const list = await invoke<PlatformCandidates[]>("list_cli_platforms");
-      setPlatforms(list);
-      const im = list.find((p) => p.kind === "im");
-      const missing = list.filter((p) => p.candidates.length === 0).length;
-      setMessage(
-        `已重检 ${list.length} 个提供方；${im?.candidates.length ?? 0} 个 IM 候选，${
-          missing > 0 ? `${missing} 个未检测到` : "全部已检测到"
-        }`,
-      );
-    } catch (e) {
-      setMessage("重检失败：" + String(e));
-    } finally {
-      setRechecking(false);
-    }
-  };
-
-  const imPlatform = platforms.find((p) => p.kind === "im");
-  const agentPlatforms = platforms.filter((p) => p.kind === "agent");
-  const usableAgentCount = agentPlatforms.filter(
-    (p) => p.candidates[0] && p.candidates[0].path !== "",
-  ).length;
+  const im = platforms.filter((p) => p.kind === "im");
+  const agent = platforms.filter((p) => p.kind === "agent");
 
   return (
     <div style={{ flex: 1, overflow: "auto", padding: "16px" }}>
+      {/* 内置 CLI：IM 与 Agent 分开展示 */}
       <div style={sectionStyle}>
-        <div style={sectionTitle}>运行总览（A1.1.1）</div>
-        <div style={{ display: "flex", gap: "20px", flexWrap: "wrap" }}>
-          <Item
-            label="IM 提供方"
-            value={
-              imPlatform?.candidates[0]?.path
-                ? `${imPlatform.command} · ${imPlatform.candidates[0].version ?? "版本未知"}${
-                    imPlatform.candidates[0].auth_state === "logged_in"
-                      ? " · 已登录"
-                      : imPlatform.candidates[0].auth_state === "not_logged_in"
-                        ? " · 未登录"
-                        : ""
-                  }`
-                : "未检测到"
-            }
-            ok={Boolean(imPlatform?.candidates[0]?.path)}
-          />
-          <Item
-            label="Agent 提供方"
-            value={
-              usableAgentCount > 0
-                ? `${usableAgentCount} / ${agentPlatforms.length} 个平台可用`
-                : "未检测到可用 CLI"
-            }
-            ok={usableAgentCount > 0}
-          />
-          <Item label="自动回复" value="按项目配置（见左侧项目）" neutral />
+        <div style={{ display: "flex", alignItems: "center", marginBottom: "10px" }}>
+          <span style={{ ...sectionTitle, marginBottom: 0 }}>内置 CLI</span>
+          <span style={{ fontSize: "11px", color: "var(--text-muted)", marginLeft: "10px" }}>
+            {checkedAt ? `上次检测 ${checkedAt}` : "启动时检测一次"}
+          </span>
+          <button
+            onClick={refresh}
+            disabled={loading}
+            title="重新检测"
+            style={{
+              marginLeft: "auto",
+              padding: "2px 10px",
+              fontSize: "14px",
+              lineHeight: 1.2,
+              backgroundColor: "transparent",
+              color: "var(--text-secondary)",
+              border: "1px solid var(--border)",
+              borderRadius: "4px",
+              cursor: loading ? "not-allowed" : "pointer",
+            }}
+          >
+            {loading ? "…" : "⟳"}
+          </button>
+        </div>
+
+        {error && (
+          <div style={{ fontSize: "12px", color: "var(--danger)", marginBottom: "8px" }}>
+            检测失败：{error}
+          </div>
+        )}
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+          <div>
+            <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "6px" }}>
+              IM 平台
+            </div>
+            {im.map((platform) => (
+              <CliRow key={platform.platform_id} platform={platform} showAuth />
+            ))}
+          </div>
+          <div>
+            <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "6px" }}>
+              Agent 平台
+            </div>
+            {agent.map((platform) => (
+              <CliRow key={platform.platform_id} platform={platform} />
+            ))}
+          </div>
         </div>
       </div>
 
@@ -205,13 +171,19 @@ export default function OverviewView() {
         <div style={sectionTitle}>监听</div>
         {listeners.length === 0 ? (
           <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>
-            当前没有监听实例。在顶部工具栏启动「@我」或「单聊」。
+            当前没有监听实例。在左侧项目里启动「@我」或「单聊」。
           </div>
         ) : (
           listeners.map((listener) => (
             <div
               key={listener.id}
-              style={{ fontSize: "12px", marginBottom: "8px", display: "flex", gap: "10px", flexWrap: "wrap" }}
+              style={{
+                fontSize: "12px",
+                marginBottom: "8px",
+                display: "flex",
+                gap: "10px",
+                flexWrap: "wrap",
+              }}
             >
               <span style={{ color: "var(--text-secondary)", minWidth: "70px" }}>
                 {listener.kind}
@@ -230,7 +202,7 @@ export default function OverviewView() {
       </div>
 
       <div style={sectionStyle}>
-        <div style={sectionTitle}>事件与回复统计（A1.1.2）</div>
+        <div style={sectionTitle}>事件与回复统计</div>
         <div style={{ display: "flex", gap: "24px", flexWrap: "wrap" }}>
           <Metric label="累计事件" value={stats?.total_events ?? 0} />
           <Metric label="已处理" value={stats?.processed_events ?? 0} />
@@ -245,34 +217,7 @@ export default function OverviewView() {
       </div>
 
       <div style={sectionStyle}>
-        <div style={sectionTitle}>提供方重检（A1.1.3）</div>
-        <button
-          onClick={handleRecheckAll}
-          disabled={rechecking}
-          style={{
-            padding: "6px 14px",
-            fontSize: "12px",
-            backgroundColor: rechecking ? "var(--text-muted)" : "var(--accent)",
-            color: "var(--accent-contrast)",
-            border: "none",
-            borderRadius: "4px",
-            cursor: rechecking ? "not-allowed" : "pointer",
-          }}
-        >
-          {rechecking ? "重检中…" : "一键重新检测全部提供方"}
-        </button>
-        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "6px" }}>
-          串行重检，同一时刻最多 1 个检测进程；检测结果不缓存。
-        </div>
-        {message && (
-          <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginTop: "8px" }}>
-            {message}
-          </div>
-        )}
-      </div>
-
-      <div style={sectionStyle}>
-        <div style={sectionTitle}>最近异常（A1.1.4）</div>
+        <div style={sectionTitle}>最近异常</div>
         {anomalies.length === 0 ? (
           <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>暂无异常事件</div>
         ) : (
@@ -298,24 +243,50 @@ export default function OverviewView() {
   );
 }
 
-function Item({
-  label,
-  value,
-  ok,
-  neutral,
+function CliRow({
+  platform,
+  showAuth,
 }: {
-  label: string;
-  value: string;
-  ok?: boolean;
-  neutral?: boolean;
+  platform: { platform_id: string; display: string; command: string; candidates: CliCandidate[] };
+  showAuth?: boolean;
 }) {
-  const color = neutral ? "var(--text-muted)" : ok ? "var(--success)" : "var(--danger)";
+  const candidate = platform.candidates[0];
+  const usable = Boolean(candidate && candidate.path !== "");
+  const authColor =
+    candidate?.auth_state === "logged_in"
+      ? "var(--success)"
+      : candidate?.auth_state === "not_logged_in"
+        ? "var(--warn)"
+        : "var(--text-muted)";
+  const authLabel =
+    candidate?.auth_state === "logged_in"
+      ? "已登录"
+      : candidate?.auth_state === "not_logged_in"
+        ? "未登录"
+        : "登录态未知";
+
   return (
-    <div>
-      <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "4px" }}>
-        {label}
+    <div style={{ padding: "6px 0", borderBottom: "1px solid var(--border)" }}>
+      <div style={{ display: "flex", gap: "8px", alignItems: "baseline", flexWrap: "wrap" }}>
+        <span style={{ fontSize: "13px", color: usable ? "var(--text-primary)" : "var(--text-muted)" }}>
+          {platform.display}
+        </span>
+        <span style={{ ...mono, color: "var(--text-secondary)" }}>{platform.command}</span>
+        <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+          {candidate?.version ?? "版本未知"}
+        </span>
+        {showAuth && usable && <span style={{ fontSize: "11px", color: authColor }}>{authLabel}</span>}
+        {!usable && (
+          <span style={{ fontSize: "11px", color: "var(--warn)" }}>
+            {candidate?.detail ?? "未检测到"}
+          </span>
+        )}
       </div>
-      <div style={{ fontSize: "13px", color, fontWeight: 600 }}>{value}</div>
+      {usable && (
+        <div style={{ ...mono, color: "var(--text-muted)", wordBreak: "break-all" }}>
+          {candidate.path}
+        </div>
+      )}
     </div>
   );
 }

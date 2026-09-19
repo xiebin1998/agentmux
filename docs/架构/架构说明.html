@@ -92,7 +92,6 @@
   <tr><td><code>storage/</code></td><td>SQLite + ndjson 归档</td><td>事件/会话/摘要；启动时幂等迁移旧库</td></tr>
   <tr><td><code>config/</code></td><td>全局设置 + 设置解析</td><td><code>reply_settings_for_project</code>：项目优先、全局兜底</td></tr>
   <tr><td><code>project.rs</code></td><td>项目模型与存储</td><td>工作目录 / CLI / 回复设置 / 平台选择</td></tr>
-  <tr><td><code>plugins.rs</code></td><td>内置适配器清单与启停</td><td>外部 manifest 插件本版不提供</td></tr>
   <tr><td><code>legacy.rs</code></td><td>旧版数据导入</td><td>只导事件/台账/会话，不导日志；可按项目归类</td></tr>
   <tr><td><code>process.rs</code></td><td>子进程工具</td><td>统一隐藏控制台窗口</td></tr>
   <tr><td><code>providers/</code></td><td>提供方检测</td><td><code>DetectReport</code> 区分「未安装」与「已安装未登录」</td></tr>
@@ -150,7 +149,7 @@
   <tr><td>CLI 按命令名探测，另存可启动路径</td><td>界面不该暴露目录；但 Windows 上 PATH 里的 <code>dws</code> 是脚本、<code>dws.cmd</code> 是包装脚本，不带 shell 无法直接 spawn，启动这一步仍需真实可执行文件</td></tr>
   <tr><td>不 spawn <code>.ps1</code> 与无扩展名脚本</td><td>实测：<code>cmd /C x.ps1</code> 不执行而是<strong>用文件关联打开</strong>（会弹编辑器）</td></tr>
   <tr><td>子进程统一 <code>CREATE_NO_WINDOW</code></td><td>否则 Windows 上每次 spawn 都建控制台窗口，轮询时表现为「黑框一直闪」</td></tr>
-  <tr><td>提供方检测不轮询</td><td>检测会 spawn 进程，属显式动作、结果不缓存（需求 D-06）</td></tr>
+  <tr><td>提供方检测不轮询</td><td>检测会 spawn 进程，属显式动作、结果不缓存；程序启动时**只检测一次**，之后由界面上的 ⟳ 手动触发（用 ref 守卫避免 StrictMode 双跑）</td></tr>
   <tr><td>Agent 子进程 <code>env_remove</code> SDK 变量</td><td>实测：宿主若带 <code>QODER_AGENT_SDK_ENTRYPOINT</code>，CLI 会被推入 SDK 模式并直接报 <code>sdk_invalid_args</code></td></tr>
   <tr><td>停机阶梯 + 精准退订</td><td>关 stdin 优雅退出为优先；退订绝不 <code>event stop --all</code>，避免误伤其它订阅</td></tr>
   <tr><td>裸 @ 不跳过</td><td>对方只 @ 一下时直接跳过，用户看到的是「收到消息但没回复」</td></tr>

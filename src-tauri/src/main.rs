@@ -4,7 +4,6 @@ mod commands;
 mod config;
 mod legacy;
 mod orchestrator;
-mod plugins;
 mod process;
 mod project;
 mod providers;
@@ -138,9 +137,6 @@ fn main() {
             commands::compress_now,
             commands::update_summary,
             commands::delete_summary,
-            // 插件（本版只提供内置适配器）
-            plugins::list_plugins,
-            plugins::set_plugin_enabled,
             // 旧版数据导入
             legacy::import_legacy,
             // 窗口/托盘

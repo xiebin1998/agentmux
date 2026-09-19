@@ -1,25 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-
-export interface CliCandidate {
-  /** 命令名，如 dws / qodercli —— 界面主显示这个 */
-  name: string;
-  /** 内部用于启动的可执行文件路径；解析不到时为空 */
-  path: string;
-  source: string;
-  launch_mode: "direct" | "via_cmd" | "unsupported";
-  version: string | null;
-  auth_state: "logged_in" | "not_logged_in" | "unknown";
-  detail: string | null;
-}
-
-export interface PlatformCandidates {
-  platform_id: string;
-  display: string;
-  kind: "im" | "agent";
-  command: string;
-  candidates: CliCandidate[];
-}
+import { useEffect, useState, type CSSProperties } from "react";
+import { useProviders, type CliCandidate } from "../providers";
 
 export interface CliSelection {
   platform: string;
@@ -45,6 +25,17 @@ function authBadge(state: CliCandidate["auth_state"]) {
   }
 }
 
+const refreshButton: CSSProperties = {
+  padding: "2px 8px",
+  fontSize: "11px",
+  backgroundColor: "transparent",
+  color: "var(--text-secondary)",
+  border: "1px solid var(--border)",
+  borderRadius: "4px",
+  cursor: "pointer",
+};
+
+/** 单选即选中，用户不需要手输路径。检测结果来自全局共享的检测上下文。 */
 export default function PlatformCliPicker({
   kind,
   title,
@@ -52,39 +43,20 @@ export default function PlatformCliPicker({
   value,
   onChange,
 }: PlatformCliPickerProps) {
-  const [platforms, setPlatforms] = useState<PlatformCandidates[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { platforms: all, loading, refresh } = useProviders();
+  const platforms = all.filter((p) => p.kind === kind);
+  const [initialized, setInitialized] = useState(false);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await invoke<PlatformCandidates[]>("list_cli_platforms", { kind });
-      setPlatforms(result);
-
-      // 默认选中第一个「能真正启动」的平台。
-      const usable = result.find((p) => p.candidates[0] && p.candidates[0].path !== "");
-      if (usable) {
-        const stillValid = value && value.platform === usable.platform_id;
-        if (!stillValid) {
-          onChange({ platform: usable.platform_id, path: usable.candidates[0].path });
-        }
-      } else {
-        onChange(null);
-      }
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind]);
-
+  // 默认选中第一个「能真正启动」的平台（只用默认值初始化一次，不覆盖用户选择）。
   useEffect(() => {
-    load();
+    if (initialized || platforms.length === 0) return;
+    const usable = platforms.find((p) => p.candidates[0] && p.candidates[0].path !== "");
+    if (usable && !value) {
+      onChange({ platform: usable.platform_id, path: usable.candidates[0].path });
+    }
+    setInitialized(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind]);
+  }, [platforms, initialized]);
 
   const usableCount = platforms.filter(
     (p) => p.candidates[0] && p.candidates[0].path !== "",
@@ -101,20 +73,8 @@ export default function PlatformCliPicker({
         }}
       >
         <label style={{ color: "var(--text-secondary)", fontSize: "13px" }}>{title}</label>
-        <button
-          onClick={load}
-          disabled={loading}
-          style={{
-            padding: "2px 8px",
-            fontSize: "11px",
-            backgroundColor: "transparent",
-            color: "var(--text-secondary)",
-            border: "1px solid var(--border)",
-            borderRadius: "4px",
-            cursor: loading ? "not-allowed" : "pointer",
-          }}
-        >
-          {loading ? "检测中…" : "重新检测"}
+        <button onClick={refresh} disabled={loading} style={refreshButton} title="重新检测">
+          {loading ? "检测中…" : "⟳ 重新检测"}
         </button>
       </div>
 
@@ -139,7 +99,7 @@ export default function PlatformCliPicker({
           <div style={{ padding: "10px 12px", color: "var(--text-muted)", fontSize: "12px" }}>
             {loading
               ? "正在按命令名检测（等价于在终端里敲 `命令 --version`）…"
-              : "未检测到可用 CLI。请在终端里确认对应命令能直接执行（如 `dws version`），然后点「重新检测」。"}
+              : "未检测到可用 CLI。请在终端里确认对应命令能直接执行（如 `dws version`），然后点「⟳ 重新检测」。"}
           </div>
         ) : (
           platforms.map((platform) => {
@@ -173,7 +133,9 @@ export default function PlatformCliPicker({
                   style={{ marginTop: "3px", accentColor: "var(--accent)" }}
                 />
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ display: "flex", gap: "8px", alignItems: "baseline", flexWrap: "wrap" }}>
+                  <div
+                    style={{ display: "flex", gap: "8px", alignItems: "baseline", flexWrap: "wrap" }}
+                  >
                     <span style={{ fontSize: "13px", color: "var(--text-primary)" }}>
                       {platform.display}
                     </span>
@@ -227,10 +189,6 @@ export default function PlatformCliPicker({
           })
         )}
       </div>
-
-      {error && (
-        <div style={{ color: "var(--danger)", fontSize: "11px", marginTop: "4px" }}>{error}</div>
-      )}
     </div>
   );
 }

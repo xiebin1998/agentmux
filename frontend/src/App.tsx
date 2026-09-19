@@ -11,7 +11,6 @@ import ReplyHistory from "./components/ReplyHistory";
 import ProvidersView from "./components/ProvidersView";
 import OverviewView from "./components/OverviewView";
 import SettingsPanel from "./components/SettingsPanel";
-import PluginsPanel from "./components/PluginsPanel";
 import { ThemeToggle } from "./theme";
 
 interface Project {
@@ -91,7 +90,6 @@ function App() {
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
   const [showProjectDialog, setShowProjectDialog] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showPlugins, setShowPlugins] = useState(false);
   const [view, setView] = useState<View>("overview");
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
@@ -259,20 +257,6 @@ function App() {
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "8px" }}>
           <ThemeToggle />
           <button
-            onClick={() => setShowPlugins(true)}
-            style={{
-              padding: "6px 12px",
-              backgroundColor: "transparent",
-              color: "var(--text-secondary)",
-              border: "1px solid var(--border)",
-              borderRadius: "4px",
-              cursor: "pointer",
-              fontSize: "13px",
-            }}
-          >
-            插件
-          </button>
-          <button
             onClick={() => setShowSettings(true)}
             style={{
               padding: "6px 12px",
@@ -419,7 +403,6 @@ function App() {
       {showSettings && (
         <SettingsPanel project={selectedProject} onClose={() => setShowSettings(false)} />
       )}
-      {showPlugins && <PluginsPanel onClose={() => setShowPlugins(false)} />}
 
       {showCloseDialog && (
         <div

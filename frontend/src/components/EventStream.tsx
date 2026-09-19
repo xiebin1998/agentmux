@@ -60,7 +60,7 @@ export default function EventStream({ refreshToken }: EventStreamProps) {
 
   const reload = useCallback(async () => {
     if (spanExceedsLimit(sinceDate, untilDate)) {
-      setRangeError("查询跨度不能超过 31 天（A4.2.1）");
+      setRangeError("查询跨度不能超过 31 天");
       setEvents([]);
       setHasMore(false);
       return;

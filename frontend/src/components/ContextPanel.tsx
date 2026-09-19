@@ -310,7 +310,7 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
       <div style={{ padding: "16px", borderTop: "1px solid var(--border)" }}>
         <div style={sectionTitle}>会话</div>
         <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "10px" }}>
-          Agent 会话状态（A6.1.2）：首次回复时按 conversation_id 建档，之后按会话续接。
+          Agent 会话状态：首次回复时按 conversation_id 建档，之后按会话续接。
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginBottom: "10px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px" }}>
@@ -349,7 +349,7 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
           )}
         </div>
         <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "10px" }}>
-          作废该会话的 Agent 记录（A6.1.3）：下一条消息将重新建档并开新会话，
+          作废该会话的 Agent 记录：下一条消息将重新建档并开新会话，
           历史事件与回复记录不受影响。
         </div>
         <button

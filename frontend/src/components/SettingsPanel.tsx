@@ -223,7 +223,7 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
       </div>
 
       <div style={section}>
-        <div style={sectionTitle}>Agent 启动参数（全局，A2.2.4）</div>
+        <div style={sectionTitle}>Agent 启动参数（全局）</div>
         <input
           type="text"
           value={(config.agent_args ?? []).join(" ")}
@@ -235,12 +235,12 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
           style={input}
         />
         <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
-          v1 只允许只读工具白名单（D-20）。会话参数由系统追加在末尾，不要在这里填写。
+          v1 只允许只读工具白名单。会话参数由系统追加在末尾，不要在这里填写。
         </div>
       </div>
 
       <div style={section}>
-        <div style={sectionTitle}>自动压缩（全局，A7.1.1 / A7.1.2）</div>
+        <div style={sectionTitle}>自动压缩（全局）</div>
         <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", marginBottom: "10px" }}>
           <input
             type="checkbox"
@@ -251,7 +251,7 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
           启用自动压缩（默认关闭）
         </label>
         <div style={{ color: "var(--text-muted)", fontSize: "11px", marginBottom: "10px" }}>
-          触发阈值（D-59）尚无实测依据，留空表示该维度不触发自动压缩，不会拍脑袋默认。
+          触发阈值尚无实测依据，留空表示该维度不触发自动压缩，不会拍脑袋默认。
         </div>
         <div style={{ display: "flex", gap: "12px" }}>
           <div style={{ flex: 1 }}>
@@ -284,7 +284,7 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
       </div>
 
       <div style={section}>
-        <div style={sectionTitle}>数据与诊断（A9.2.1 / A9.2.2）</div>
+        <div style={sectionTitle}>数据与诊断</div>
         <Row k="配置文件" v={paths?.config_path ?? "—"} />
         <Row k="数据目录" v={paths?.data_dir ?? "—"} />
         <Row k="归档目录" v={paths?.archive_dir ?? "—"} />
@@ -302,7 +302,7 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
             style={input}
           />
           <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
-            只导入事件 / 回复台账 / 会话；不导入旧版日志（D-78）。重复事件按 message_id 去重。
+            只导入事件 / 回复台账 / 会话；不导入旧版日志。重复事件按 message_id 去重。
           </div>
           <button
             onClick={handleImport}
