@@ -78,6 +78,8 @@ struct ListenerTask {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     pid: Arc<Mutex<Option<u32>>>,
     stop_requested: Arc<AtomicBool>,
+    /// 该监听的回复设置句柄：项目设置保存后可以直接改写它，不必重启监听。
+    reply: Arc<Mutex<ReplySettings>>,
 }
 
 /// 日志缓冲里的一行。带上归属，界面才能按项目筛选：
@@ -258,6 +260,8 @@ impl Orchestrator {
         let stdin = Arc::new(Mutex::new(None));
         let pid = Arc::new(Mutex::new(None));
         let stop_requested = Arc::new(AtomicBool::new(false));
+        // 设置存成共享句柄：监听运行中被改写，无需重启这条监听。
+        let reply = Arc::new(Mutex::new(reply));
 
         let task = ListenerTask {
             status: ListenerStatus {
@@ -276,6 +280,7 @@ impl Orchestrator {
             stdin: stdin.clone(),
             pid: pid.clone(),
             stop_requested: stop_requested.clone(),
+            reply: reply.clone(),
         };
 
         {
@@ -312,6 +317,23 @@ impl Orchestrator {
         tokio::spawn(async move { shared.run().await });
 
         Ok(id)
+    }
+
+    /// 项目设置保存后热更新：把新解析出来的回复设置写进该项目正在跑的监听。
+    ///
+    /// 监听启动时会把设置取一次快照（回复链路要用）。以前改完设置必须手动停掉再启动
+    /// 监听才生效，界面只留一句「需重启」的提示——用户实际遇到的就是「勾了启用自动回复
+    /// 但收到的消息仍被判定为未启用」。返回被更新的监听数（0 = 该项目当前没有在跑的监听）。
+    pub async fn apply_project_settings(&self, project_id: &str, settings: ReplySettings) -> usize {
+        let listeners = self.listeners.lock().await;
+        let mut updated = 0;
+        for task in listeners.values() {
+            if task.status.project_id == project_id && !is_terminal(&task.status.state) {
+                *task.reply.lock().await = settings.clone();
+                updated += 1;
+            }
+        }
+        updated
     }
 
     pub async fn stop_listener(&self, id: &str) -> anyhow::Result<String> {
@@ -447,8 +469,9 @@ struct Shared {
     pid: Arc<Mutex<Option<u32>>>,
     stop_requested: Arc<AtomicBool>,
     pending: Arc<Mutex<VecDeque<String>>>,
-    /// 本项目的回复设置（启动监听时解析一次；改设置需重启该项目监听）。
-    reply: ReplySettings,
+    /// 本项目的回复设置。**可热更新**：项目设置保存后由
+    /// `apply_project_settings` 直接改写，不需要重启监听。
+    reply: Arc<Mutex<ReplySettings>>,
     reply_lock: Arc<Mutex<()>>,
     reply_batches: Arc<Mutex<HashMap<String, Vec<ChatEvent>>>>,
     reply_inflight: Arc<Mutex<HashSet<String>>>,
@@ -682,6 +705,9 @@ impl Shared {
         // 归属到「哪个项目的监听收到的」，左树与统计都按这个分。
         event.project_id = self.project_id.clone();
 
+        // 设置取「此刻」的：项目设置保存后会热更新到这条监听上，不必重启监听。
+        let reply_settings = self.reply.lock().await.clone();
+
         // 追踪起点：后面每一步都打「距收到多少毫秒」，哪一步后没有下一条
         // 就是卡在哪一步。
         if !event.message_id.is_empty() {
@@ -728,14 +754,18 @@ impl Shared {
 
         // ③ 范围过滤：项目指定了群/人名单时，只处理命中的消息；名单为空 = 不限制。
         // 不落盘也不推流 —— 不在这个项目的监听范围内，存下来只会污染会话与统计。
-        if !event_in_scope(&self.reply.group_ids, &self.reply.member_ids, &event) {
+        if !event_in_scope(
+            &reply_settings.group_ids,
+            &reply_settings.member_ids,
+            &event,
+        ) {
             self.trace(
                 &event.message_id,
                 "③ 范围过滤",
                 &format!(
                     " 未命中指定名单（群 {} 个 / 人 {} 个），丢弃不落盘",
-                    self.reply.group_ids.len(),
-                    self.reply.member_ids.len()
+                    reply_settings.group_ids.len(),
+                    reply_settings.member_ids.len()
                 ),
             )
             .await;
@@ -792,7 +822,7 @@ impl Shared {
         }
 
         // 先落盘再推流再回复：回复失败不影响事件已经安全落盘。
-        if self.reply.enabled {
+        if reply_settings.enabled {
             self.trace(
                 &event.message_id,
                 "⑥ 回复开关",
@@ -826,6 +856,7 @@ impl Shared {
     /// 之前是「来一条答一条」，对方连发 n 条就会回 n 条。现在同会话的消息在
     /// `REPLY_BATCH_WINDOW` 内攒成一批，只生成并发送一条回复。
     async fn schedule_reply(&self, event: ChatEvent) {
+        let reply_settings = self.reply.lock().await.clone();
         if event.malformed || event.conversation_id.is_empty() {
             self.trace(
                 &event.message_id,
@@ -837,7 +868,7 @@ impl Shared {
             return;
         }
 
-        if let Some(self_id) = self.reply.self_open_id.as_ref() {
+        if let Some(self_id) = reply_settings.self_open_id.as_ref() {
             if !self_id.is_empty() && *self_id == event.sender_open_dingtalk_id {
                 self.trace(&event.message_id, "⑦ 单条判定", " 发送者是本人，跳过")
                     .await;
@@ -850,7 +881,7 @@ impl Shared {
         // 注意：正文剥离 @ 后为空（对方只 @ 了一下）**不跳过**，
         // 由 reply::build_prompt 用占位问句交给 Agent 自然回应。
         // 之前在这里直接 skip，用户看到的就是「收到消息但没回复」。
-        if self.reply.agent_cli_path.is_none() {
+        if reply_settings.agent_cli_path.is_none() {
             self.trace(
                 &event.message_id,
                 "⑦ 单条判定",
@@ -963,8 +994,8 @@ impl Shared {
 
     /// 回复链路：判定 → 拉上下文 → 生成 → 清洗 → 发送 → 记账。
     async fn reply_to_batch(&self, events: Vec<ChatEvent>) {
-        // 本项目的回复设置快照（启动监听时已解析）。
-        let reply = self.reply.clone();
+        // 本项目当前的回复设置（项目设置保存后会热更新）。
+        let reply = self.reply.lock().await.clone();
 
         let Some(event) = events.first().cloned() else {
             return;
@@ -1845,6 +1876,144 @@ process.stdin.resume();
 process.stdin.on("end", function () { process.exit(0); });
 "#;
 
+    /// 假 dws：分两波发事件，用来验证「跑到一半改设置」是否生效。
+    const STUB_TWO_WAVES: &str = r#"
+const READY = "[event] ready event_key=user_im_message_receive_at subscribe_id=subId-stub bus_pid=1";
+function evt(id) {
+  return JSON.stringify({
+    type: "user_im_message_receive_at",
+    event_id: id,
+    subscribe_id: "subId-stub",
+    message_id: "msg-" + id,
+    conversation_id: "cid-1",
+    sender: "张三",
+    sender_open_dingtalk_id: "open-1",
+    content: "消息 " + id,
+    create_time: "2026-09-19T00:00:00Z"
+  });
+}
+process.stderr.write(READY + "\n");
+setTimeout(function () { process.stdout.write(evt("early") + "\n"); }, 200);
+setTimeout(function () { process.stdout.write(evt("late") + "\n"); }, 1500);
+process.stdin.resume();
+process.stdin.on("end", function () { process.exit(0); });
+"#;
+
+    /// 项目设置保存后必须**热更新**到正在跑的监听。
+    ///
+    /// 以前设置只在启动监听时快照一次：用户勾了「启用自动回复」或改了监听范围，
+    /// 不重启监听就完全没反应（用户实际反馈「启用自动回复不生效」）。这里用两波事件
+    /// 验证：第一波按旧范围被丢弃，中途改设置后第二波必须落盘。
+    #[tokio::test]
+    async fn hot_updated_settings_apply_to_running_listener() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let stub_dir = std::env::temp_dir().join("agentmux-hot-settings-stub");
+        let _ = std::fs::remove_dir_all(&stub_dir);
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::write(stub_dir.join("event"), STUB_TWO_WAVES).unwrap();
+
+        let data_dir = std::env::temp_dir().join("agentmux-hot-settings-data");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let orchestrator = Orchestrator::new(storage.clone());
+        // 必须把 dws 指到桩脚本上：否则会真的起 dws 订阅（抢真实事件、脏环境）。
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        // 起监听时范围里没有 open-1 → 第一波事件不落盘。
+        let id = orchestrator
+            .start_listener(
+                "p-hot".to_string(),
+                ListenKind::AtMe,
+                ReplySettings {
+                    member_ids: vec![crate::project::ScopeEntry::new("open-other", "别人")],
+                    ..ReplySettings::default()
+                },
+                None,
+            )
+            .await
+            .expect("应能启动监听");
+
+        // 等就绪门控通过，再等第一波事件（t=200ms）走完范围过滤。
+        let mut ready = false;
+        for _ in 0..60 {
+            sleep(Duration::from_millis(100)).await;
+            if orchestrator
+                .get_all_listener_status()
+                .await
+                .iter()
+                .any(|status| status.ready)
+            {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "应通过 stderr 的 ready 行完成就绪门控");
+        sleep(Duration::from_millis(400)).await;
+
+        // 模拟「保存项目设置」：新范围包含 open-1，并且打开自动回复开关。
+        let updated = orchestrator
+            .apply_project_settings(
+                "p-hot",
+                ReplySettings {
+                    enabled: true,
+                    member_ids: vec![crate::project::ScopeEntry::new("open-1", "张三")],
+                    ..ReplySettings::default()
+                },
+            )
+            .await;
+        let stranger = orchestrator
+            .apply_project_settings("p-none", ReplySettings::default())
+            .await;
+
+        sleep(Duration::from_millis(1600)).await;
+        let logs = orchestrator
+            .get_logs(500)
+            .await
+            .iter()
+            .map(|entry| entry.line.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = orchestrator.stop_listener(&id).await;
+        std::env::set_current_dir(previous).unwrap();
+
+        let rows = storage
+            .lock()
+            .await
+            .list_events(&EventQuery {
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(updated, 1, "正在跑的监听应被热更新");
+        assert_eq!(stranger, 0, "没有在跑的监听时不该有更新");
+        assert!(
+            logs.contains("未命中指定名单"),
+            "第一波事件应是被旧范围挡下的（而不是没就绪被丢）:\n{}",
+            logs
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.message_id.clone()).collect::<Vec<_>>(),
+            vec!["msg-late".to_string()],
+            "只有热更新之后的那一波事件该落盘"
+        );
+
+        // Windows 上库文件还被连接占着时删不掉目录：等监听任务收尾再清。
+        drop(orchestrator);
+        drop(storage);
+        sleep(Duration::from_millis(300)).await;
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&stub_dir);
+    }
+
     #[tokio::test]
     async fn stub_listener_runs_end_to_end() {
         let Some(node) = node_exe() else {
@@ -2053,6 +2222,7 @@ process.stdin.on("end", function () { process.exit(0); });
                     stdin: Arc::new(Mutex::new(None)),
                     pid: Arc::new(Mutex::new(None)),
                     stop_requested: Arc::new(AtomicBool::new(false)),
+                    reply: Arc::new(Mutex::new(ReplySettings::default())),
                 },
             );
         }

@@ -432,6 +432,10 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
               启用自动回复
             </label>
 
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "10px" }}>
+              保存后立刻对这个项目正在运行的监听生效，不必重启监听。
+            </div>
+
             {!replyEnabled && (
               <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "10px" }}>
                 未勾选时只记录不回复：消息照常收下并落盘，但不会驱动 Agent 生成回复。
