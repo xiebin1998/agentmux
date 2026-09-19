@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>需求明细看板</title>
+<style>
+:root{--bg:#f4f6f9;--panel:#fff;--ink:#1b2330;--muted:#68727f;--line:#dde3ea;--line2:#eef2f6;
+--admin:#0f766e;--mini:#2167f3;--code:#f0f3f7;
+--src-code:#0f766e;--src-doc:#2167f3;--src-own:#b45309;--src-open:#b91c1c;
+--done:#15803d;--todo:#b45309;--gap:#b91c1c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--line);padding:9px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+header h1{font-size:14px;margin:0;font-weight:600;letter-spacing:0}
+.cov{display:flex;gap:6px;flex-wrap:wrap;font-size:11px;color:var(--muted)}
+.cov b{color:var(--ink);font-variant-numeric:tabular-nums}
+.chip{background:transparent;border:0;padding:0;font-size:11px}
+.wrap{display:flex;min-height:calc(100vh - 47px);align-items:stretch}
+nav{width:336px;flex:0 0 336px;background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;height:calc(100vh - 47px);position:sticky;top:47px;scrollbar-width:thin;scrollbar-color:#cfd7e0 transparent}
+nav::-webkit-scrollbar{width:9px}
+nav::-webkit-scrollbar-thumb{background:#cfd7e0;border:3px solid var(--panel);border-radius:9px}
+.navhead{position:sticky;top:0;background:var(--panel);padding:10px;border-bottom:1px solid var(--line);z-index:3}
+.navhead input{width:100%;border:0;border-bottom:1px solid var(--line);border-radius:0;padding:6px 2px;font:inherit;font-size:12px;background:transparent}
+.navhead input:focus{outline:none;border-bottom-color:var(--mini)}
+.tools{display:flex;gap:6px;margin-top:8px;align-items:stretch}
+.seg{display:flex;flex:1;background:transparent;border-radius:0;padding:0;gap:16px}
+.seg button{flex:none;border:0;background:transparent;padding:4px 0;font:inherit;font-size:11px;color:var(--muted);cursor:pointer;border-radius:0;white-space:nowrap}
+.seg button:hover{color:var(--ink)}
+.seg button[aria-pressed="true"]{background:transparent;color:var(--ink);font-weight:600;box-shadow:inset 0 -2px 0 var(--mini)}
+.ib{flex:0 0 auto;width:26px;border:0;background:transparent;border-radius:6px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--muted);padding:0}
+.ib:hover{background:transparent;color:var(--ink)}
+.ib svg{width:14px;height:14px}
+ul{list-style:none;margin:0;padding:0}
+.axis{display:flex;align-items:center;gap:6px;padding:11px 10px 5px;font-size:11px;font-weight:600;color:var(--ink)}
+.axis .bar{width:3px;height:12px;border-radius:2px;flex:0 0 auto}
+.axis.admin .bar{background:var(--admin)}
+.axis.mini .bar{background:var(--mini)}
+.axis .api{font:10px/1.4 ui-monospace,Consolas,monospace;color:#98a2b0;margin-left:auto;font-weight:400}
+.l1{margin:0 6px}
+.l1>.mh{width:100%;display:flex;align-items:center;gap:7px;border:0;background:transparent;padding:6px 7px;font:inherit;text-align:left;cursor:pointer;border-radius:6px;color:var(--ink)}
+.l1>.mh:hover{background:var(--code)}
+.l1.trail>.mh .cd{color:var(--admin)}
+.l1.mini.trail>.mh .cd{color:var(--mini)}
+.chev{width:14px;height:14px;flex:0 0 auto;color:#9aa4b0;transition:transform .12s ease}
+.l1.open>.mh>.chev,.l2.open>.sh>.chev{transform:rotate(90deg)}
+.cd{flex:0 0 auto;font:10.5px/1.5 ui-monospace,Consolas,monospace;color:#4b5563;background:transparent;border:0;border-radius:0;padding:0}
+.l1>.mh .cd{font-weight:700}
+.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.l1>.mh .nm{font-weight:600;font-size:12.5px}
+.l2{margin:1px 0 5px 13px;padding-left:9px;border-left:1px solid var(--line)}
+.l2>.sh{width:100%;display:flex;align-items:center;gap:6px;border:0;background:transparent;padding:4px 6px;font:inherit;text-align:left;cursor:pointer;border-radius:5px;color:#333}
+.l2>.sh:hover{background:var(--code)}
+.l2>.sh .cd{font-size:9.5px;color:#6b7280;padding:0 3px}
+.l2>.sh .nm{font-size:12px}
+.l2.trail>.sh>.nm{font-weight:600;color:var(--ink)}
+.rt{flex:0 0 auto;max-width:96px;font:9.5px/1.4 ui-monospace,Consolas,monospace;color:#98a2b0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.l3{margin:1px 0 4px 2px}
+.l3 li{display:flex;align-items:center;gap:6px;padding:3px 7px;font-size:12px;border-radius:5px;cursor:pointer;color:#333;border-left:2px solid transparent}
+.l3 li:hover{background:var(--code)}
+.l3 li.act{background:#eaf1fe;border-left-color:var(--mini);color:var(--ink);font-weight:600}
+.l3.admin li.act{background:#e9f6f4;border-left-color:var(--admin)}
+.l3 li .cd{font-size:9.5px;padding:0 3px;color:#6b7280;flex:0 0 auto;min-width:20px;text-align:center}
+.l3 li.act .cd{color:#333}
+.meter{flex:0 0 auto;width:32px;height:4px;border-radius:2px;background:var(--line);overflow:hidden;display:flex}
+.meter i{display:block;height:100%}
+.meter i.done{background:var(--done)}
+.meter i.todo{background:var(--todo)}
+.meter i.gap{background:var(--gap)}
+.cnt{flex:0 0 auto;font-size:10px;color:var(--muted);min-width:14px;text-align:right;font-variant-numeric:tabular-nums}
+.dot{width:6px;height:6px;border-radius:50%;flex:0 0 auto}
+.dot.done{background:var(--done)}.dot.todo{background:var(--todo)}.dot.gap{background:var(--gap)}
+.has{flex:0 0 auto;width:12px;height:12px;color:var(--admin);display:flex;align-items:center;justify-content:center}
+.has svg{width:11px;height:11px}
+.emptyn{padding:14px 12px;color:var(--muted);font-size:12px}
+main{flex:1;min-width:0;padding:16px 22px 60px}
+.crumb{font-size:11px;color:var(--muted);margin-bottom:6px}
+.crumb code{font-family:ui-monospace,Consolas,monospace}
+.hd{background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:13px 15px;margin-bottom:12px}
+.hd h2{margin:0 0 3px;font-size:19px;font-weight:600;letter-spacing:0}
+.hd .id{font:12px/1.5 ui-monospace,Consolas,monospace;color:var(--muted)}
+.tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}
+.tag{border:1px solid var(--line);border-radius:4px;padding:1px 7px;font-size:11px;background:var(--code);color:#333}
+.tag.req{color:var(--admin);border-color:#bfe0dc;background:#f0faf8}
+.tag.st-done{color:var(--done);border-color:#bbe6c5;background:#f2fbf4}
+.tag.st-todo{color:var(--todo);border-color:#f0dcb8;background:#fdf8ef}
+.tag.st-gap{color:var(--gap);border-color:#f0c4c4;background:#fdf3f3}
+section{background:var(--panel);border:1px solid var(--line);border-radius:7px;margin-bottom:11px;overflow:hidden}
+section>h3{margin:0;padding:8px 14px;font-size:12px;font-weight:600;letter-spacing:.02em;background:var(--code);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
+section>h3 .n{font-weight:400;color:var(--muted);font-size:11px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:11px;padding:6px 12px;border-bottom:1px solid var(--line);background:#fbfcfd;white-space:nowrap;vertical-align:bottom}
+td{padding:6px 12px;border-bottom:1px solid var(--line2);vertical-align:top}
+tr:last-child td{border-bottom:0}
+tr:hover td{background:#fafbfd}
+td.mono,th.mono{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:#334}
+td.nowrap{white-space:nowrap}
+.src{display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;border:1px solid;white-space:nowrap}
+.src.代码实测{color:var(--src-code);border-color:#bfe0dc;background:#f0faf8}
+.src.需求清单{color:var(--src-doc);border-color:#c5d9f7;background:#f1f6fe}
+.src.需求文档{color:var(--src-doc);border-color:#c5d9f7;background:#f1f6fe}
+.src.自定义{color:var(--src-own);border-color:#f0dcb8;background:#fdf8ef}
+.src.待决{color:var(--src-open);border-color:#f0c4c4;background:#fdf3f3}
+.req-yes{color:var(--gap);font-weight:600}
+.empty{padding:16px;color:var(--muted);font-size:12px}
+.note{background:#fffaf0;border:1px solid #f0dcb8;border-radius:7px;padding:11px 14px;margin-bottom:12px;font-size:12px;color:#6b4e16}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:8px}
+@media (max-width:900px){nav{width:272px;flex-basis:272px}main{padding:12px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>需求明细看板</h1>
+  <div class="cov" id="cov"></div>
+</header>
+<div class="wrap">
+  <nav>
+    <div class="navhead">
+      <input id="q" type="search" placeholder="搜索编码、功能名、需求编号">
+      <div class="tools">
+      <div class="seg" id="seg"></div>
+        <button class="ib" id="expandAll" type="button" title="展开全部菜单与节点"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4l4 4-4 4"/><path d="M8.5 4l4 4-4 4"/></svg></button>
+        <button class="ib" id="collapseAll" type="button" title="收起全部"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4L8 8l4 4"/><path d="M7.5 4l-4 4 4 4"/></svg></button>
+      </div>
+    </div>
+    <div id="tree"></div>
+  </nav>
+  <main id="detail"></main>
+</div>
+<script src="需求树.js"></script>
+<script src="需求明细.js"></script>
+<script>
+const NAV = window.REQ_NAV;
+const DET = window.REQ_DETAIL || {};
+// 轴从数据推导：label 取 NAV[k].label，样式类按序交替，保证任意项目的端都能渲染
+const AXES = {};
+Object.keys(NAV).filter(k => Array.isArray(NAV[k].menus)).forEach((k, i) => {
+  const label = NAV[k].label || k;
+  AXES[k] = { label, short: label.length > 6 ? label.slice(0, 6) : label, cls: i % 2 === 0 ? 'admin' : 'mini' };
+});
+(() => {
+  const seg = document.getElementById('seg');
+  [['all', '全部']].concat(Object.keys(AXES).map(k => [k, AXES[k].short])).forEach(([ax, txt], i) => {
+    const b = document.createElement('button');
+    b.dataset.axis = ax; b.textContent = txt;
+    if (i === 0) b.setAttribute('aria-pressed', 'true');
+    seg.append(b);
+  });
+})();
+const ST = { done: '已实现', todo: '未实现', gap: '待决' };
+const el = (t, c, x) => { const n = document.createElement(t); if (c) n.className = c; if (x != null) n.textContent = x; return n; };
+const esc = s => String(s == null ? '' : s);
+
+const allFuncs = [];
+Object.keys(AXES).forEach(axis => NAV[axis].menus.forEach((m, mi) => {
+  m[3].forEach(n => n[4].forEach(f => allFuncs.push({ axis, menu: m, node: n, fn: f })));
+}));
+const detailed = allFuncs.filter(x => DET[x.fn[0]]);
+
+const cov = document.getElementById('cov');
+[[`菜单 ${Object.keys(AXES).reduce((s, a) => s + NAV[a].menus.length, 0)}`, ''],
+ [`节点 ${allFuncs.length ? new Set(allFuncs.map(x => x.node[0])).size : 0}`, ''],
+ [`功能 ${allFuncs.length}`, ''],
+ [`已细化 ${detailed.length}`, ''],
+ [`待细化 ${allFuncs.length - detailed.length}`, ''],
+ [`待决功能点 ${allFuncs.filter(x => x.fn[3] === 'gap').length}`, '']
+].forEach(([txt]) => cov.append(el('span', 'chip', txt)));
+
+const tree = document.getElementById('tree');
+let axisFilter = 'all', term = '';
+const openSet = new Set();
+
+const ICON = {
+  chev: '<svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5L10.5 8 6 12.5"/></svg>',
+  doc: '<svg class="docic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="2.5" width="9" height="11" rx="1.5"/><path d="M6 6h4M6 8.5h4M6 11h2.5"/></svg>'
+};
+const icon = html => { const s = el('span'); s.innerHTML = html; return s; };
+const STK = ['done', 'todo', 'gap'];
+
+function tally(rows) {
+  const o = { done: 0, todo: 0, gap: 0 };
+  rows.forEach(r => { if (o[r[3]] !== undefined) o[r[3]] += 1; });
+  return o;
+}
+function meter(rows) {
+  const o = tally(rows), m = el('span', 'meter');
+  m.title = STK.map(k => ST[k] + ' ' + o[k]).join(' / ');
+  STK.forEach(k => {
+    if (!o[k]) return;
+    const i = el('i', k);
+    i.style.width = (o[k] / rows.length * 100) + '%';
+    m.append(i);
+  });
+  return m;
+}
+function match(s) { return !term || String(s).toLowerCase().includes(term); }
+
+// 定位到某个功能时展开它的祖先菜单，但只写进 openSet，用户之后仍可自由收缩
+function reveal(code) {
+  const hit = allFuncs.find(x => x.fn[0] === code);
+  if (hit) { openSet.add(hit.menu[0]); openSet.add(hit.node[0]); }
+}
+
+function render() {
+  const act = allFuncs.find(x => x.fn[0] === location.hash.slice(1));
+  tree.innerHTML = '';
+  Object.keys(AXES).filter(a => axisFilter === 'all' || axisFilter === a).forEach(axis => {
+    const fnTotal = NAV[axis].menus.reduce((s, m) => s + m[3].reduce((x, n) => x + n[4].length, 0), 0);
+    const hd = el('div', 'axis ' + AXES[axis].cls);
+    hd.append(el('span', 'bar'));
+    hd.append(el('span', null, AXES[axis].label));
+    hd.append(el('span', 'api', NAV[axis].menus.length + ' 菜单 / ' + fnTotal + ' 功能'));
+    tree.append(hd);
+
+    NAV[axis].menus.forEach(menu => {
+      const nodes = menu[3].filter(n =>
+        match(n[0]) || match(n[1]) || match(n[3]) ||
+        n[4].some(f => match(f[0]) || match(f[1]) || match(f[2])) ||
+        match(menu[0]) || match(menu[1]));
+      if (!nodes.length && term) return;
+      const funcs = menu[3].reduce((s, n) => s.concat(n[4]), []);
+      const key1 = menu[0];
+      const inTrail = !!act && act.menu[0] === key1;
+      const opened = !!term || openSet.has(key1);
+      const li1 = el('li', 'l1 ' + AXES[axis].cls + (opened ? ' open' : '') + (inTrail ? ' trail' : ''));
+      const btn1 = el('button', 'mh');
+      btn1.title = '实现载体：' + menu[2];
+      btn1.append(icon(ICON.chev));
+      btn1.append(el('span', 'cd', key1));
+      btn1.append(el('span', 'nm', menu[1]));
+      btn1.append(meter(funcs));
+      btn1.append(el('span', 'cnt', String(funcs.length)));
+      btn1.onclick = () => { openSet.has(key1) ? openSet.delete(key1) : openSet.add(key1); render(); };
+      li1.append(btn1);
+      if (opened) {
+        const ul2 = el('ul', 'subs');
+        nodes.forEach(node => {
+          const key2 = node[0];
+          const on2 = !!term || openSet.has(key2);
+          const li2 = el('li', on2 ? 'l2 open' : 'l2');
+          const b2 = el('button', 'sh');
+          b2.append(icon(ICON.chev));
+          b2.append(el('span', 'cd', key2));
+          b2.append(el('span', 'nm', node[1]));
+          if (node[2]) { const r = el('span', 'rt', node[2]); r.title = node[2]; b2.append(r); }
+          b2.append(meter(node[4]));
+          b2.append(el('span', 'cnt', String(node[4].length)));
+          b2.onclick = () => { openSet.has(key2) ? openSet.delete(key2) : openSet.add(key2); render(); };
+          li2.append(b2);
+          if (on2) {
+            const ul3 = el('ul', 'l3 ' + AXES[axis].cls);
+            node[4].filter(f => !term || match(f[0]) || match(f[1]) || match(f[2]) || match(node[0]) || match(node[1]) || match(menu[1]))
+              .forEach(f => {
+                const li3 = el('li');
+                if (act && act.fn[0] === f[0]) li3.classList.add('act');
+                li3.append(el('span', 'dot ' + f[3]));
+                li3.append(el('span', 'cd', f[0].replace(node[0] + '.', '')));
+                const nm = el('span', 'nm', f[1]);
+                nm.title = f[0] + ' ' + f[1];
+                li3.append(nm);
+                if (DET[f[0]]) { const h = el('span', 'has'); h.title = '已拆解需求明细'; h.append(icon(ICON.doc)); li3.append(h); }
+                li3.onclick = () => { location.hash = f[0]; };
+                ul3.append(li3);
+              });
+            if (ul3.children.length) li2.append(ul3);
+          }
+          ul2.append(li2);
+        });
+        li1.append(ul2);
+      }
+      tree.append(li1);
+    });
+  });
+}
+
+document.getElementById('expandAll').onclick = () => {
+  Object.keys(AXES).forEach(a => NAV[a].menus.forEach(m => {
+    openSet.add(m[0]);
+    m[3].forEach(n => openSet.add(n[0]));
+  }));
+  render();
+};
+document.getElementById('collapseAll').onclick = () => { openSet.clear(); render(); };
+
+function table(cols, rows, cls) {
+  if (!rows || !rows.length) return null;
+  const s = el('section');
+  const h = el('h3'); h.append(el('span', null, cols[0].t)); h.append(el('span', 'n', rows.length + ' 条'));
+  s.append(h);
+  const tb = el('table');
+  const thead = el('thead'); const tr = el('tr');
+  cols.forEach(c => { const th = el('th', c.cls, c.t); tr.append(th); });
+  thead.append(tr); tb.append(thead);
+  const tbody = el('tbody');
+  rows.forEach(r => {
+    const row = el('tr');
+    cols.forEach((c, i) => {
+      const td = el('td', c.cls);
+      const v = Array.isArray(r) ? r[i] : r;
+      if (c.src) { td.append(el('span', 'src ' + v, v)); }
+      else if (c.req) { td.textContent = v; if (String(v).indexOf('是') === 0) td.classList.add('req-yes'); }
+      else td.textContent = esc(v);
+      row.append(td);
+    });
+    tbody.append(row);
+  });
+  tb.append(tbody); s.append(tb); return s;
+}
+
+function renderDetail() {
+  const code = location.hash.slice(1);
+  const main = document.getElementById('detail');
+  main.innerHTML = '';
+  const hit = allFuncs.find(x => x.fn[0] === code);
+  if (!hit) {
+    const p = el('div', 'note');
+    p.textContent = '从左侧选择一个功能节点。编码规则：首字母表示端，三级编码为 菜单.节点.功能。';
+    main.append(p);
+    const lg = el('div', 'hd');
+    const h2 = el('h2', null, '来源标记说明');
+    lg.append(h2);
+    const t = el('div', 'tags');
+    ['代码实测', '需求文档', '自定义', '待决'].forEach(s => t.append(el('span', 'src ' + s, s)));
+    lg.append(t);
+    const d = el('div', 'empty');
+    d.textContent = '代码实测＝原型代码里可验证的事实；需求文档＝需求文档已定口径；自定义＝代码与文档均无依据、本次由需求方定值，可推翻；待决＝需人拍板，已列入待决问题。';
+    lg.append(d);
+    const st = el('div', 'hd');
+    st.append(el('h2', null, '功能实现状态'));
+    const tt = el('div', 'tags');
+    Object.keys(ST).forEach(k => { const b = el('span', 'tag st-' + k, ST[k]); tt.append(b); });
+    st.append(tt);
+    const sd = el('div', 'empty');
+    sd.textContent = '已实现＝admin 或 miniprogram 原型里已有对应交互；未实现＝需求已定但原型没有；待决＝需求或取值尚未确定。';
+    st.append(sd);
+    main.append(lg);
+    main.append(st);
+    return;
+  }
+  const { axis, menu, node, fn } = hit;
+  const crumb = el('div', 'crumb');
+  crumb.innerHTML = `${esc(AXES[axis].label)} <code>${esc(menu[0])}</code> ${esc(menu[1])} › <code>${esc(node[0])}</code> ${esc(node[1])}`;
+  main.append(crumb);
+  const d = DET[fn[0]];
+  const hd = el('div', 'hd');
+  hd.append(el('h2', null, fn[1]));
+  const id = el('div', 'id', fn[0] + '   载体：' + menu[2] + (node[2] ? '   路由：' + node[2] : '   路由：待补页签'));
+  hd.append(id);
+  const tags = el('div', 'tags');
+  tags.append(el('span', 'tag req', '需求编号 ' + fn[2]));
+  tags.append(el('span', 'tag st-' + fn[3], '实现状态 ' + ST[fn[3]]));
+  if (d) tags.append(el('span', 'tag', '已细化')); else tags.append(el('span', 'tag st-gap', '待细化'));
+  hd.append(tags);
+  main.append(hd);
+  if (!d) {
+    const n = el('div', 'note');
+    n.textContent = '该功能尚未拆解。需要补充 功能项、字段、按钮、事件、校验、规则、接口、错误码、待决问题、验收 十项内容，登记到 需求明细.js 中键为 ' + fn[0] + ' 的记录。';
+    main.append(n);
+    return;
+  }
+  if (d.src) {
+    const s = el('span', 'src ' + d.src, '整体来源 ' + d.src);
+    const t = el('div', 'tags'); t.append(s);
+    const box = el('div', 'hd'); box.append(t); main.append(box);
+  }
+  if (d.forms && d.forms.length) {
+    const s = table([{ t: '形态', cls: 'nowrap' }, { t: '说明' }], d.forms);
+    if (s) main.append(s);
+  }
+  const sec = (title, cols, rows) => {
+    if (!rows || !rows.length) return;
+    const box = table([{ t: title, cls: 'nowrap' }].concat(cols), rows);
+    if (box) main.append(box);
+  };
+  const F = [{ t: '字段', cls: 'mono' }, { t: '标签' }, { t: '控件', cls: 'nowrap' }, { t: '必填', cls: 'nowrap', req: 1 }, { t: '长度', cls: 'nowrap' }, { t: '内容限制', cls: 'mono' }, { t: '默认', cls: 'nowrap' }, { t: '来源', cls: 'nowrap', src: 1 }];
+  const B = [{ t: '按钮', cls: 'nowrap' }, { t: '位置' }, { t: '权限点', cls: 'mono' }, { t: '二次确认', cls: 'nowrap' }, { t: '幂等', cls: 'nowrap' }, { t: '可用条件' }];
+  const E = [{ t: '触发', cls: 'nowrap' }, { t: '动作' }, { t: '影响面' }];
+  const C = [{ t: '规则' }, { t: '校验时机', cls: 'nowrap' }, { t: '失败提示' }, { t: '来源', cls: 'nowrap', src: 1 }];
+  const R = [{ t: '约束', cls: 'nowrap' }, { t: '取值' }, { t: '来源', cls: 'nowrap', src: 1 }];
+  const A = [{ t: '编号', cls: 'mono nowrap' }, { t: '方法', cls: 'nowrap' }, { t: '路径', cls: 'mono' }, { t: '说明' }];
+  const X = [{ t: '错误码', cls: 'mono nowrap' }, { t: '场景', cls: 'nowrap' }, { t: '用户提示' }, { t: '登记状态', cls: 'nowrap' }];
+  const O = [{ t: '问题' }, { t: '建议' }, { t: '阻塞范围', cls: 'mono' }];
+  const cols = (title, head, rows) => {
+    if (!rows || !rows.length) return;
+    const s = el('section'); const h = el('h3'); h.append(el('span', null, title)); h.append(el('span', 'n', rows.length + ' 条')); s.append(h);
+    s.append(head(rows)); main.append(s);
+  };
+  const mkTable = (head, rows) => {
+    const tb = el('table'); const th = el('thead'); const tr = el('tr');
+    head.forEach(c => tr.append(el('th', c.cls, c.t))); th.append(tr); tb.append(th);
+    const tbody = el('tbody');
+    rows.forEach(r => {
+      const row = el('tr');
+      head.forEach((c, i) => {
+        const td = el('td', c.cls);
+        const v = Array.isArray(r) ? r[i] : r;
+        if (c.src) td.append(el('span', 'src ' + v, v));
+        else { td.textContent = esc(v); if (c.req && String(v).indexOf('是') === 0) td.classList.add('req-yes'); }
+        row.append(td);
+      });
+      tbody.append(row);
+    });
+    tb.append(tbody); return tb;
+  };
+  const add = (title, head, rows) => {
+    if (!rows || !rows.length) return;
+    const s = el('section'); const h = el('h3'); h.append(el('span', null, title)); h.append(el('span', 'n', rows.length + ' 条')); s.append(h); s.append(mkTable(head, rows)); main.append(s);
+  };
+  add('字段', F, d.fields);
+  add('按钮与权限', B, d.btns);
+  add('事件与联动', E, d.events);
+  add('校验规则', C, d.checks);
+  add('业务规则与取值', R, d.rules);
+  add('接口', A, d.api);
+  add('错误码', X, d.errors);
+  add('待决问题', O, d.open);
+  if (d.accept && d.accept.length) {
+    const pairs = Array.isArray(d.accept[0]);
+    add('验收场景', pairs ? [{ t: '场景' }, { t: '预期' }] : [{ t: '场景与预期' }], d.accept);
+  }
+}
+
+document.getElementById('q').addEventListener('input', e => { term = e.target.value.trim().toLowerCase(); render(); });
+document.getElementById('seg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  axisFilter = b.dataset.axis;
+  Array.from(b.parentElement.children).forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+  render();
+});
+window.addEventListener('hashchange', () => { reveal(location.hash.slice(1)); render(); renderDetail(); });
+reveal(location.hash.slice(1));
+render(); renderDetail();
+</script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node
+node_modules/
+dist/
+.npm
+.eslintcache
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/
+*.db
+*.db-journal
+archive/
+
+# Config (keep template, ignore actual)
+# settings.json
+
+# 本地实测临时产物（cargo 日志、dws 抓包，可能含真实会话信息）
+/.probe/
+
+# Qoder 本地技能资产（共享技能副本，不属于本项目交付物）
+/.qoder/
