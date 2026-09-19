@@ -981,6 +981,12 @@ mod tests {
     use super::*;
     use crate::storage::EventQuery;
 
+    /// 两个端到端测试都要临时改**进程级**工作目录（node 按相对名 `event` / `chat`
+    /// 找桩脚本）。进程 cwd 是全局的，并行跑就会互相踩：一个测试改了 cwd，
+    /// 另一个测试的 `chat` 桩就找不到了，表现为偶发的「发送失败」。
+    /// 用一把锁把「改 cwd 的窗口」串起来，否则这是测试环境问题而非产品缺陷。
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn node_exe() -> Option<String> {
         let path_var = std::env::var("PATH").ok()?;
         for dir in std::env::split_paths(&path_var) {
@@ -1041,6 +1047,8 @@ process.stdin.on("end", function () { process.exit(0); });
         let orchestrator = Orchestrator::new(storage.clone());
         orchestrator.set_dws_path(Some(node)).await;
 
+        // 改 cwd 前拿锁，直到本测试恢复 cwd 为止（见 CWD_LOCK 的说明）。
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(&stub_dir).unwrap();
 
@@ -1210,6 +1218,8 @@ process.stdout.write("收到 " + process.cwd());
             ..Default::default()
         };
 
+        // 改 cwd 前拿锁，直到本测试恢复 cwd 为止（见 CWD_LOCK 的说明）。
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(&stub_dir).unwrap();
 

@@ -113,6 +113,9 @@ fn location_file() -> PathBuf {
 #[derive(Debug, Serialize, Deserialize)]
 struct Location {
     data_dir: String,
+    /// 换目录时记住「从哪搬」，否则连续搬两次会拿默认目录里的陈旧副本当源。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<String>,
 }
 
 fn configured_data_dir() -> Option<PathBuf> {
@@ -137,23 +140,50 @@ pub fn persist_data_dir(path: &str) -> anyhow::Result<()> {
     if target.as_os_str().is_empty() {
         anyhow::bail!("数据目录不能为空");
     }
+    let current = data_dir();
     fs::create_dir_all(&target)?;
     fs::create_dir_all(app_root())?;
     fs::write(
         location_file(),
         serde_json::to_string_pretty(&Location {
             data_dir: target.to_string_lossy().to_string(),
+            previous: if current == target {
+                None
+            } else {
+                Some(current.to_string_lossy().to_string())
+            },
         })?,
     )?;
     Ok(())
 }
 
-/// 启动时的一次性搬迁：目标目录还没有数据库、而旧目录有，就把旧数据拷过去。
+/// 搬迁的源目录：优先用上一次的数据目录（连续换目录时它才是最新副本），
+/// 没有记录时退回默认目录。
+fn migrate_source() -> PathBuf {
+    let previous = fs::read_to_string(location_file())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Location>(&raw).ok())
+        .and_then(|parsed| parsed.previous)
+        .map(|path| PathBuf::from(path.trim()))
+        .filter(|path| !path.as_os_str().is_empty());
+
+    pick_migrate_source(previous, default_data_dir())
+}
+
+/// 源目录选择：记录里的「上一次目录」里确实有数据库就用它，否则用默认目录。
+fn pick_migrate_source(previous: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
+    match previous {
+        Some(path) if path.join("agentmux.db").exists() => path,
+        _ => fallback,
+    }
+}
+
+/// 启动时的一次性搬迁：目标目录还没有数据库、而源目录有，就把源数据拷过去。
 pub fn migrate_data_dir_on_startup() {
     let Some(target) = configured_data_dir() else {
         return;
     };
-    let source = default_data_dir();
+    let source = migrate_source();
     if target == source || target.join("agentmux.db").exists() || !source.join("agentmux.db").exists() {
         return;
     }
@@ -496,6 +526,40 @@ mod tests {
         let fresh = root.join("fresh").join("settings.json");
         assert!(!adopt_config_file(&absent, &fresh).unwrap());
         assert!(!fresh.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 回归：连续换两次数据目录时，搬迁的源必须是「上一次的目录」，
+    /// 否则第二次会把默认目录里的陈旧副本当成最新数据。
+    #[test]
+    fn chained_data_dir_moves_pick_the_previous_dir_as_source() {
+        let root = std::env::temp_dir().join("agentmux-chained-move-test");
+        let _ = fs::remove_dir_all(&root);
+        let first = root.join("first");
+        let stale_default = root.join("stale-default");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&stale_default).unwrap();
+        // 第一次搬走的目录里是最新库；默认目录留着的是搬走前的旧副本。
+        fs::write(first.join("agentmux.db"), b"latest").unwrap();
+        fs::write(stale_default.join("agentmux.db"), b"stale").unwrap();
+
+        assert_eq!(
+            pick_migrate_source(Some(first.clone()), stale_default.clone()),
+            first,
+            "有上一次目录且其中有库时，必须从它搬，不能退回默认目录"
+        );
+
+        // 上一次目录里没有库（比如被手工删了）→ 退回默认目录。
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            pick_migrate_source(Some(empty), stale_default.clone()),
+            stale_default
+        );
+
+        // 从未换过目录 → 没有记录，用默认目录。
+        assert_eq!(pick_migrate_source(None, stale_default.clone()), stale_default);
 
         let _ = fs::remove_dir_all(&root);
     }
