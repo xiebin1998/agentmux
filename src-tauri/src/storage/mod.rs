@@ -307,35 +307,59 @@ impl Storage {
             .map_err(|e| anyhow::anyhow!("Failed to collect events: {}", e))
     }
 
-    /// 会话汇总。传 project_id 时只统计该项目的会话（左侧树的「项目下挂会话」）。
+    /// 会话汇总。
+    ///
+    /// - `project_id = Some(id)`：只统计该项目的会话（左树「项目下挂会话」）
+    /// - `unassigned_only = true`：只统计**没有项目归属**的会话（升级前的历史数据）
     ///
     /// 会过滤掉 `conversation_id` 为空的行：那是缺会话标识的畸形事件，
     /// 在左树里会表现为一个点了没反应的「空会话」。
-    pub fn list_conversations(&self, project_id: Option<&str>) -> Result<Vec<ConversationSummary>> {
-        let mut stmt = self.db.prepare(
+    pub fn list_conversations(
+        &self,
+        project_id: Option<&str>,
+        unassigned_only: bool,
+    ) -> Result<Vec<ConversationSummary>> {
+        let scope = if unassigned_only {
+            " AND (project_id IS NULL OR project_id = '')"
+        } else if project_id.map(|p| !p.is_empty()).unwrap_or(false) {
+            " AND project_id = ?1"
+        } else {
+            ""
+        };
+
+        let sql = format!(
             "SELECT conversation_id,
                     COUNT(*) AS events,
                     MAX(received_at) AS last_received_at,
                     SUM(CASE WHEN reply_status = 'sent' THEN 1 ELSE 0 END) AS replied
              FROM events
-             WHERE conversation_id <> ''
-               AND (?1 IS NULL OR project_id = ?1)
+             WHERE conversation_id <> ''{}
              GROUP BY conversation_id
              ORDER BY last_received_at DESC",
-        )?;
+            scope
+        );
 
-        let rows = stmt.query_map(params![project_id], |row| {
+        let mut stmt = self.db.prepare(&sql)?;
+
+        let map_row = |row: &rusqlite::Row<'_>| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
             ))
-        })?;
+        };
+
+        let collected: Vec<(String, i64, String, i64)> =
+            if scope.contains("?1") {
+                stmt.query_map(params![project_id], map_row)?
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                stmt.query_map([], map_row)?.collect::<Result<Vec<_>, _>>()?
+            };
 
         let mut out = Vec::new();
-        for row in rows {
-            let (conversation_id, events, last_received_at, replied) = row?;
+        for (conversation_id, events, last_received_at, replied) in collected {
             let last_sender: String = self
                 .db
                 .query_row(
@@ -354,6 +378,27 @@ impl Storage {
         }
 
         Ok(out)
+    }
+
+    /// 把某个会话（连同它的历史事件）归入项目。
+    ///
+    /// 用于升级前的历史数据：它们 `project_id` 为空，不属于任何项目，
+    /// 在左树里看不到。返回被改写的会话数。
+    pub fn assign_conversation(&self, conversation_id: &str, project_id: &str) -> Result<usize> {
+        let changed = self.db.execute(
+            "UPDATE events SET project_id = ?1
+             WHERE conversation_id = ?2 AND (project_id IS NULL OR project_id = '')",
+            params![project_id, conversation_id],
+        )?;
+
+        // 会话记录同样搬过去（旧记录原本挂在空项目下）。
+        let _ = self.db.execute(
+            "UPDATE sessions SET project_id = ?1
+             WHERE conversation_id = ?2 AND (project_id IS NULL OR project_id = '')",
+            params![project_id, conversation_id],
+        );
+
+        Ok(changed)
     }
 
     /// 取某会话最近若干条消息（最新在前），用于拼上下文。

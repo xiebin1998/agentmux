@@ -83,6 +83,8 @@ const VIEWS: { view: View; label: string }[] = [
 function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({});
+  /** 没有项目归属的历史会话（升级前的数据），仍要能看到并能归入项目 */
+  const [unassignedSessions, setUnassignedSessions] = useState<Session[]>([]);
   const [statusesByProject, setStatusesByProject] = useState<
     Record<string, Partial<Record<ListenKind, ListenerStatus>>>
   >({});
@@ -122,21 +124,23 @@ function App() {
   /** 会话按项目分别拉取：左树是「项目 → 会话」两层。 */
   const loadSessions = useCallback(async (list: Project[]) => {
     const next: Record<string, Session[]> = {};
+    const toSession = (projectId: string, conversation: ConversationSummary): Session => ({
+      id: conversation.conversation_id,
+      project_id: projectId,
+      name: conversation.last_sender
+        ? `${conversation.last_sender}（${conversation.events} 条）`
+        : conversation.conversation_id,
+      conversation_id: conversation.conversation_id,
+      created_at: conversation.last_received_at,
+    });
+
     await Promise.all(
       list.map(async (project) => {
         try {
           const conversations = await invoke<ConversationSummary[]>("list_conversations", {
             projectId: project.id,
           });
-          next[project.id] = conversations.map((conversation) => ({
-            id: conversation.conversation_id,
-            project_id: project.id,
-            name: conversation.last_sender
-              ? `${conversation.last_sender}（${conversation.events} 条）`
-              : conversation.conversation_id,
-            conversation_id: conversation.conversation_id,
-            created_at: conversation.last_received_at,
-          }));
+          next[project.id] = conversations.map((c) => toSession(project.id, c));
         } catch (e) {
           console.error("Failed to load conversations for", project.id, e);
           next[project.id] = [];
@@ -144,7 +148,31 @@ function App() {
       }),
     );
     setSessionsByProject(next);
+
+    // 升级前的历史会话没有 project_id，不属于任何项目，但必须可见
+    try {
+      const orphans = await invoke<ConversationSummary[]>("list_conversations", {
+        unassigned: true,
+      });
+      setUnassignedSessions(orphans.map((c) => toSession("", c)));
+    } catch (e) {
+      console.error("Failed to load unassigned conversations:", e);
+      setUnassignedSessions([]);
+    }
   }, []);
+
+  /** 把无归属的历史会话归入某个项目。 */
+  const handleAssignConversation = async (conversationId: string, projectId: string) => {
+    if (!projectId) return;
+    try {
+      await invoke("assign_conversation", { conversationId, projectId });
+      const list = await loadProjects();
+      await loadSessions(list);
+      setBanner(null);
+    } catch (e) {
+      setBanner(String(e));
+    }
+  };
 
   const loadStatuses = useCallback(async () => {
     try {
@@ -229,7 +257,7 @@ function App() {
     }
   };
 
-  const handleSelectSession = (session: Session, project: Project) => {
+  const handleSelectSession = (session: Session, project: Project | null) => {
     setSelectedProject(project);
     setSelectedSession(session);
   };
@@ -317,10 +345,12 @@ function App() {
           <ProjectList
             projects={projects}
             sessionsByProject={sessionsByProject}
+            unassignedSessions={unassignedSessions}
             statusesByProject={statusesByProject}
             selectedSession={selectedSession}
             busyKey={busyKey}
             onSelectSession={handleSelectSession}
+            onAssignConversation={handleAssignConversation}
             onEditProject={(project) => {
               setEditingProject(project);
               setShowProjectDialog(true);

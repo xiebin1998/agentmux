@@ -2,7 +2,6 @@
 
 mod commands;
 mod config;
-mod legacy;
 mod orchestrator;
 mod process;
 mod project;
@@ -48,6 +47,9 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 fn main() {
+    // 数据目录若被改到别处，先把旧数据搬过去（必须在打开数据库之前）。
+    config::migrate_data_dir_on_startup();
+
     let data_dir = config::data_dir();
     let storage = Arc::new(Mutex::new(
         Storage::new(data_dir).expect("Failed to initialize storage"),
@@ -110,6 +112,8 @@ fn main() {
             config::get_config,
             config::set_config,
             config::data_paths,
+            config::set_data_dir,
+            config::set_im_identity,
             // 平台 CLI 自动检测
             resolve::list_cli_platforms,
             providers::detect_im_provider,
@@ -128,6 +132,7 @@ fn main() {
             commands::get_stats,
             commands::list_events,
             commands::list_conversations,
+            commands::assign_conversation,
             commands::reset_conversation,
             commands::conversation_session,
             // 运行期设置（按项目）
@@ -137,8 +142,6 @@ fn main() {
             commands::compress_now,
             commands::update_summary,
             commands::delete_summary,
-            // 旧版数据导入
-            legacy::import_legacy,
             // 窗口/托盘
             hide_to_tray,
             quit_app,

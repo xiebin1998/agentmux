@@ -1,10 +1,12 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 
 interface Project {
   id: string;
   name: string;
   work_dir: string;
+  context_max_chars: number;
 }
 
 interface AppConfig {
@@ -13,7 +15,8 @@ interface AppConfig {
   agent_platform: string;
   im_cli_path: string | null;
   agent_cli_path: string | null;
-  self_open_dingtalk_id: string | null;
+  im_identities?: Record<string, string>;
+  self_open_dingtalk_id?: string | null;
   agent_cwd: string | null;
   agent_args: string[] | null;
   reply_enabled: boolean;
@@ -23,11 +26,11 @@ interface AppConfig {
   context_message_limit: number;
   context_max_chars: number;
   auto_compress: boolean;
+  compress_trigger_percent?: number | null;
   compress_trigger_turns: number | null;
   compress_trigger_chars: number | null;
 }
 
-/** 某个项目**实际生效**的运行期设置（由后端按项目解析后返回）。 */
 interface RuntimeSettings {
   project_id: string;
   reply_enabled: boolean;
@@ -41,16 +44,18 @@ interface RuntimeSettings {
   context_message_limit: number;
   context_max_chars: number;
   auto_compress: boolean;
-  compress_trigger_turns: number | null;
+  compress_trigger_percent: number | null;
   compress_trigger_chars: number | null;
-  self_open_dingtalk_id: string | null;
+  self_open_id: string | null;
   im_cli_path: string | null;
 }
 
 interface DataPaths {
+  app_root: string;
   config_path: string;
   data_dir: string;
   archive_dir: string;
+  is_default: boolean;
 }
 
 interface SettingsPanelProps {
@@ -86,15 +91,15 @@ const section: CSSProperties = {
   marginBottom: "14px",
 };
 
+const DEFAULT_PERCENT = 80;
+
 export default function SettingsPanel({ project, onClose }: SettingsPanelProps) {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [runtime, setRuntime] = useState<RuntimeSettings | null>(null);
   const [paths, setPaths] = useState<DataPaths | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [legacyPath, setLegacyPath] = useState("");
-  const [importing, setImporting] = useState(false);
-  const [importReport, setImportReport] = useState<string | null>(null);
+  const [moving, setMoving] = useState(false);
 
   const load = async () => {
     try {
@@ -104,15 +109,11 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
       ]);
       setConfig(nextConfig);
       setPaths(nextPaths);
-      if (project) {
-        setRuntime(
-          await invoke<RuntimeSettings>("project_runtime_settings", {
-            projectId: project.id,
-          }),
-        );
-      } else {
-        setRuntime(null);
-      }
+      setRuntime(
+        project
+          ? await invoke<RuntimeSettings>("project_runtime_settings", { projectId: project.id })
+          : null,
+      );
     } catch (e) {
       setStatus("读取设置失败：" + String(e));
     }
@@ -134,7 +135,7 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
     try {
       await invoke("set_config", { config });
       await load();
-      setStatus("已保存。Agent 启动参数、压缩策略、身份改动需重启对应项目的监听才生效。");
+      setStatus("已保存。Agent 启动参数与压缩策略需重启对应项目的监听才生效。");
     } catch (e) {
       setStatus("保存失败：" + String(e));
     } finally {
@@ -142,20 +143,42 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
     }
   };
 
-  const handleImport = async () => {
-    if (!confirm("从该目录导入旧版事件、回复台账与会话？重复事件会自动跳过。")) return;
-    setImporting(true);
-    setImportReport(null);
+  /** 切换数据目录：只记录位置，搬迁在下次启动时做。 */
+  const handleMoveDataDir = async () => {
     try {
-      const report = await invoke<Record<string, unknown>>("import_legacy", {
-        path: legacyPath,
-        projectId: project?.id ?? null,
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        title: "选择数据目录（配置文件、数据库、归档都会放在这里）",
+        defaultPath: paths?.data_dir,
       });
-      setImportReport(JSON.stringify(report, null, 2));
+      if (typeof picked !== "string" || !picked) return;
+      if (
+        !confirm(
+          `把数据目录改为：\n${picked}\n\n重启后生效：现有数据会复制过去，旧目录不会被删除。确定吗？`,
+        )
+      ) {
+        return;
+      }
+      setMoving(true);
+      const next = await invoke<DataPaths>("set_data_dir", { path: picked });
+      setPaths(next);
+      setStatus("数据目录已记录，重启 AgentMux 后生效（现有数据会一并复制过去）。");
     } catch (e) {
-      setImportReport("导入失败：" + String(e));
+      setStatus("切换数据目录失败：" + String(e));
     } finally {
-      setImporting(false);
+      setMoving(false);
+    }
+  };
+
+  const handleResetDataDir = async () => {
+    if (!confirm("恢复默认数据目录？重启后生效。")) return;
+    try {
+      const next = await invoke<DataPaths>("set_data_dir", { path: "" });
+      setPaths(next);
+      setStatus("已恢复默认数据目录，重启后生效。");
+    } catch (e) {
+      setStatus("恢复失败：" + String(e));
     }
   };
 
@@ -167,17 +190,21 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
     );
   }
 
+  const percent = config.compress_trigger_percent ?? DEFAULT_PERCENT;
+  const budget = runtime?.context_max_chars ?? project?.context_max_chars ?? config.context_max_chars;
+  const approxChars = Math.max(1, Math.round((budget * percent) / 100));
+
   return (
     <Shell onClose={onClose}>
       {project ? (
         <div style={section}>
           <div style={sectionTitle}>当前项目生效值（{project.name}）</div>
-          <Row k="回复引擎" v={runtime?.reply_enabled ? "已启用" : "未启用（只记录）"} tone={runtime?.reply_enabled ? "ok" : "muted"} />
           <Row
-            k="驱动 Agent 的工作目录"
-            v={runtime?.agent_cwd ?? project.work_dir}
-            tone="plain"
+            k="回复引擎"
+            v={runtime?.reply_enabled ? "已启用" : "未启用（只记录）"}
+            tone={runtime?.reply_enabled ? "ok" : "muted"}
           />
+          <Row k="驱动 Agent 的工作目录" v={runtime?.agent_cwd ?? project.work_dir} />
           <Row
             k="实际使用的 Agent CLI"
             v={runtime?.agent_cli_path ?? "未解析到（无法生成回复）"}
@@ -194,10 +221,11 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
                 : "已禁用"
             }
           />
+          <Row k="自身身份" v={runtime?.self_open_id ?? "未设置（会回复自己发的消息）"} />
           <Row k="实际使用的 IM CLI" v={runtime?.im_cli_path ?? "未解析到"} />
           <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "8px" }}>
-            上面是**运行期真实生效值**。回复开关/超时/字数/上下文在「编辑项目」里改；
-            **改完需重启该项目的监听才生效**。
+            回复开关、工作目录、超时、字数、上下文预算在项目的「编辑」里改；
+            <strong>改完需重启该项目的监听才生效</strong>。自身身份在「提供方检测」页按 IM 平台设置。
           </div>
         </div>
       ) : (
@@ -209,18 +237,6 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
           </div>
         </div>
       )}
-
-      <div style={section}>
-        <div style={sectionTitle}>身份（全局）</div>
-        <label style={label}>自身 openDingTalkId（用于跳过自己发的消息）</label>
-        <input
-          type="text"
-          value={config.self_open_dingtalk_id ?? ""}
-          onChange={(e) => patch({ self_open_dingtalk_id: e.target.value || null })}
-          placeholder="留空则不跳过；可在「回复历史」里核对后一键采用"
-          style={input}
-        />
-      </div>
 
       <div style={section}>
         <div style={sectionTitle}>Agent 启动参数（全局）</div>
@@ -241,7 +257,9 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
 
       <div style={section}>
         <div style={sectionTitle}>自动压缩（全局）</div>
-        <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", marginBottom: "10px" }}>
+        <label
+          style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", marginBottom: "12px" }}
+        >
           <input
             type="checkbox"
             checked={config.auto_compress}
@@ -250,95 +268,86 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
           />
           启用自动压缩（默认关闭）
         </label>
-        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginBottom: "10px" }}>
-          触发阈值尚无实测依据，留空表示该维度不触发自动压缩，不会拍脑袋默认。
-        </div>
-        <div style={{ display: "flex", gap: "12px" }}>
-          <div style={{ flex: 1 }}>
-            <label style={label}>按新增轮数触发（留空=不触发）</label>
-            <input
-              type="number"
-              min={1}
-              value={config.compress_trigger_turns ?? ""}
-              onChange={(e) =>
-                patch({ compress_trigger_turns: e.target.value ? Number(e.target.value) : null })
-              }
-              disabled={!config.auto_compress}
-              style={input}
-            />
+
+        <div style={{ opacity: config.auto_compress ? 1 : 0.5 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "baseline",
+              marginBottom: "6px",
+            }}
+          >
+            <label style={label}>触发阈值：上下文用到 {percent}%</label>
+            <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+              ≈ {approxChars} 字符
+            </span>
           </div>
-          <div style={{ flex: 1 }}>
-            <label style={label}>按字符数触发（留空=不触发）</label>
-            <input
-              type="number"
-              min={1}
-              value={config.compress_trigger_chars ?? ""}
-              onChange={(e) =>
-                patch({ compress_trigger_chars: e.target.value ? Number(e.target.value) : null })
-              }
-              disabled={!config.auto_compress}
-              style={input}
-            />
+          <input
+            type="range"
+            className="agentmux-range"
+            min={0}
+            max={100}
+            step={5}
+            value={percent}
+            disabled={!config.auto_compress}
+            onChange={(e) => patch({ compress_trigger_percent: Number(e.target.value) })}
+          />
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", color: "var(--text-muted)" }}>
+            <span>0%</span>
+            <span>50%</span>
+            <span>100%</span>
+          </div>
+          <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "6px" }}>
+            按各项目的上下文预算换算成字符数；设为 0% 表示不自动压缩。
+            连续压缩失败 3 次会自动暂停。
           </div>
         </div>
       </div>
 
       <div style={section}>
-        <div style={sectionTitle}>数据与诊断</div>
+        <div style={sectionTitle}>数据位置</div>
+        <Row k="数据目录" v={paths?.data_dir ?? "—"} tone={paths?.is_default ? "plain" : "ok"} />
         <Row k="配置文件" v={paths?.config_path ?? "—"} />
-        <Row k="数据目录" v={paths?.data_dir ?? "—"} />
         <Row k="归档目录" v={paths?.archive_dir ?? "—"} />
-
-        <div style={{ marginTop: "12px" }}>
-          <label style={label}>
-            导入旧版数据（指向旧工程的 data 目录）
-            {project ? `，导入到项目「${project.name}」` : "，需先选中项目才能归类"}
-          </label>
-          <input
-            type="text"
-            value={legacyPath}
-            onChange={(e) => setLegacyPath(e.target.value)}
-            placeholder="例如：D:\workSpase\idea\dingtalk-event-host\data"
-            style={input}
-          />
-          <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
-            只导入事件 / 回复台账 / 会话；不导入旧版日志。重复事件按 message_id 去重。
-          </div>
+        <Row k="定位文件" v={paths?.app_root ?? "—"} />
+        <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
           <button
-            onClick={handleImport}
-            disabled={importing || !legacyPath.trim() || !project}
+            onClick={handleMoveDataDir}
+            disabled={moving}
             style={{
-              marginTop: "8px",
               padding: "6px 14px",
               fontSize: "12px",
-              backgroundColor:
-                importing || !project ? "var(--text-muted)" : "var(--accent)",
+              backgroundColor: moving ? "var(--text-muted)" : "var(--accent)",
               color: "var(--accent-contrast)",
               border: "none",
               borderRadius: "4px",
-              cursor: importing || !project ? "not-allowed" : "pointer",
+              cursor: moving ? "not-allowed" : "pointer",
             }}
           >
-            {importing ? "导入中…" : "开始导入"}
+            {moving ? "处理中…" : "更改数据目录…"}
           </button>
-          {importReport && (
-            <pre
+          {paths && !paths.is_default && (
+            <button
+              onClick={handleResetDataDir}
               style={{
-                marginTop: "10px",
-                padding: "10px",
-                backgroundColor: "var(--bg-app)",
+                padding: "6px 14px",
+                fontSize: "12px",
+                backgroundColor: "transparent",
+                color: "var(--text-secondary)",
                 border: "1px solid var(--border)",
                 borderRadius: "4px",
-                fontSize: "11px",
-                color: "var(--text-secondary)",
-                whiteSpace: "pre-wrap",
-                maxHeight: "200px",
-                overflow: "auto",
+                cursor: "pointer",
               }}
             >
-              {importReport}
-            </pre>
+              恢复默认
+            </button>
           )}
+        </div>
+        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "8px" }}>
+          配置文件、数据库与归档都放在这个目录下。**安装时选自定义位置不会被自动采用**
+          —— 安装到 `Program Files` 后写入需要管理员权限，所以默认仍放在用户目录；
+          这里改完**重启生效**，现有数据会复制过去（旧目录不会删）。
         </div>
       </div>
 
@@ -397,11 +406,7 @@ function Row({ k, v, tone = "plain" }: { k: string; v: string; tone?: "plain" | 
     <div style={{ display: "flex", gap: "12px", fontSize: "12px", marginBottom: "6px" }}>
       <span style={{ color: "var(--text-secondary)", flex: "0 0 150px" }}>{k}</span>
       <span
-        style={{
-          color,
-          wordBreak: "break-all",
-          fontFamily: "ui-monospace, Consolas, monospace",
-        }}
+        style={{ color, wordBreak: "break-all", fontFamily: "ui-monospace, Consolas, monospace" }}
       >
         {v}
       </span>
@@ -427,7 +432,7 @@ function Shell({ children, onClose }: { children: ReactNode; onClose: () => void
           backgroundColor: "var(--bg-elevated)",
           border: "1px solid var(--border)",
           borderRadius: "8px",
-          width: "640px",
+          width: "660px",
           maxHeight: "88vh",
           overflow: "auto",
           boxShadow: "var(--shadow)",

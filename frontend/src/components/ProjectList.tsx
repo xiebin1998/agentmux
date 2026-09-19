@@ -72,11 +72,14 @@ interface ProjectListProps {
   projects: Project[];
   /** project_id → 该项目的会话 */
   sessionsByProject: Record<string, Session[]>;
+  /** 没有项目归属的历史会话（升级前的数据） */
+  unassignedSessions: Session[];
   /** project_id → kind → 监听状态 */
   statusesByProject: Record<string, Partial<Record<ListenKind, ListenerStatus>>>;
   selectedSession: Session | null;
   busyKey: string | null;
-  onSelectSession: (session: Session, project: Project) => void;
+  onSelectSession: (session: Session, project: Project | null) => void;
+  onAssignConversation: (conversationId: string, projectId: string) => void;
   onEditProject: (project: Project) => void;
   onDeleteProject: (id: string) => void;
   onToggleListener: (project: Project, kind: ListenKind, active: boolean) => void;
@@ -95,15 +98,19 @@ const iconButton = {
 export default function ProjectList({
   projects,
   sessionsByProject,
+  unassignedSessions,
   statusesByProject,
   selectedSession,
   busyKey,
   onSelectSession,
+  onAssignConversation,
   onEditProject,
   onDeleteProject,
   onToggleListener,
 }: ProjectListProps) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  /** 每个未归类会话当前选中的目标项目 */
+  const [assignTarget, setAssignTarget] = useState<Record<string, string>>({});
 
   return (
     <div style={{ flex: 1, overflow: "auto" }}>
@@ -263,6 +270,99 @@ export default function ProjectList({
             </div>
           );
         })
+      )}
+      {/* 升级前的历史会话：没有项目归属，但必须可见、可归入 */}
+      {unassignedSessions.length > 0 && (
+        <div style={{ borderBottom: "1px solid var(--border)" }}>
+          <div style={{ padding: "8px 12px 2px", fontSize: "12px", color: "var(--warn)" }}>
+            未归类（历史会话）· {unassignedSessions.length}
+          </div>
+          <div
+            style={{
+              padding: "0 12px 6px",
+              fontSize: "10px",
+              color: "var(--text-muted)",
+              lineHeight: 1.5,
+            }}
+          >
+            这些是升级前收到的消息，还没有归入任何项目。选一个项目点「归入」即可。
+          </div>
+          {unassignedSessions.map((session) => {
+            const target = assignTarget[session.conversation_id] ?? "";
+            const selected = selectedSession?.id === session.conversation_id;
+            return (
+              <div
+                key={session.conversation_id}
+                style={{
+                  padding: "6px 12px 8px",
+                  backgroundColor: selected ? "var(--bg-active)" : "transparent",
+                }}
+              >
+                <div
+                  onClick={() => onSelectSession(session, null)}
+                  style={{ cursor: "pointer" }}
+                >
+                  <div style={{ fontSize: "12px", color: "var(--text-primary)" }}>
+                    {session.name}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: "10px",
+                      color: "var(--text-muted)",
+                      fontFamily: "ui-monospace, Consolas, monospace",
+                      wordBreak: "break-all",
+                    }}
+                  >
+                    {session.conversation_id}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: "6px", marginTop: "4px" }}>
+                  <select
+                    value={target}
+                    onChange={(e) =>
+                      setAssignTarget((current) => ({
+                        ...current,
+                        [session.conversation_id]: e.target.value,
+                      }))
+                    }
+                    style={{
+                      flex: 1,
+                      minWidth: 0,
+                      padding: "2px 4px",
+                      fontSize: "11px",
+                      backgroundColor: "var(--bg-input)",
+                      color: "var(--text-primary)",
+                      border: "1px solid var(--border)",
+                      borderRadius: "3px",
+                    }}
+                  >
+                    <option value="">选择项目…</option>
+                    {projects.map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    disabled={!target}
+                    onClick={() => onAssignConversation(session.conversation_id, target)}
+                    style={{
+                      padding: "2px 8px",
+                      fontSize: "11px",
+                      backgroundColor: target ? "var(--accent)" : "var(--text-muted)",
+                      color: "var(--accent-contrast)",
+                      border: "none",
+                      borderRadius: "3px",
+                      cursor: target ? "pointer" : "not-allowed",
+                    }}
+                  >
+                    归入
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       )}
     </div>
   );

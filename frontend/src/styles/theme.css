@@ -81,3 +81,28 @@ input::placeholder,
 textarea::placeholder {
   color: var(--text-muted);
 }
+
+/* 刷新等异步动作的「在转」提示：静止的图标看不出在不在刷新 */
+@keyframes agentmux-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spin {
+  display: inline-block;
+  animation: agentmux-spin 0.9s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation-duration: 2.4s;
+  }
+}
+
+/* 0-100 的滑动条（自动压缩阈值等） */
+input[type="range"].agentmux-range {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}

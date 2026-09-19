@@ -1,4 +1,5 @@
-import { useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useProviders, type CliCandidate, type PlatformCandidates } from "../providers";
 
 /** 未安装与未登录必须一眼可辨，不能合并成一个状态。 */
@@ -29,6 +30,50 @@ const sectionTitle: CSSProperties = {
 export default function ProvidersView() {
   const { platforms, loading, error, checkedAt, refresh } = useProviders();
   const [expanded, setExpanded] = useState<string | null>(null);
+  /** platform_id → 自身在该平台上的身份 id（跳过自己发的消息用） */
+  const [identities, setIdentities] = useState<Record<string, string>>({});
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [savingId, setSavingId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const loadIdentities = async () => {
+    try {
+      const config = await invoke<{
+        im_identities?: Record<string, string>;
+        self_open_dingtalk_id?: string | null;
+      }>("get_config");
+      const map: Record<string, string> = { ...(config.im_identities ?? {}) };
+      // 旧版本只有一个全局钉钉身份，读出来当作钉钉平台的值。
+      if (!map.dingtalk && config.self_open_dingtalk_id) {
+        map.dingtalk = config.self_open_dingtalk_id;
+      }
+      setIdentities(map);
+      setDraft(map);
+    } catch (e) {
+      console.error("Failed to load identities:", e);
+    }
+  };
+
+  useEffect(() => {
+    loadIdentities();
+  }, []);
+
+  const saveIdentity = async (platformId: string) => {
+    setSavingId(platformId);
+    setNotice(null);
+    try {
+      await invoke("set_im_identity", {
+        platformId,
+        identity: draft[platformId] ?? "",
+      });
+      await loadIdentities();
+      setNotice(`${platformId} 的自身身份已保存（下次启动该项目监听时生效）`);
+    } catch (e) {
+      setNotice("保存失败：" + String(e));
+    } finally {
+      setSavingId(null);
+    }
+  };
 
   const im = platforms.filter((p) => p.kind === "im");
   const agent = platforms.filter((p) => p.kind === "agent");
@@ -64,21 +109,27 @@ export default function ProvidersView() {
             padding: "2px 10px",
             fontSize: "14px",
             lineHeight: 1.2,
-            backgroundColor: "transparent",
-            color: "var(--text-secondary)",
+            backgroundColor: loading ? "var(--bg-active)" : "transparent",
+            color: loading ? "var(--accent)" : "var(--text-secondary)",
             border: "1px solid var(--border)",
             borderRadius: "4px",
             cursor: loading ? "not-allowed" : "pointer",
           }}
         >
-          {loading ? "…" : "⟳"}
+          <span className={loading ? "spin" : undefined}>⟳</span>
         </button>
       </div>
 
       <div style={{ flex: 1, overflow: "auto", padding: "16px" }}>
-        {error && (
-          <div style={{ color: "var(--danger)", fontSize: "12px", marginBottom: "12px" }}>
-            检测失败：{error}
+        {(error || notice) && (
+          <div
+            style={{
+              color: error ? "var(--danger)" : "var(--text-secondary)",
+              fontSize: "12px",
+              marginBottom: "12px",
+            }}
+          >
+            {error ? `检测失败：${error}` : notice}
           </div>
         )}
 
@@ -90,6 +141,13 @@ export default function ProvidersView() {
             platform={platform}
             expanded={expanded === platform.platform_id}
             onToggle={() => toggle(platform.platform_id)}
+            identity={draft[platform.platform_id] ?? ""}
+            savedIdentity={identities[platform.platform_id] ?? ""}
+            saving={savingId === platform.platform_id}
+            onIdentityChange={(value) =>
+              setDraft((current) => ({ ...current, [platform.platform_id]: value }))
+            }
+            onIdentitySave={() => saveIdentity(platform.platform_id)}
           />
         ))}
 
@@ -111,14 +169,25 @@ function PlatformCard({
   platform,
   expanded,
   onToggle,
+  identity,
+  savedIdentity,
+  saving,
+  onIdentityChange,
+  onIdentitySave,
 }: {
   platform: PlatformCandidates;
   expanded: boolean;
   onToggle: () => void;
+  identity?: string;
+  savedIdentity?: string;
+  saving?: boolean;
+  onIdentityChange?: (value: string) => void;
+  onIdentitySave?: () => void;
 }) {
   const best = platform.candidates[0];
   const install = installBadge(best);
   const auth = authBadge(best?.auth_state);
+  const dirty = identity !== undefined && identity !== (savedIdentity ?? "");
 
   return (
     <div
@@ -196,6 +265,61 @@ function PlatformCard({
               {best.detail}
             </div>
           )}
+        </div>
+      )}
+
+      {/* 身份按 IM 平台设置：以后接入别的 IM，各自有自己的身份 */}
+      {platform.kind === "im" && onIdentityChange && (
+        <div
+          style={{
+            marginTop: "10px",
+            paddingTop: "10px",
+            borderTop: "1px solid var(--border)",
+          }}
+        >
+          <label
+            style={{
+              display: "block",
+              fontSize: "11px",
+              color: "var(--text-secondary)",
+              marginBottom: "4px",
+            }}
+          >
+            自身身份 id（你在该平台上的身份，用于跳过自己发的消息）
+          </label>
+          <div style={{ display: "flex", gap: "6px" }}>
+            <input
+              type="text"
+              value={identity ?? ""}
+              onChange={(e) => onIdentityChange(e.target.value)}
+              placeholder="留空 = 不跳过（会回复自己发的消息）"
+              style={{
+                flex: 1,
+                minWidth: 0,
+                padding: "4px 8px",
+                fontSize: "12px",
+                fontFamily: "ui-monospace, Consolas, monospace",
+              }}
+            />
+            <button
+              onClick={onIdentitySave}
+              disabled={!dirty || saving}
+              style={{
+                padding: "4px 12px",
+                fontSize: "12px",
+                backgroundColor: dirty && !saving ? "var(--accent)" : "var(--text-muted)",
+                color: "var(--accent-contrast)",
+                border: "none",
+                borderRadius: "4px",
+                cursor: dirty && !saving ? "pointer" : "not-allowed",
+              }}
+            >
+              {saving ? "保存中…" : "保存"}
+            </button>
+          </div>
+          <div style={{ fontSize: "10px", color: "var(--text-muted)", marginTop: "4px" }}>
+            身份按平台独立存放，换 IM 平台互不影响。可在「回复历史」里核对发送身份后点「采用该身份」。
+          </div>
         </div>
       )}
 

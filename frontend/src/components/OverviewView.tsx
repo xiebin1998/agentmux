@@ -130,14 +130,14 @@ export default function OverviewView() {
               padding: "2px 10px",
               fontSize: "14px",
               lineHeight: 1.2,
-              backgroundColor: "transparent",
-              color: "var(--text-secondary)",
+              backgroundColor: loading ? "var(--bg-active)" : "transparent",
+              color: loading ? "var(--accent)" : "var(--text-secondary)",
               border: "1px solid var(--border)",
               borderRadius: "4px",
               cursor: loading ? "not-allowed" : "pointer",
             }}
           >
-            {loading ? "…" : "⟳"}
+            <span className={loading ? "spin" : undefined}>⟳</span>
           </button>
         </div>
 

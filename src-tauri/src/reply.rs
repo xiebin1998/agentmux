@@ -21,7 +21,9 @@ pub struct ReplySettings {
     pub agent_cwd: String,
     pub timeout_ms: u64,
     pub max_chars: usize,
-    pub self_open_dingtalk_id: Option<String>,
+    /// 自身在该 IM 平台上的身份 id：用于跳过自己发的消息。
+    /// 不叫 dingtalk id —— 以后 IM 不止钉钉。
+    pub self_open_id: Option<String>,
     pub context_enabled: bool,
     pub context_message_limit: usize,
     pub context_max_chars: usize,
@@ -41,7 +43,7 @@ impl Default for ReplySettings {
             agent_cwd: String::new(),
             timeout_ms: 120_000,
             max_chars: 500,
-            self_open_dingtalk_id: None,
+            self_open_id: None,
             context_enabled: true,
             context_message_limit: 50,
             context_max_chars: 8000,

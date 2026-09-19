@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useProviders } from "../providers";
 
 interface EventRow {
   message_id: string;
@@ -28,6 +29,8 @@ export default function ReplyHistory() {
   const [keyword, setKeyword] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const { platforms } = useProviders();
+  const imPlatforms = platforms.filter((p) => p.kind === "im");
 
   const load = useCallback(async () => {
     try {
@@ -49,17 +52,24 @@ export default function ReplyHistory() {
     return () => clearInterval(timer);
   }, [load]);
 
-  /** A5.3.3 / D-50：核对发送身份后一键回填到设置。 */
+  /** 核对发送身份后一键回填（身份按 IM 平台存放）。 */
   const adoptIdentity = async (openDingTalkId: string) => {
     if (!openDingTalkId) return;
-    if (!confirm(`把 ${openDingTalkId} 设为「自身身份」？此后将跳过该身份发送的消息。`)) return;
+    const platformId = imPlatforms[0]?.platform_id;
+    if (!platformId) {
+      setNotice("没有可用的 IM 平台，无法回填身份");
+      return;
+    }
+    if (
+      !confirm(
+        `把 ${openDingTalkId} 设为「${imPlatforms[0].display}」上的自身身份？此后将跳过该身份发送的消息。`,
+      )
+    ) {
+      return;
+    }
     try {
-      const config = await invoke<Record<string, unknown>>("get_config");
-      await invoke("set_config", {
-        config: { ...config, self_open_dingtalk_id: openDingTalkId },
-      });
-      await invoke("apply_settings");
-      setNotice("已回填自身身份并在运行期生效");
+      await invoke("set_im_identity", { platformId, identity: openDingTalkId });
+      setNotice("已回填自身身份（下次启动该项目监听时生效）");
     } catch (e) {
       setNotice("回填失败：" + String(e));
     }

@@ -593,7 +593,7 @@ impl Shared {
             return;
         }
 
-        if let Some(self_id) = reply.self_open_dingtalk_id.as_ref() {
+        if let Some(self_id) = reply.self_open_id.as_ref() {
             if !self_id.is_empty() && *self_id == event.sender_open_dingtalk_id {
                 self.push_log("跳过自己发送的消息").await;
                 self.finish_reply(&event, "skipped", None).await;
@@ -1110,7 +1110,7 @@ process.stdin.on("end", function () { process.exit(0); });
         let mine = storage
             .lock()
             .await
-            .list_conversations(Some("test-project"))
+            .list_conversations(Some("test-project"), false)
             .unwrap();
         assert_eq!(mine.len(), 1, "本项目应只看到 cid-1 这一个会话，实际 {:?}", mine);
         assert_eq!(mine[0].conversation_id, "cid-1");
@@ -1123,7 +1123,7 @@ process.stdin.on("end", function () { process.exit(0); });
         let others = storage
             .lock()
             .await
-            .list_conversations(Some("other-project"))
+            .list_conversations(Some("other-project"), false)
             .unwrap();
         assert!(others.is_empty(), "别的项目不应看到这个会话，实际 {:?}", others);
 
@@ -1274,7 +1274,7 @@ process.stdout.write("收到 " + process.cwd());
         let mine = storage
             .lock()
             .await
-            .list_conversations(Some("proj-A"))
+            .list_conversations(Some("proj-A"), false)
             .unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].replied, 1, "应统计到 1 条已回复");

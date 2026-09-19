@@ -160,15 +160,31 @@ pub async fn list_events(
         .map_err(|e| e.to_string())
 }
 
-/// 会话汇总；传 project_id 时只列该项目的会话（左侧树的「项目下挂会话」）。
+/// 会话汇总。
+/// - 传 project_id：只列该项目的会话（左树「项目下挂会话」）
+/// - unassigned = true：只列**没有项目归属**的历史会话（升级前的数据）
 #[tauri::command]
 pub async fn list_conversations(
     state: State<'_, AppState>,
     project_id: Option<String>,
+    unassigned: Option<bool>,
 ) -> Result<Vec<ConversationSummary>, String> {
     let storage = state.storage.lock().await;
     storage
-        .list_conversations(project_id.as_deref())
+        .list_conversations(project_id.as_deref(), unassigned.unwrap_or(false))
+        .map_err(|e| e.to_string())
+}
+
+/// 把没有归属的历史会话归入某个项目，让它出现在该项目的树里。
+#[tauri::command]
+pub async fn assign_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    project_id: String,
+) -> Result<usize, String> {
+    let storage = state.storage.lock().await;
+    storage
+        .assign_conversation(&conversation_id, &project_id)
         .map_err(|e| e.to_string())
 }
 
@@ -228,9 +244,10 @@ pub struct RuntimeSettings {
     pub context_message_limit: usize,
     pub context_max_chars: usize,
     pub auto_compress: bool,
+    pub compress_trigger_percent: Option<u8>,
     pub compress_trigger_turns: Option<usize>,
     pub compress_trigger_chars: Option<usize>,
-    pub self_open_dingtalk_id: Option<String>,
+    pub self_open_id: Option<String>,
     pub im_cli_path: Option<String>,
 }
 
@@ -238,6 +255,7 @@ fn to_runtime(
     project_id: String,
     settings: crate::reply::ReplySettings,
     im_cli: Option<String>,
+    percent: Option<u8>,
 ) -> RuntimeSettings {
     RuntimeSettings {
         project_id,
@@ -252,9 +270,10 @@ fn to_runtime(
         context_message_limit: settings.context_message_limit,
         context_max_chars: settings.context_max_chars,
         auto_compress: settings.auto_compress,
+        compress_trigger_percent: percent,
         compress_trigger_turns: settings.compress_trigger_turns,
         compress_trigger_chars: settings.compress_trigger_chars,
-        self_open_dingtalk_id: settings.self_open_dingtalk_id,
+        self_open_id: settings.self_open_id,
         im_cli_path: im_cli,
     }
 }
@@ -266,11 +285,14 @@ pub async fn project_runtime_settings(
 ) -> Result<RuntimeSettings, String> {
     let project = load_project(&project_id)?;
     let settings = effective_settings(&project).await;
+    let percent = crate::config::load_config()
+        .ok()
+        .and_then(|config| config.compress_trigger_percent);
     let im_cli = {
         let orchestrator = state.orchestrator.lock().await;
         orchestrator.dws_path().await
     };
-    Ok(to_runtime(project_id, settings, im_cli))
+    Ok(to_runtime(project_id, settings, im_cli, percent))
 }
 
 #[tauri::command]
