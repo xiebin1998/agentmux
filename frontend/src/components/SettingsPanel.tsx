@@ -1,6 +1,12 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+interface Project {
+  id: string;
+  name: string;
+  work_dir: string;
+}
+
 interface AppConfig {
   theme: "dark" | "light" | "system";
   im_platform: string;
@@ -21,7 +27,9 @@ interface AppConfig {
   compress_trigger_chars: number | null;
 }
 
+/** 某个项目**实际生效**的运行期设置（由后端按项目解析后返回）。 */
 interface RuntimeSettings {
+  project_id: string;
   reply_enabled: boolean;
   agent_platform: string;
   agent_cli_path: string | null;
@@ -46,10 +54,9 @@ interface DataPaths {
 }
 
 interface SettingsPanelProps {
+  project: Project | null;
   onClose: () => void;
 }
-
-const TIMEOUT_PRESETS = [60_000, 120_000, 300_000];
 
 const label: CSSProperties = {
   display: "block",
@@ -79,7 +86,7 @@ const section: CSSProperties = {
   marginBottom: "14px",
 };
 
-export default function SettingsPanel({ onClose }: SettingsPanelProps) {
+export default function SettingsPanel({ project, onClose }: SettingsPanelProps) {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [runtime, setRuntime] = useState<RuntimeSettings | null>(null);
   const [paths, setPaths] = useState<DataPaths | null>(null);
@@ -91,14 +98,21 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   const load = async () => {
     try {
-      const [nextConfig, nextRuntime, nextPaths] = await Promise.all([
+      const [nextConfig, nextPaths] = await Promise.all([
         invoke<AppConfig>("get_config"),
-        invoke<RuntimeSettings>("runtime_settings"),
         invoke<DataPaths>("data_paths"),
       ]);
       setConfig(nextConfig);
-      setRuntime(nextRuntime);
       setPaths(nextPaths);
+      if (project) {
+        setRuntime(
+          await invoke<RuntimeSettings>("project_runtime_settings", {
+            projectId: project.id,
+          }),
+        );
+      } else {
+        setRuntime(null);
+      }
     } catch (e) {
       setStatus("读取设置失败：" + String(e));
     }
@@ -106,7 +120,8 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   useEffect(() => {
     load();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.id]);
 
   const patch = (changes: Partial<AppConfig>) => {
     setConfig((current) => (current ? { ...current, ...changes } : current));
@@ -118,9 +133,8 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     setStatus(null);
     try {
       await invoke("set_config", { config });
-      const next = await invoke<RuntimeSettings>("apply_settings");
-      setRuntime(next);
-      setStatus("已保存并即时生效（回复开关与预算无需重启监听）");
+      await load();
+      setStatus("已保存。Agent 启动参数、压缩策略、身份改动需重启对应项目的监听才生效。");
     } catch (e) {
       setStatus("保存失败：" + String(e));
     } finally {
@@ -135,6 +149,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     try {
       const report = await invoke<Record<string, unknown>>("import_legacy", {
         path: legacyPath,
+        projectId: project?.id ?? null,
       });
       setImportReport(JSON.stringify(report, null, 2));
     } catch (e) {
@@ -151,130 +166,81 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
       </Shell>
     );
   }
+
   return (
     <Shell onClose={onClose}>
-      <div style={section}>
-        <div style={sectionTitle}>回复（A5.1.1）</div>
-        <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", marginBottom: "10px" }}>
-          <input
-            type="checkbox"
-            checked={config.reply_enabled}
-            onChange={(e) => patch({ reply_enabled: e.target.checked })}
-            style={{ accentColor: "var(--accent)" }}
+      {project ? (
+        <div style={section}>
+          <div style={sectionTitle}>当前项目生效值（{project.name}）</div>
+          <Row k="回复引擎" v={runtime?.reply_enabled ? "已启用" : "未启用（只记录）"} tone={runtime?.reply_enabled ? "ok" : "muted"} />
+          <Row
+            k="驱动 Agent 的工作目录"
+            v={runtime?.agent_cwd ?? project.work_dir}
+            tone="plain"
           />
-          启用自动回复（关闭时只记录，不发送任何消息）
-        </label>
-        <div style={{ display: "flex", gap: "12px" }}>
-          <div style={{ flex: 1 }}>
-            <label style={label}>生成超时（A9.1.3）</label>
-            <select
-              value={config.reply_timeout_ms}
-              onChange={(e) => patch({ reply_timeout_ms: Number(e.target.value) })}
-              style={input}
-            >
-              {TIMEOUT_PRESETS.map((preset) => (
-                <option key={preset} value={preset}>
-                  {preset / 1000}s
-                </option>
-              ))}
-            </select>
+          <Row
+            k="实际使用的 Agent CLI"
+            v={runtime?.agent_cli_path ?? "未解析到（无法生成回复）"}
+            tone={runtime?.agent_cli_path ? "plain" : "bad"}
+          />
+          <Row k="Agent 平台" v={runtime?.agent_platform ?? "—"} />
+          <Row k="生成超时" v={`${(runtime?.timeout_ms ?? 0) / 1000}s`} />
+          <Row k="回复字数上限" v={`${runtime?.max_chars ?? 0} 字符`} />
+          <Row
+            k="群上下文"
+            v={
+              runtime?.context_enabled
+                ? `已启用（${runtime.context_message_limit} 条 / ${runtime.context_max_chars} 字符）`
+                : "已禁用"
+            }
+          />
+          <Row k="实际使用的 IM CLI" v={runtime?.im_cli_path ?? "未解析到"} />
+          <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "8px" }}>
+            上面是**运行期真实生效值**。回复开关/超时/字数/上下文在「编辑项目」里改；
+            **改完需重启该项目的监听才生效**。
           </div>
-          <div style={{ flex: 1 }}>
-            <label style={label}>回复字数上限（A9.1.4）</label>
-            <input
-              type="number"
-              min={1}
-              value={config.reply_max_chars}
-              onChange={(e) => patch({ reply_max_chars: Number(e.target.value) })}
-              style={input}
-            />
+        </div>
+      ) : (
+        <div style={section}>
+          <div style={sectionTitle}>项目相关设置</div>
+          <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+            回复开关、工作目录、超时、字数上限、上下文预算、CLI 选择都是**按项目**配置的。
+            请在左侧选中一个项目，或点项目上的「编辑」进行修改。
           </div>
+        </div>
+      )}
+
+      <div style={section}>
+        <div style={sectionTitle}>身份（全局）</div>
+        <label style={label}>自身 openDingTalkId（用于跳过自己发的消息）</label>
+        <input
+          type="text"
+          value={config.self_open_dingtalk_id ?? ""}
+          onChange={(e) => patch({ self_open_dingtalk_id: e.target.value || null })}
+          placeholder="留空则不跳过；可在「回复历史」里核对后一键采用"
+          style={input}
+        />
+      </div>
+
+      <div style={section}>
+        <div style={sectionTitle}>Agent 启动参数（全局，A2.2.4）</div>
+        <input
+          type="text"
+          value={(config.agent_args ?? []).join(" ")}
+          onChange={(e) => {
+            const parts = e.target.value.split(/[\s,]+/).filter(Boolean);
+            patch({ agent_args: parts.length > 0 ? parts : null });
+          }}
+          placeholder="留空 = 该平台的只读默认参数"
+          style={input}
+        />
+        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
+          v1 只允许只读工具白名单（D-20）。会话参数由系统追加在末尾，不要在这里填写。
         </div>
       </div>
 
       <div style={section}>
-        <div style={sectionTitle}>身份与工作目录</div>
-        <div style={{ marginBottom: "10px" }}>
-          <label style={label}>自身 openDingTalkId（A9.1.1，用于跳过自己发的消息）</label>
-          <input
-            type="text"
-            value={config.self_open_dingtalk_id ?? ""}
-            onChange={(e) => patch({ self_open_dingtalk_id: e.target.value || null })}
-            placeholder="留空则不跳过；可从事件流的「发送人身份」里核对后回填"
-            style={input}
-          />
-        </div>
-        <div>
-          <label style={label}>Agent 工作目录（A9.1.2，Agent 可见范围）</label>
-          <input
-            type="text"
-            value={config.agent_cwd ?? ""}
-            onChange={(e) => patch({ agent_cwd: e.target.value || null })}
-            placeholder="留空 = 程序配置目录下的专用子目录"
-            style={input}
-          />
-        </div>
-        <div style={{ marginTop: "10px" }}>
-          <label style={label}>Agent 启动参数（A2.2.4，空格或逗号分隔）</label>
-          <input
-            type="text"
-            value={(config.agent_args ?? []).join(" ")}
-            onChange={(e) => {
-              const parts = e.target.value.split(/[\s,]+/).filter(Boolean);
-              patch({ agent_args: parts.length > 0 ? parts : null });
-            }}
-            placeholder="留空 = 该平台的只读默认参数"
-            style={input}
-          />
-          <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
-            v1 只允许只读工具白名单（D-20）。会话参数由系统追加在末尾，不要在
-            这里填写。改参数不影响既有会话记录。
-          </div>
-        </div>
-      </div>
-
-      <div style={section}>
-        <div style={sectionTitle}>群上下文（A9.1.5）</div>
-        <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", marginBottom: "10px" }}>
-          <input
-            type="checkbox"
-            checked={config.context_enabled}
-            onChange={(e) => patch({ context_enabled: e.target.checked })}
-            style={{ accentColor: "var(--accent)" }}
-          />
-          注入最近消息作为上下文
-        </label>
-        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginBottom: "10px" }}>
-          关闭后回答可能缺少上下文（D-75 尚未实测长期影响）
-        </div>
-        <div style={{ display: "flex", gap: "12px" }}>
-          <div style={{ flex: 1 }}>
-            <label style={label}>消息条数</label>
-            <input
-              type="number"
-              min={1}
-              value={config.context_message_limit}
-              onChange={(e) => patch({ context_message_limit: Number(e.target.value) })}
-              disabled={!config.context_enabled}
-              style={input}
-            />
-          </div>
-          <div style={{ flex: 1 }}>
-            <label style={label}>字符预算</label>
-            <input
-              type="number"
-              min={1}
-              value={config.context_max_chars}
-              onChange={(e) => patch({ context_max_chars: Number(e.target.value) })}
-              disabled={!config.context_enabled}
-              style={input}
-            />
-          </div>
-        </div>
-      </div>
-
-      <div style={section}>
-        <div style={sectionTitle}>自动压缩（A7.1.1 / A7.1.2）</div>
+        <div style={sectionTitle}>自动压缩（全局，A7.1.1 / A7.1.2）</div>
         <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", marginBottom: "10px" }}>
           <input
             type="checkbox"
@@ -285,8 +251,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           启用自动压缩（默认关闭）
         </label>
         <div style={{ color: "var(--text-muted)", fontSize: "11px", marginBottom: "10px" }}>
-          触发阈值（D-59）尚无实测依据，建议先在真实会话上记录长度与回答质量的关系再定值；
-          留空表示该维度不触发自动压缩，不会拍脑袋默认。
+          触发阈值（D-59）尚无实测依据，留空表示该维度不触发自动压缩，不会拍脑袋默认。
         </div>
         <div style={{ display: "flex", gap: "12px" }}>
           <div style={{ flex: 1 }}>
@@ -316,49 +281,6 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
             />
           </div>
         </div>
-        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "8px" }}>
-          连续压缩失败 3 次会自动暂停自动压缩（避免反复失败拖慢回复）。
-        </div>
-      </div>
-
-      <div style={section}>
-        <div style={sectionTitle}>设置生效状态（A9.1.6 / D-76）</div>
-        <Row
-          k="回复引擎"
-          v={runtime?.reply_enabled ? "已启用" : "未启用（只记录）"}
-          tone={runtime?.reply_enabled ? "ok" : "muted"}
-        />
-        <Row
-          k="实际使用的 Agent CLI"
-          v={runtime?.agent_cli_path ?? "未解析到（无法生成回复）"}
-          tone={runtime?.agent_cli_path ? "plain" : "bad"}
-        />
-        <Row k="Agent 平台" v={runtime?.agent_platform ?? "—"} />
-        <Row
-          k="实际启动参数"
-          v={
-            runtime?.agent_args && runtime.agent_args.length > 0
-              ? runtime.agent_args.join(" ")
-              : "（平台只读默认值）"
-          }
-        />
-        <Row k="实际工作目录" v={runtime?.agent_cwd ?? "—"} />
-        <Row
-          k="自动压缩"
-          v={
-            runtime?.auto_compress
-              ? runtime.compress_trigger_turns || runtime.compress_trigger_chars
-                ? "已启用（阈值已配置）"
-                : "已启用但未配阈值，不会自动触发"
-              : "未启用"
-          }
-          tone={runtime?.auto_compress ? "plain" : "muted"}
-        />
-        <Row k="实际使用的 IM CLI" v={runtime?.im_cli_path ?? "未解析到"} />
-        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "8px" }}>
-          上面这组是**运行期真实生效值**，不是 settings.json 的回显。回复开关、超时、字数、上下文预算保存后即时生效；
-          Agent / IM CLI 路径变更后需重新启动对应监听。
-        </div>
       </div>
 
       <div style={section}>
@@ -368,7 +290,10 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         <Row k="归档目录" v={paths?.archive_dir ?? "—"} />
 
         <div style={{ marginTop: "12px" }}>
-          <label style={label}>导入旧版数据（指向旧工程的数据目录）</label>
+          <label style={label}>
+            导入旧版数据（指向旧工程的 data 目录）
+            {project ? `，导入到项目「${project.name}」` : "，需先选中项目才能归类"}
+          </label>
           <input
             type="text"
             value={legacyPath}
@@ -381,16 +306,17 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           </div>
           <button
             onClick={handleImport}
-            disabled={importing || !legacyPath.trim()}
+            disabled={importing || !legacyPath.trim() || !project}
             style={{
               marginTop: "8px",
               padding: "6px 14px",
               fontSize: "12px",
-              backgroundColor: importing ? "var(--text-muted)" : "var(--accent)",
+              backgroundColor:
+                importing || !project ? "var(--text-muted)" : "var(--accent)",
               color: "var(--accent-contrast)",
               border: "none",
               borderRadius: "4px",
-              cursor: importing ? "not-allowed" : "pointer",
+              cursor: importing || !project ? "not-allowed" : "pointer",
             }}
           >
             {importing ? "导入中…" : "开始导入"}
@@ -450,7 +376,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
             fontSize: "13px",
           }}
         >
-          {saving ? "保存中…" : "保存并即时生效"}
+          {saving ? "保存中…" : "保存全局设置"}
         </button>
       </div>
     </Shell>
@@ -469,7 +395,7 @@ function Row({ k, v, tone = "plain" }: { k: string; v: string; tone?: "plain" | 
 
   return (
     <div style={{ display: "flex", gap: "12px", fontSize: "12px", marginBottom: "6px" }}>
-      <span style={{ color: "var(--text-secondary)", flex: "0 0 130px" }}>{k}</span>
+      <span style={{ color: "var(--text-secondary)", flex: "0 0 150px" }}>{k}</span>
       <span
         style={{
           color,
@@ -501,7 +427,7 @@ function Shell({ children, onClose }: { children: ReactNode; onClose: () => void
           backgroundColor: "var(--bg-elevated)",
           border: "1px solid var(--border)",
           borderRadius: "8px",
-          width: "620px",
+          width: "640px",
           maxHeight: "88vh",
           overflow: "auto",
           boxShadow: "var(--shadow)",

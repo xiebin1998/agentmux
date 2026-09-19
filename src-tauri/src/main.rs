@@ -37,6 +37,7 @@ fn main() {
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .setup(|app| {
             println!("AgentMux starting...");
@@ -68,9 +69,8 @@ fn main() {
             commands::list_conversations,
             commands::reset_conversation,
             commands::conversation_session,
-            // 运行期设置
-            commands::runtime_settings,
-            commands::apply_settings,
+            // 运行期设置（按项目）
+            commands::project_runtime_settings,
             // 压缩
             commands::get_summary,
             commands::compress_now,

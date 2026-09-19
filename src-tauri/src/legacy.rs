@@ -71,7 +71,7 @@ fn record_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn line_to_event(line: &str) -> Option<ChatEvent> {
+fn line_to_event(line: &str, project_id: &str) -> Option<ChatEvent> {
     let raw: serde_json::Value = serde_json::from_str(line).ok()?;
     if !raw.is_object() {
         return None;
@@ -93,6 +93,7 @@ fn line_to_event(line: &str) -> Option<ChatEvent> {
         .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
 
     Some(ChatEvent {
+        project_id: project_id.to_string(),
         malformed: message_id.is_empty() || conversation_id.is_empty(),
         message_id,
         conversation_id,
@@ -106,7 +107,7 @@ fn line_to_event(line: &str) -> Option<ChatEvent> {
     })
 }
 
-fn import_events(storage: &Storage, root: &Path, report: &mut ImportReport) {
+fn import_events(storage: &Storage, root: &Path, project_id: &str, report: &mut ImportReport) {
     for file in record_files(root) {
         let Ok(content) = std::fs::read_to_string(&file) else {
             report
@@ -120,7 +121,7 @@ fn import_events(storage: &Storage, root: &Path, report: &mut ImportReport) {
             if line.is_empty() {
                 continue;
             }
-            match line_to_event(line) {
+            match line_to_event(line, project_id) {
                 Some(event) => match storage.save_event(&event) {
                     Ok(true) => report.events_imported += 1,
                     Ok(false) => report.events_duplicated += 1,
@@ -171,7 +172,7 @@ fn import_replies(storage: &Storage, root: &Path, report: &mut ImportReport) {
     }
 }
 
-fn import_sessions(storage: &Storage, root: &Path, report: &mut ImportReport) {
+fn import_sessions(storage: &Storage, root: &Path, project_id: &str, report: &mut ImportReport) {
     let path = root.join("sessions.json");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return;
@@ -193,6 +194,7 @@ fn import_sessions(storage: &Storage, root: &Path, report: &mut ImportReport) {
     for (conversation_id, value) in map {
         match serde_json::from_value::<LegacySession>(value.clone()) {
             Ok(session) => match storage.save_session(
+                project_id,
                 conversation_id,
                 &session.session_id,
                 &session.cwd,
@@ -208,22 +210,25 @@ fn import_sessions(storage: &Storage, root: &Path, report: &mut ImportReport) {
 }
 
 /// 从旧版数据目录导入。path 指向旧工程的 `data` 目录。
+/// 传 project_id 时，导入的事件与会话都归到该项目（左树才能按项目分类）。
 #[tauri::command]
 pub async fn import_legacy(
     state: tauri::State<'_, crate::AppState>,
     path: String,
+    project_id: Option<String>,
 ) -> Result<ImportReport, String> {
     let root = PathBuf::from(path.trim());
     if !root.is_dir() {
         return Err(format!("目录不存在: {}", root.to_string_lossy()));
     }
 
+    let project_id = project_id.unwrap_or_default();
     let storage = state.storage.lock().await;
     let mut report = ImportReport::default();
 
-    import_events(&storage, &root, &mut report);
+    import_events(&storage, &root, &project_id, &mut report);
     import_replies(&storage, &root, &mut report);
-    import_sessions(&storage, &root, &mut report);
+    import_sessions(&storage, &root, &project_id, &mut report);
 
     Ok(report)
 }
@@ -258,9 +263,10 @@ mod tests {
     #[test]
     fn legacy_record_line_maps_into_an_event() {
         let line = r#"{"received_at":"2026-09-18T07:48:21.253Z","type":"user_im_message_receive_at","message_id":"m1","conversation_id":"c1","sender":"甲","sender_open_dingtalk_id":"open1","content":"@我 你好","create_time":"2026-09-18 15:48:20"}"#;
-        let event = line_to_event(line).expect("应能解析");
+        let event = line_to_event(line, "proj-1").expect("应能解析");
         assert_eq!(event.message_id, "m1");
         assert_eq!(event.listen_kind, "at-me");
+        assert_eq!(event.project_id, "proj-1", "导入的事件应归到目标项目");
         assert!(!event.malformed);
         assert_eq!(event.raw, line);
     }
@@ -268,7 +274,7 @@ mod tests {
     #[test]
     fn line_without_ids_is_flagged_malformed_not_dropped() {
         let line = r#"{"received_at":"2026-09-18T07:48:21.253Z","type":"x","content":"无 id"}"#;
-        let event = line_to_event(line).expect("畸形事件也应保留");
+        let event = line_to_event(line, "proj-1").expect("畸形事件也应保留");
         assert!(event.malformed);
     }
 
@@ -286,9 +292,9 @@ mod tests {
         let storage = Storage::new(dir.clone()).expect("临时库应能创建");
 
         let mut first = ImportReport::default();
-        import_events(&storage, legacy, &mut first);
+        import_events(&storage, legacy, "proj-1", &mut first);
         import_replies(&storage, legacy, &mut first);
-        import_sessions(&storage, legacy, &mut first);
+        import_sessions(&storage, legacy, "proj-1", &mut first);
 
         assert!(first.events_imported > 0, "应导入事件，实际 {:?}", first);
         assert_eq!(first.bad_lines, 0, "不应有坏行，实际 {:?}", first);
@@ -301,7 +307,7 @@ mod tests {
 
         // 再导一次：事件应全部判重，不重复入库。
         let mut second = ImportReport::default();
-        import_events(&storage, legacy, &mut second);
+        import_events(&storage, legacy, "proj-1", &mut second);
         assert_eq!(second.events_imported, 0, "二次导入不应新增事件");
         assert!(second.events_duplicated > 0, "二次导入应识别为重复");
 

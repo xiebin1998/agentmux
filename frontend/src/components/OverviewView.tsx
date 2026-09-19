@@ -38,14 +38,8 @@ interface PlatformCandidates {
   platform_id: string;
   display: string;
   kind: "im" | "agent";
+  command: string;
   candidates: CliCandidate[];
-}
-
-interface RuntimeSettings {
-  reply_enabled: boolean;
-  agent_platform: string;
-  agent_cli_path: string | null;
-  im_cli_path: string | null;
 }
 
 interface EventRow {
@@ -100,7 +94,6 @@ export default function OverviewView() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [listeners, setListeners] = useState<ListenerStatus[]>([]);
   const [platforms, setPlatforms] = useState<PlatformCandidates[]>([]);
-  const [runtime, setRuntime] = useState<RuntimeSettings | null>(null);
   const [anomalies, setAnomalies] = useState<EventRow[]>([]);
   const [rechecking, setRechecking] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -108,16 +101,14 @@ export default function OverviewView() {
   /** 便宜的运行时信息，可以轮询。 */
   const loadRuntime = useCallback(async () => {
     try {
-      const [nextStats, nextListeners, nextRuntime, malformed, failed] = await Promise.all([
+      const [nextStats, nextListeners, malformed, failed] = await Promise.all([
         invoke<Stats>("get_stats"),
         invoke<ListenerStatus[]>("listener_status"),
-        invoke<RuntimeSettings>("runtime_settings"),
         invoke<EventRow[]>("list_events", { limit: ANOMALY_LIMIT, malformedOnly: true }),
         invoke<EventRow[]>("list_events", { limit: ANOMALY_LIMIT, failedOnly: true }),
       ]);
       setStats(nextStats);
       setListeners(nextListeners);
-      setRuntime(nextRuntime);
       // A1.1.4：异常保留上限 200 条，与归档同源。
       setAnomalies([...malformed, ...failed].slice(0, ANOMALY_LIMIT));
     } catch (e) {
@@ -127,17 +118,12 @@ export default function OverviewView() {
 
   /**
    * 提供方检测会真的 spawn CLI 进程，**不能轮询**：
-   * D-06 要求「检测为显式动作、结果不缓存」，而且每次 spawn 在 Windows 上
-   * 都可能有控制台窗口开销。只在进入页面与点「一键重新检测」时跑。
+   * D-06 要求「检测为显式动作、结果不缓存」。只在进入页面与点「一键重新检测」时跑。
    */
   const loadProviders = useCallback(async () => {
     try {
-      const [list, settings] = await Promise.all([
-        invoke<PlatformCandidates[]>("list_cli_platforms"),
-        invoke<RuntimeSettings>("runtime_settings"),
-      ]);
+      const list = await invoke<PlatformCandidates[]>("list_cli_platforms");
       setPlatforms(list);
-      setRuntime(settings);
     } catch (e) {
       console.error("Failed to detect providers:", e);
     }
@@ -177,7 +163,10 @@ export default function OverviewView() {
   };
 
   const imPlatform = platforms.find((p) => p.kind === "im");
-  const agentPlatform = platforms.find((p) => p.platform_id === runtime?.agent_platform);
+  const agentPlatforms = platforms.filter((p) => p.kind === "agent");
+  const usableAgentCount = agentPlatforms.filter(
+    (p) => p.candidates[0] && p.candidates[0].path !== "",
+  ).length;
 
   return (
     <div style={{ flex: 1, overflow: "auto", padding: "16px" }}>
@@ -187,33 +176,28 @@ export default function OverviewView() {
           <Item
             label="IM 提供方"
             value={
-              imPlatform
-                ? `${imPlatform.display} · ${imPlatform.candidates.length} 个候选${
-                    imPlatform.candidates[0]?.auth_state === "logged_in"
+              imPlatform?.candidates[0]?.path
+                ? `${imPlatform.command} · ${imPlatform.candidates[0].version ?? "版本未知"}${
+                    imPlatform.candidates[0].auth_state === "logged_in"
                       ? " · 已登录"
-                      : imPlatform.candidates[0]?.auth_state === "not_logged_in"
+                      : imPlatform.candidates[0].auth_state === "not_logged_in"
                         ? " · 未登录"
                         : ""
                   }`
                 : "未检测到"
             }
-            ok={Boolean(imPlatform?.candidates.length)}
+            ok={Boolean(imPlatform?.candidates[0]?.path)}
           />
           <Item
             label="Agent 提供方"
             value={
-              runtime?.agent_cli_path
-                ? `${runtime.agent_platform} · ${agentPlatform?.candidates.length ?? 0} 个候选`
-                : "未解析到可用 CLI"
+              usableAgentCount > 0
+                ? `${usableAgentCount} / ${agentPlatforms.length} 个平台可用`
+                : "未检测到可用 CLI"
             }
-            ok={Boolean(runtime?.agent_cli_path)}
+            ok={usableAgentCount > 0}
           />
-          <Item
-            label="自动回复"
-            value={runtime?.reply_enabled ? "已启用" : "未启用（只记录）"}
-            ok={Boolean(runtime?.reply_enabled)}
-            neutral={!runtime?.reply_enabled}
-          />
+          <Item label="自动回复" value="按项目配置（见左侧项目）" neutral />
         </div>
       </div>
 

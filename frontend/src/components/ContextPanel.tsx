@@ -100,8 +100,10 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
   const [agentSession, setAgentSession] = useState<AgentSessionInfo | null>(null);
 
   useEffect(() => {
+    if (!project) return;
     let cancelled = false;
     invoke<AgentSessionInfo | null>("conversation_session", {
+      projectId: project.id,
       conversationId: session.conversation_id,
     })
       .then((result) => {
@@ -111,7 +113,7 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
     return () => {
       cancelled = true;
     };
-  }, [session.conversation_id, sessionNotice]);
+  }, [project, session.conversation_id, sessionNotice]);
 
   useEffect(() => {
     let cancelled = false;
@@ -300,7 +302,10 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
           </div>
         </div>
       </div>
-      <CompressionSection conversationId={session.conversation_id} />
+      <CompressionSection
+        projectId={project.id}
+        conversationId={session.conversation_id}
+      />
 
       <div style={{ padding: "16px", borderTop: "1px solid var(--border)" }}>
         <div style={sectionTitle}>会话</div>
@@ -358,6 +363,7 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
             }
             try {
               await invoke("reset_conversation", {
+                projectId: project.id,
                 conversationId: session.conversation_id,
               });
               setSessionNotice("已作废，下一条消息将重建会话");

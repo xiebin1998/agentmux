@@ -1,5 +1,6 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import PlatformCliPicker, { type CliSelection } from "./PlatformCliPicker";
 
 interface Project {
@@ -193,15 +194,47 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
 
           <div style={{ marginBottom: "16px" }}>
             <label style={fieldLabel}>工作目录 *</label>
-            <input
-              type="text"
-              value={workDir}
-              onChange={(e) => setWorkDir(e.target.value)}
-              placeholder="例如：D:\work\my-project"
-              style={textInput}
-            />
+            <div style={{ display: "flex", gap: "8px" }}>
+              <input
+                type="text"
+                value={workDir}
+                onChange={(e) => setWorkDir(e.target.value)}
+                placeholder="例如：D:\work\my-project"
+                style={textInput}
+              />
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const picked = await open({
+                      directory: true,
+                      multiple: false,
+                      defaultPath: workDir || undefined,
+                      title: "选择 Agent 的工作目录",
+                    });
+                    if (typeof picked === "string" && picked) {
+                      setWorkDir(picked);
+                    }
+                  } catch (e) {
+                    alert("打开目录选择器失败：" + String(e));
+                  }
+                }}
+                style={{
+                  padding: "8px 14px",
+                  whiteSpace: "nowrap",
+                  backgroundColor: "transparent",
+                  color: "var(--text-secondary)",
+                  border: "1px solid var(--border)",
+                  borderRadius: "4px",
+                  cursor: "pointer",
+                  fontSize: "13px",
+                }}
+              >
+                选择…
+              </button>
+            </div>
             <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
-              Agent 可以访问的目录范围
+              Agent 只在这个目录内读写；驱动 Agent CLI 时就以它为工作目录
             </div>
           </div>
 

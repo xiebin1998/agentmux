@@ -19,11 +19,6 @@ interface PlatformCandidates {
   candidates: CliCandidate[];
 }
 
-interface RuntimeSettings {
-  agent_platform: string;
-  im_cli_path: string | null;
-}
-
 /** A2.1.3：未安装与未登录必须一眼可辨，不能合并成一个状态。 */
 function installBadge(candidate: CliCandidate | undefined) {
   if (!candidate) return { label: "未检测到", color: "var(--danger)" };
@@ -51,7 +46,6 @@ const sectionTitle: CSSProperties = {
 
 export default function ProvidersView() {
   const [platforms, setPlatforms] = useState<PlatformCandidates[]>([]);
-  const [runtime, setRuntime] = useState<RuntimeSettings | null>(null);
   const [loading, setLoading] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
@@ -61,12 +55,8 @@ export default function ProvidersView() {
     setLoading(true);
     setError(null);
     try {
-      const [list, settings] = await Promise.all([
-        invoke<PlatformCandidates[]>("list_cli_platforms"),
-        invoke<RuntimeSettings>("runtime_settings"),
-      ]);
+      const list = await invoke<PlatformCandidates[]>("list_cli_platforms");
       setPlatforms(list);
-      setRuntime(settings);
       setCheckedAt(new Date().toLocaleString());
     } catch (e) {
       setError(String(e));
@@ -130,7 +120,6 @@ export default function ProvidersView() {
           <PlatformCard
             key={platform.platform_id}
             platform={platform}
-            selected={platform.candidates.some((c) => c.path === runtime?.im_cli_path)}
             expanded={expanded === platform.platform_id}
             onToggle={() =>
               setExpanded(expanded === platform.platform_id ? null : platform.platform_id)
@@ -144,7 +133,6 @@ export default function ProvidersView() {
           <PlatformCard
             key={platform.platform_id}
             platform={platform}
-            selected={platform.platform_id === runtime?.agent_platform}
             expanded={expanded === platform.platform_id}
             onToggle={() =>
               setExpanded(expanded === platform.platform_id ? null : platform.platform_id)
@@ -159,13 +147,11 @@ export default function ProvidersView() {
 
 function PlatformCard({
   platform,
-  selected,
   expanded,
   onToggle,
   onRefresh,
 }: {
   platform: PlatformCandidates;
-  selected: boolean;
   expanded: boolean;
   onToggle: () => void;
   onRefresh: () => void;
@@ -177,7 +163,7 @@ function PlatformCard({
   return (
     <div
       style={{
-        border: `1px solid ${selected ? "var(--accent)" : "var(--border)"}`,
+        border: "1px solid var(--border)",
         borderRadius: "6px",
         padding: "12px",
         marginBottom: "10px",
@@ -200,19 +186,6 @@ function PlatformCard({
         <span style={{ fontSize: "11px", color: install.color }}>{install.label}</span>
         {platform.kind === "im" && (
           <span style={{ fontSize: "11px", color: auth.color }}>{auth.label}</span>
-        )}
-        {selected && (
-          <span
-            style={{
-              fontSize: "11px",
-              padding: "1px 6px",
-              borderRadius: "8px",
-              backgroundColor: "var(--accent)",
-              color: "var(--accent-contrast)",
-            }}
-          >
-            当前选用
-          </span>
         )}
         <div style={{ marginLeft: "auto", display: "flex", gap: "6px" }}>
           <button

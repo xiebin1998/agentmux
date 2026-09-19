@@ -34,6 +34,8 @@ pub enum ListenerState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenerStatus {
     pub id: String,
+    /// 该监听属于哪个项目。
+    pub project_id: String,
     pub kind: ListenKind,
     pub state: ListenerState,
     pub ready: bool,
@@ -47,6 +49,8 @@ pub struct ListenerStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatEvent {
+    /// 归属于哪个项目（哪个项目的监听收到的就归谁）。
+    pub project_id: String,
     pub message_id: String,
     pub conversation_id: String,
     pub sender: String,
@@ -86,10 +90,6 @@ pub struct Orchestrator {
     dws_path: Arc<Mutex<Option<String>>>,
     /// 回复全局串行：一次只处理一条（与旧基准工程一致）。
     reply_lock: Arc<Mutex<()>>,
-    /// 回复配置的实时快照：改设置后可立即生效，不必重启监听。
-    reply: Arc<Mutex<ReplySettings>>,
-    /// 自动压缩连续失败计数；达到阈值后暂停自动压缩（D-63）。
-    compress_failures: Arc<Mutex<u32>>,
 }
 
 impl Orchestrator {
@@ -101,8 +101,6 @@ impl Orchestrator {
             storage,
             dws_path: Arc::new(Mutex::new(None)),
             reply_lock: Arc::new(Mutex::new(())),
-            reply: Arc::new(Mutex::new(crate::config::reply_settings())),
-            compress_failures: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -116,29 +114,16 @@ impl Orchestrator {
     }
 
     /// 压缩某会话的上下文并落盘为最新一版摘要（A7.1.3 / A7.2.1）。
+    /// 压缩要走 Agent，因此需要调用方传入该会话所属项目的回复设置。
     pub async fn compress_conversation(
         &self,
+        settings: ReplySettings,
         conversation_id: &str,
     ) -> anyhow::Result<crate::storage::Summary> {
-        let settings = self.reply.lock().await.clone();
         let summary = compress_with(&self.storage, settings, conversation_id).await?;
         self.push_global_log(&format!("已压缩会话 {} 的上下文", conversation_id))
             .await;
         Ok(summary)
-    }
-
-    /// 从 settings.json 重新装载回复配置；Agent CLI 缺失时走全局自动解析。
-    pub async fn refresh_reply_settings(&self) -> ReplySettings {
-        let mut next = crate::config::reply_settings();
-        if next.enabled && next.agent_cli_path.is_none() {
-            next.agent_cli_path = crate::resolve::resolve_executable(&next.agent_platform).await;
-        }
-        *self.reply.lock().await = next.clone();
-        next
-    }
-
-    pub async fn reply_settings(&self) -> ReplySettings {
-        self.reply.lock().await.clone()
     }
 
     /// 全局自动解析 IM CLI；settings.json 里的显式覆盖优先。结果缓存，直到显式重设。
@@ -165,9 +150,13 @@ impl Orchestrator {
         self.dws_path.lock().await.clone()
     }
 
+    /// 启动一路监听。**监听属于某个项目**：收到的事件归该项目，回复用该项目的设置
+    /// （工作目录、CLI、开关等）。`reply` 由调用方按项目解析后传入。
     pub async fn start_listener(
         &self,
+        project_id: String,
         kind: ListenKind,
+        reply: ReplySettings,
         channel: Option<Channel<ListenerUpdate>>,
     ) -> anyhow::Result<String> {
         let path = self.ensure_dws_path().await?;
@@ -180,6 +169,7 @@ impl Orchestrator {
         let task = ListenerTask {
             status: ListenerStatus {
                 id: id.clone(),
+                project_id: project_id.clone(),
                 kind,
                 state: ListenerState::Starting,
                 ready: false,
@@ -200,11 +190,9 @@ impl Orchestrator {
             listeners.insert(id.clone(), task);
         }
 
-        // 回复配置实时刷新；Agent CLI 缺失时走全局自动解析。
-        self.refresh_reply_settings().await;
-
         let shared = Shared {
             id: id.clone(),
+            project_id,
             kind,
             path,
             listeners: self.listeners.clone(),
@@ -216,9 +204,9 @@ impl Orchestrator {
             pid,
             stop_requested,
             pending: Arc::new(Mutex::new(VecDeque::new())),
-            reply: self.reply.clone(),
+            reply,
             reply_lock: self.reply_lock.clone(),
-            compress_failures: self.compress_failures.clone(),
+            compress_failures: Arc::new(Mutex::new(0)),
             malformed_streak: Arc::new(Mutex::new(0)),
         };
 
@@ -296,6 +284,8 @@ impl Orchestrator {
 #[derive(Clone)]
 struct Shared {
     id: String,
+    /// 该监听所属项目：收到的事件按此归属，回复按此项目的设置执行。
+    project_id: String,
     kind: ListenKind,
     path: String,
     listeners: Arc<Mutex<HashMap<String, ListenerTask>>>,
@@ -307,7 +297,8 @@ struct Shared {
     pid: Arc<Mutex<Option<u32>>>,
     stop_requested: Arc<AtomicBool>,
     pending: Arc<Mutex<VecDeque<String>>>,
-    reply: Arc<Mutex<ReplySettings>>,
+    /// 本项目的回复设置（启动监听时解析一次；改设置需重启该项目监听）。
+    reply: ReplySettings,
     reply_lock: Arc<Mutex<()>>,
     compress_failures: Arc<Mutex<u32>>,
     /// 连续畸形事件计数：仅在连续出现时提示（D-40）。
@@ -524,7 +515,7 @@ impl Shared {
             return;
         }
 
-        let event = match parse_event_line(trimmed, self.kind) {
+        let mut event = match parse_event_line(trimmed, self.kind) {
             Some(event) => event,
             None => {
                 self.push_log(&format!("丢弃非法事件行: {}", truncate(trimmed, 200)))
@@ -532,6 +523,8 @@ impl Shared {
                 return;
             }
         };
+        // 归属到「哪个项目的监听收到的」，左树与统计都按这个分。
+        event.project_id = self.project_id.clone();
 
         let dedupe_key = if event.message_id.is_empty() {
             format!("raw:{}", trimmed)
@@ -583,7 +576,7 @@ impl Shared {
         }
 
         // 先落盘再推流再回复：回复失败不影响事件已经安全落盘。
-        if self.reply.lock().await.enabled {
+        if self.reply.enabled {
             let shared = self.clone();
             let event = event.clone();
             tokio::spawn(async move { shared.process_reply(event).await });
@@ -592,8 +585,8 @@ impl Shared {
 
     /// 回复链路：判定 → 拉上下文 → 生成 → 清洗 → 发送 → 记账。
     async fn process_reply(&self, event: ChatEvent) {
-        // 一次性快照，避免持锁跨越整个生成过程。
-        let reply = self.reply.lock().await.clone();
+        // 本项目的回复设置快照（启动监听时已解析）。
+        let reply = self.reply.clone();
 
         if event.malformed || event.conversation_id.is_empty() {
             self.finish_reply(&event, "skipped", None).await;
@@ -683,10 +676,13 @@ impl Shared {
             }
         };
 
-        // 会话按 conversation_id 建档：首次 --session-id，之后 --resume。
+        // 会话按 (项目, conversation_id) 建档：首次 --session-id，之后 --resume。
         let existing = {
             let storage = self.storage.lock().await;
-            storage.get_session(&event.conversation_id).ok().flatten()
+            storage
+                .get_session(&self.project_id, &event.conversation_id)
+                .ok()
+                .flatten()
         };
         let (session_id, resume) = match existing {
             Some((session_id, _cwd)) => (session_id, true),
@@ -708,7 +704,12 @@ impl Shared {
 
         if !resume {
             let storage = self.storage.lock().await;
-            let _ = storage.save_session(&event.conversation_id, &session_id, &settings.agent_cwd);
+            let _ = storage.save_session(
+                &self.project_id,
+                &event.conversation_id,
+                &session_id,
+                &settings.agent_cwd,
+            );
         }
 
         let text = crate::reply::sanitize_reply(&raw, reply.max_chars);
@@ -961,6 +962,7 @@ fn parse_event_line(line: &str, kind: ListenKind) -> Option<ChatEvent> {
     let conversation_id = get_str("conversation_id");
 
     Some(ChatEvent {
+        project_id: String::new(),
         malformed: message_id.is_empty() || conversation_id.is_empty(),
         message_id,
         conversation_id,
@@ -1043,7 +1045,12 @@ process.stdin.on("end", function () { process.exit(0); });
         std::env::set_current_dir(&stub_dir).unwrap();
 
         let id = orchestrator
-            .start_listener(ListenKind::AtMe, None)
+            .start_listener(
+                "test-project".to_string(),
+                ListenKind::AtMe,
+                ReplySettings::default(),
+                None,
+            )
             .await
             .expect("应能启动监听");
 
@@ -1189,7 +1196,15 @@ process.stdin.on("end", function () { process.exit(0); });
 
         let orchestrator = Orchestrator::new(storage);
         // 不显式设路径：走全局自动解析，顺带验证解析结果真能被 spawn。
-        let id = match orchestrator.start_listener(ListenKind::AtMe, None).await {
+        let id = match orchestrator
+            .start_listener(
+                "test-project".to_string(),
+                ListenKind::AtMe,
+                ReplySettings::default(),
+                None,
+            )
+            .await
+        {
             Ok(id) => id,
             Err(err) => {
                 eprintln!("跳过：{}", err);
@@ -1250,7 +1265,15 @@ process.stdin.on("end", function () { process.exit(0); });
         let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
 
         let orchestrator = Orchestrator::new(storage.clone());
-        let id = match orchestrator.start_listener(ListenKind::AtMe, None).await {
+        let id = match orchestrator
+            .start_listener(
+                "test-project".to_string(),
+                ListenKind::AtMe,
+                ReplySettings::default(),
+                None,
+            )
+            .await
+        {
             Ok(id) => id,
             Err(err) => {
                 eprintln!("跳过：{}", err);
@@ -1313,7 +1336,11 @@ process.stdin.on("end", function () { process.exit(0); });
         let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
 
         let orchestrator = Orchestrator::new(storage.clone());
-        let settings = orchestrator.reply_settings().await;
+        let mut settings = crate::config::reply_settings();
+        if settings.enabled && settings.agent_cli_path.is_none() {
+            settings.agent_cli_path =
+                crate::resolve::resolve_executable(&settings.agent_platform).await;
+        }
         if !settings.enabled {
             eprintln!("跳过：settings.json 里 reply_enabled 不是 true");
             return;
@@ -1326,7 +1353,10 @@ process.stdin.on("end", function () { process.exit(0); });
             settings.timeout_ms,
             settings.max_chars
         );
-        let id = match orchestrator.start_listener(ListenKind::AtMe, None).await {
+        let id = match orchestrator
+            .start_listener("test-project".to_string(), ListenKind::AtMe, settings, None)
+            .await
+        {
             Ok(id) => id,
             Err(err) => {
                 eprintln!("跳过：{}", err);

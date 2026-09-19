@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import ProjectList from "./components/ProjectList";
-import SessionList from "./components/SessionList";
 import MessageView from "./components/MessageView";
 import ContextPanel from "./components/ContextPanel";
 import ProjectDialog from "./components/ProjectDialog";
@@ -46,6 +45,7 @@ type ListenerState = "stopped" | "starting" | "running" | "backing_off" | "aband
 
 interface ListenerStatus {
   id: string;
+  project_id: string;
   kind: ListenKind;
   state: ListenerState;
   ready: boolean;
@@ -70,11 +70,6 @@ type ListenerUpdate =
   | { type: "event"; event: unknown }
   | { type: "log"; listener_id: string; line: string };
 
-const KINDS: { kind: ListenKind; label: string }[] = [
-  { kind: "at-me", label: "@我" },
-  { kind: "all-direct", label: "单聊" },
-];
-
 type View = "overview" | "events" | "replies" | "logs" | "providers";
 
 const VIEWS: { view: View; label: string }[] = [
@@ -85,44 +80,21 @@ const VIEWS: { view: View; label: string }[] = [
   { view: "providers", label: "提供方检测" },
 ];
 
-function stateText(status: ListenerStatus | undefined) {
-  if (!status) return "未启动";
-  if (status.ready) return "监听中";
-  switch (status.state) {
-    case "starting":
-      return "启动中";
-    case "backing_off":
-      return "退避重试中";
-    case "abandoned":
-      return "已放弃";
-    case "stopped":
-      return "已停止";
-    default:
-      return "未启动";
-  }
-}
-
-function stateColor(status: ListenerStatus | undefined) {
-  if (!status) return "var(--text-muted)";
-  if (status.ready) return "var(--success)";
-  if (status.state === "abandoned") return "var(--danger)";
-  if (status.state === "starting" || status.state === "backing_off") return "var(--warn)";
-  return "var(--text-muted)";
-}
-
 function App() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({});
+  const [statusesByProject, setStatusesByProject] = useState<
+    Record<string, Partial<Record<ListenKind, ListenerStatus>>>
+  >({});
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
-  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
   const [showProjectDialog, setShowProjectDialog] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showPlugins, setShowPlugins] = useState(false);
   const [view, setView] = useState<View>("overview");
   const [editingProject, setEditingProject] = useState<Project | null>(null);
-  const [statuses, setStatuses] = useState<Record<string, ListenerStatus>>({});
   const [refreshToken, setRefreshToken] = useState(0);
-  const [busyKind, setBusyKind] = useState<string | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
 
   const loadProjects = useCallback(async () => {
@@ -132,84 +104,114 @@ function App() {
       setSelectedProject((current) =>
         current ? (result.find((p) => p.id === current.id) ?? null) : null,
       );
+      return result;
     } catch (e) {
       console.error("Failed to load projects:", e);
+      return [];
     }
   }, []);
 
-  const loadConversations = useCallback(async () => {
-    try {
-      const result = await invoke<ConversationSummary[]>("list_conversations");
-      setConversations(result);
-    } catch (e) {
-      console.error("Failed to load conversations:", e);
-    }
+  /** 会话按项目分别拉取：左树是「项目 → 会话」两层。 */
+  const loadSessions = useCallback(async (list: Project[]) => {
+    const next: Record<string, Session[]> = {};
+    await Promise.all(
+      list.map(async (project) => {
+        try {
+          const conversations = await invoke<ConversationSummary[]>("list_conversations", {
+            projectId: project.id,
+          });
+          next[project.id] = conversations.map((conversation) => ({
+            id: conversation.conversation_id,
+            project_id: project.id,
+            name: conversation.last_sender
+              ? `${conversation.last_sender}（${conversation.events} 条）`
+              : conversation.conversation_id,
+            conversation_id: conversation.conversation_id,
+            created_at: conversation.last_received_at,
+          }));
+        } catch (e) {
+          console.error("Failed to load conversations for", project.id, e);
+          next[project.id] = [];
+        }
+      }),
+    );
+    setSessionsByProject(next);
   }, []);
 
   const loadStatuses = useCallback(async () => {
     try {
-      const result = await invoke<ListenerStatus[]>("listener_status");
-      const next: Record<string, ListenerStatus> = {};
-      for (const status of result) {
-        next[status.kind] = status;
+      const list = await invoke<ListenerStatus[]>("listener_status");
+      const next: Record<string, Partial<Record<ListenKind, ListenerStatus>>> = {};
+      for (const status of list) {
+        next[status.project_id] = { ...(next[status.project_id] ?? {}), [status.kind]: status };
       }
-      setStatuses(next);
+      setStatusesByProject(next);
     } catch (e) {
       console.error("Failed to load listener status:", e);
     }
   }, []);
 
   useEffect(() => {
-    loadProjects();
-    loadConversations();
+    loadProjects().then((list) => loadSessions(list));
     loadStatuses();
-    const timer = setInterval(() => {
-      loadConversations();
-      loadStatuses();
+    const timer = setInterval(async () => {
+      const list = await loadProjects();
+      await loadSessions(list);
+      await loadStatuses();
     }, 3000);
     return () => clearInterval(timer);
-  }, [loadProjects, loadConversations, loadStatuses]);
+  }, [loadProjects, loadSessions, loadStatuses]);
 
-  const handleStart = async (kind: ListenKind) => {
-    setBusyKind(kind);
+  /** 启动/停止某项目的一路监听。监听属于项目，不是全局开关。 */
+  const handleToggleListener = async (
+    project: Project,
+    kind: ListenKind,
+    active: boolean,
+  ) => {
+    const key = `${project.id}:${kind}`;
+    setBusyKey(key);
     setBanner(null);
     try {
-      const channel = new Channel<ListenerUpdate>();
-      channel.onmessage = (message) => {
-        if (message.type === "status") {
-          setStatuses((prev) => ({ ...prev, [message.status.kind]: message.status }));
-        } else if (message.type === "event") {
-          setRefreshToken((token) => token + 1);
+      if (active) {
+        const current = statusesByProject[project.id]?.[kind];
+        if (current) {
+          await invoke("stop_listener", { id: current.id });
         }
-      };
-      await invoke<string>("start_listener", { kind, channel });
+      } else {
+        const channel = new Channel<ListenerUpdate>();
+        channel.onmessage = (message) => {
+          if (message.type === "status") {
+            setStatusesByProject((prev) => ({
+              ...prev,
+              [message.status.project_id]: {
+                ...(prev[message.status.project_id] ?? {}),
+                [message.status.kind]: message.status,
+              },
+            }));
+          } else if (message.type === "event") {
+            setRefreshToken((token) => token + 1);
+          }
+        };
+        await invoke<string>("start_listener", {
+          projectId: project.id,
+          kind,
+          channel,
+        });
+      }
       await loadStatuses();
     } catch (e) {
       setBanner(String(e));
     } finally {
-      setBusyKind(null);
-    }
-  };
-
-  const handleStop = async (kind: ListenKind) => {
-    const status = statuses[kind];
-    if (!status) return;
-    setBusyKind(kind);
-    try {
-      await invoke("stop_listener", { id: status.id });
-      await loadStatuses();
-    } catch (e) {
-      setBanner(String(e));
-    } finally {
-      setBusyKind(null);
+      setBusyKey(null);
     }
   };
 
   const handleDeleteProject = async (id: string) => {
-    if (!confirm("确定要删除这个项目吗？")) return;
+    if (!confirm("确定要删除这个项目吗？（已落盘的事件与会话记录不会删除）")) return;
     try {
       await invoke("delete_project", { id });
-      await loadProjects();
+      const list = await loadProjects();
+      await loadSessions(list);
       if (selectedProject?.id === id) {
         setSelectedProject(null);
         setSelectedSession(null);
@@ -219,15 +221,10 @@ function App() {
     }
   };
 
-  const sessions: Session[] = conversations.map((conversation) => ({
-    id: conversation.conversation_id,
-    project_id: selectedProject?.id ?? "",
-    name: conversation.last_sender
-      ? `${conversation.last_sender}（${conversation.events} 条）`
-      : conversation.conversation_id,
-    conversation_id: conversation.conversation_id,
-    created_at: conversation.last_received_at,
-  }));
+  const handleSelectSession = (session: Session, project: Project) => {
+    setSelectedProject(project);
+    setSelectedSession(session);
+  };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
@@ -245,47 +242,9 @@ function App() {
         }}
       >
         <h1 style={{ margin: 0, fontSize: "16px", fontWeight: 600 }}>AgentMux</h1>
-
-        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-          {KINDS.map(({ kind, label }) => {
-            const status = statuses[kind];
-            const active = Boolean(status?.ready);
-            const busy = busyKind === kind;
-            return (
-              <div
-                key={kind}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  padding: "3px 8px",
-                  border: "1px solid var(--border)",
-                  borderRadius: "6px",
-                }}
-              >
-                <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>{label}</span>
-                <span style={{ fontSize: "11px", color: stateColor(status) }}>
-                  {stateText(status)}
-                </span>
-                <button
-                  onClick={() => (active ? handleStop(kind) : handleStart(kind))}
-                  disabled={busy}
-                  style={{
-                    padding: "2px 8px",
-                    fontSize: "11px",
-                    border: "none",
-                    borderRadius: "4px",
-                    cursor: busy ? "not-allowed" : "pointer",
-                    backgroundColor: active ? "var(--danger-strong)" : "var(--accent)",
-                    color: "var(--accent-contrast)",
-                  }}
-                >
-                  {busy ? "…" : active ? "停止" : "启动"}
-                </button>
-              </div>
-            );
-          })}
-        </div>
+        <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+          监听开关在左侧每个项目里
+        </span>
 
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "8px" }}>
           <ThemeToggle />
@@ -353,28 +312,27 @@ function App() {
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
         <div
           style={{
-            width: "280px",
+            width: "300px",
             backgroundColor: "var(--bg-sidebar)",
             borderRight: "1px solid var(--border)",
             display: "flex",
             flexDirection: "column",
-            overflow: "auto",
+            overflow: "hidden",
           }}
         >
           <ProjectList
             projects={projects}
-            selectedProject={selectedProject}
-            onSelectProject={setSelectedProject}
+            sessionsByProject={sessionsByProject}
+            statusesByProject={statusesByProject}
+            selectedSession={selectedSession}
+            busyKey={busyKey}
+            onSelectSession={handleSelectSession}
             onEditProject={(project) => {
               setEditingProject(project);
               setShowProjectDialog(true);
             }}
             onDeleteProject={handleDeleteProject}
-          />
-          <SessionList
-            sessions={sessions}
-            selectedSession={selectedSession}
-            onSelectSession={setSelectedSession}
+            onToggleListener={handleToggleListener}
           />
         </div>
 
@@ -443,12 +401,14 @@ function App() {
           </div>
         </div>
 
-        {selectedSession && (
+        {selectedSession && selectedProject && (
           <ContextPanel session={selectedSession} project={selectedProject} />
         )}
       </div>
 
-      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {showSettings && (
+        <SettingsPanel project={selectedProject} onClose={() => setShowSettings(false)} />
+      )}
       {showPlugins && <PluginsPanel onClose={() => setShowPlugins(false)} />}
 
       {showProjectDialog && (
@@ -457,7 +417,8 @@ function App() {
           onClose={() => setShowProjectDialog(false)}
           onSaved={async () => {
             setShowProjectDialog(false);
-            await loadProjects();
+            const list = await loadProjects();
+            await loadSessions(list);
           }}
         />
       )}

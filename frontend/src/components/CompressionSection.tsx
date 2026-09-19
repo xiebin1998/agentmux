@@ -9,10 +9,15 @@ interface Summary {
 }
 
 interface CompressionSectionProps {
+  /** 压缩要走 Agent，用哪个 CLI 与工作目录由项目决定。 */
+  projectId: string;
   conversationId: string;
 }
 
-export default function CompressionSection({ conversationId }: CompressionSectionProps) {
+export default function CompressionSection({
+  projectId,
+  conversationId,
+}: CompressionSectionProps) {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -41,7 +46,7 @@ export default function CompressionSection({ conversationId }: CompressionSectio
     setBusy(true);
     setMessage(null);
     try {
-      const result = await invoke<Summary>("compress_now", { conversationId });
+      const result = await invoke<Summary>("compress_now", { projectId, conversationId });
       setSummary(result);
       setDraft(result.content);
       setMessage("压缩完成，已生效");

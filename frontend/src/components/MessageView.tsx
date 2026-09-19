@@ -40,6 +40,7 @@ export default function MessageView({ session }: MessageViewProps) {
       setLoading(true);
       try {
         const result = await invoke<EventRow[]>("list_events", {
+          projectId: session.project_id,
           conversationId: session.conversation_id,
           limit: 200,
         });
@@ -59,7 +60,7 @@ export default function MessageView({ session }: MessageViewProps) {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [session.conversation_id]);
+  }, [session.project_id, session.conversation_id]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });

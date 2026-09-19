@@ -12,8 +12,20 @@ pub struct Storage {
     archive_dir: PathBuf,
 }
 
+fn table_has_column(db: &Connection, table: &str, column: &str) -> bool {
+    let Ok(mut stmt) = db.prepare(&format!("PRAGMA table_info({})", table)) else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
+        return false;
+    };
+    let names: Vec<String> = rows.flatten().collect();
+    names.iter().any(|name| name == column)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EventRow {
+    pub project_id: String,
     pub message_id: String,
     pub conversation_id: String,
     pub sender: String,
@@ -59,6 +71,8 @@ pub struct Summary {
 pub struct EventQuery {
     pub limit: usize,
     pub offset: usize,
+    /// 只看某个项目的事件。
+    pub project_id: Option<String>,
     pub conversation_id: Option<String>,
     pub sender: Option<String>,
     pub keyword: Option<String>,
@@ -79,6 +93,7 @@ impl Storage {
             "CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id TEXT UNIQUE NOT NULL,
+                project_id TEXT NOT NULL DEFAULT '',
                 conversation_id TEXT NOT NULL,
                 sender TEXT NOT NULL,
                 sender_open_dingtalk_id TEXT NOT NULL,
@@ -94,17 +109,19 @@ impl Storage {
                 reply_sent_at TEXT
             );
 
+            CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id);
             CREATE INDEX IF NOT EXISTS idx_events_conversation ON events(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_events_received_at ON events(received_at);
             CREATE INDEX IF NOT EXISTS idx_events_processed ON events(processed);
 
             CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT UNIQUE NOT NULL,
+                project_id TEXT NOT NULL DEFAULT '',
+                conversation_id TEXT NOT NULL,
                 agent_session_id TEXT NOT NULL,
                 agent_cwd TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (project_id, conversation_id)
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -126,6 +143,7 @@ impl Storage {
             "ALTER TABLE events ADD COLUMN listen_kind TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE events ADD COLUMN malformed INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE events ADD COLUMN raw TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE events ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
         ] {
             let _ = db.execute(stmt, []);
         }
@@ -133,7 +151,35 @@ impl Storage {
         let archive_dir = data_dir.join("archive");
         fs::create_dir_all(&archive_dir)?;
 
-        Ok(Self { db, archive_dir })
+        let storage = Self { db, archive_dir };
+        storage.migrate_sessions_to_project_scoped();
+        Ok(storage)
+    }
+
+    /// 旧库的 sessions 是 `conversation_id` 单列唯一，无法按项目隔离。
+    /// 检测到旧结构时重建一次（幂等：只在缺 project_id 列时执行）。
+    fn migrate_sessions_to_project_scoped(&self) {
+        if table_has_column(&self.db, "sessions", "project_id") {
+            return;
+        }
+
+        let _ = self.db.execute_batch(
+            "CREATE TABLE sessions_v2 (
+                project_id TEXT NOT NULL DEFAULT '',
+                conversation_id TEXT NOT NULL,
+                agent_session_id TEXT NOT NULL,
+                agent_cwd TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (project_id, conversation_id)
+             );
+             INSERT OR IGNORE INTO sessions_v2
+                (project_id, conversation_id, agent_session_id, agent_cwd, created_at, updated_at)
+                SELECT '', conversation_id, agent_session_id, agent_cwd, created_at, updated_at
+                FROM sessions;
+             DROP TABLE sessions;
+             ALTER TABLE sessions_v2 RENAME TO sessions;",
+        );
     }
 
     pub fn archive_dir(&self) -> &PathBuf {
@@ -150,11 +196,12 @@ impl Storage {
 
         let inserted = self.db.execute(
             "INSERT OR IGNORE INTO events (
-                message_id, conversation_id, sender, sender_open_dingtalk_id,
+                message_id, project_id, conversation_id, sender, sender_open_dingtalk_id,
                 content, create_time, received_at, listen_kind, malformed, raw
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 message_id,
+                event.project_id,
                 event.conversation_id,
                 event.sender,
                 event.sender_open_dingtalk_id,
@@ -189,12 +236,16 @@ impl Storage {
 
     pub fn list_events(&self, query: &EventQuery) -> Result<Vec<EventRow>> {
         let mut sql = String::from(
-            "SELECT message_id, conversation_id, sender, sender_open_dingtalk_id, content,
+            "SELECT project_id, message_id, conversation_id, sender, sender_open_dingtalk_id, content,
                     create_time, received_at, listen_kind, malformed, processed, reply_status, reply_text
              FROM events WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
+        if let Some(project_id) = query.project_id.as_ref().filter(|s| !s.is_empty()) {
+            sql.push_str(" AND project_id = ?");
+            args.push(Box::new(project_id.clone()));
+        }
         if let Some(conversation_id) = query.conversation_id.as_ref().filter(|s| !s.is_empty()) {
             sql.push_str(" AND conversation_id = ?");
             args.push(Box::new(conversation_id.clone()));
@@ -230,18 +281,19 @@ impl Storage {
         let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(|a| a.as_ref()).collect();
         let rows = stmt.query_map(params.as_slice(), |row| {
             Ok(EventRow {
-                message_id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                sender: row.get(2)?,
-                sender_open_dingtalk_id: row.get(3)?,
-                content: row.get(4)?,
-                create_time: row.get(5)?,
-                received_at: row.get(6)?,
-                listen_kind: row.get(7)?,
-                malformed: row.get::<_, i32>(8)? != 0,
-                processed: row.get::<_, i32>(9)? != 0,
-                reply_status: row.get(10)?,
-                reply_text: row.get(11)?,
+                project_id: row.get(0)?,
+                message_id: row.get(1)?,
+                conversation_id: row.get(2)?,
+                sender: row.get(3)?,
+                sender_open_dingtalk_id: row.get(4)?,
+                content: row.get(5)?,
+                create_time: row.get(6)?,
+                received_at: row.get(7)?,
+                listen_kind: row.get(8)?,
+                malformed: row.get::<_, i32>(9)? != 0,
+                processed: row.get::<_, i32>(10)? != 0,
+                reply_status: row.get(11)?,
+                reply_text: row.get(12)?,
             })
         })?;
 
@@ -249,18 +301,20 @@ impl Storage {
             .map_err(|e| anyhow::anyhow!("Failed to collect events: {}", e))
     }
 
-    pub fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
+    /// 会话汇总。传 project_id 时只统计该项目的会话（左侧树的「项目下挂会话」）。
+    pub fn list_conversations(&self, project_id: Option<&str>) -> Result<Vec<ConversationSummary>> {
         let mut stmt = self.db.prepare(
             "SELECT conversation_id,
                     COUNT(*) AS events,
                     MAX(received_at) AS last_received_at,
                     SUM(CASE WHEN reply_status = 'sent' THEN 1 ELSE 0 END) AS replied
              FROM events
+             WHERE (?1 IS NULL OR project_id = ?1)
              GROUP BY conversation_id
              ORDER BY last_received_at DESC",
         )?;
 
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![project_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
@@ -400,29 +454,37 @@ impl Storage {
 
     pub fn save_session(
         &self,
+        project_id: &str,
         conversation_id: &str,
         agent_session_id: &str,
         agent_cwd: &str,
     ) -> Result<()> {
         let now = chrono::Local::now().to_rfc3339();
         self.db.execute(
-            "INSERT INTO sessions (conversation_id, agent_session_id, agent_cwd, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(conversation_id) DO UPDATE SET
-                agent_session_id = ?2,
-                agent_cwd = ?3,
-                updated_at = ?5",
-            params![conversation_id, agent_session_id, agent_cwd, now, now],
+            "INSERT INTO sessions (project_id, conversation_id, agent_session_id, agent_cwd, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(project_id, conversation_id) DO UPDATE SET
+                agent_session_id = ?3,
+                agent_cwd = ?4,
+                updated_at = ?6",
+            params![project_id, conversation_id, agent_session_id, agent_cwd, now, now],
         )?;
         Ok(())
     }
 
-    pub fn get_session(&self, conversation_id: &str) -> Result<Option<(String, String)>> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT agent_session_id, agent_cwd FROM sessions WHERE conversation_id = ?1")?;
+    pub fn get_session(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT agent_session_id, agent_cwd FROM sessions
+             WHERE project_id = ?1 AND conversation_id = ?2",
+        )?;
 
-        let result = stmt.query_row(params![conversation_id], |row| Ok((row.get(0)?, row.get(1)?)));
+        let result = stmt.query_row(params![project_id, conversation_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        });
 
         match result {
             Ok(session) => Ok(Some(session)),
@@ -431,10 +493,10 @@ impl Storage {
         }
     }
 
-    pub fn delete_session(&self, conversation_id: &str) -> Result<()> {
+    pub fn delete_session(&self, project_id: &str, conversation_id: &str) -> Result<()> {
         self.db.execute(
-            "DELETE FROM sessions WHERE conversation_id = ?1",
-            params![conversation_id],
+            "DELETE FROM sessions WHERE project_id = ?1 AND conversation_id = ?2",
+            params![project_id, conversation_id],
         )?;
         Ok(())
     }

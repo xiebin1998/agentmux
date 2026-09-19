@@ -6,16 +6,45 @@ use crate::providers::ListenKind;
 use crate::storage::{ConversationSummary, EventQuery, EventRow, Stats};
 use crate::AppState;
 
+fn data_dir() -> std::path::PathBuf {
+    crate::config::data_dir()
+}
+
+fn load_project(project_id: &str) -> Result<crate::project::Project, String> {
+    let store = crate::project::ProjectStore::new(data_dir()).map_err(|e| e.to_string())?;
+    store
+        .get(project_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("项目不存在: {}", project_id))
+}
+
+/// 解析某个项目实际生效的回复设置（必要时按平台自动解析 Agent CLI）。
+async fn effective_settings(
+    project: &crate::project::Project,
+) -> crate::reply::ReplySettings {
+    let mut settings = crate::config::reply_settings_for_project(project);
+    if settings.enabled && settings.agent_cli_path.is_none() {
+        settings.agent_cli_path =
+            crate::resolve::resolve_executable(&settings.agent_platform).await;
+    }
+    settings
+}
+
+/// 启动某项目的一路监听（@我 / 单聊各自独立，可并发）。
 #[tauri::command]
 pub async fn start_listener(
     state: State<'_, AppState>,
+    project_id: String,
     kind: String,
     channel: Channel<ListenerUpdate>,
 ) -> Result<String, String> {
     let parsed = ListenKind::parse(&kind).ok_or_else(|| format!("未知监听类型: {}", kind))?;
+    let project = load_project(&project_id)?;
+    let settings = effective_settings(&project).await;
+
     let orchestrator = state.orchestrator.lock().await;
     orchestrator
-        .start_listener(parsed, Some(channel))
+        .start_listener(project_id, parsed, settings, Some(channel))
         .await
         .map_err(|e| e.to_string())
 }
@@ -29,6 +58,7 @@ pub async fn stop_listener(state: State<'_, AppState>, id: String) -> Result<Str
         .map_err(|e| e.to_string())
 }
 
+/// 列出全部监听实例（含所属 project_id，界面按项目分组）。
 #[tauri::command]
 pub async fn listener_status(state: State<'_, AppState>) -> Result<Vec<ListenerStatus>, String> {
     let orchestrator = state.orchestrator.lock().await;
@@ -88,6 +118,7 @@ pub async fn list_events(
     state: State<'_, AppState>,
     limit: Option<usize>,
     offset: Option<usize>,
+    project_id: Option<String>,
     conversation_id: Option<String>,
     sender: Option<String>,
     keyword: Option<String>,
@@ -117,6 +148,7 @@ pub async fn list_events(
         .list_events(&EventQuery {
             limit: limit.unwrap_or(200),
             offset: offset.unwrap_or(0),
+            project_id,
             conversation_id,
             sender,
             keyword,
@@ -128,56 +160,67 @@ pub async fn list_events(
         .map_err(|e| e.to_string())
 }
 
+/// 会话汇总；传 project_id 时只列该项目的会话（左侧树的「项目下挂会话」）。
 #[tauri::command]
-pub async fn list_conversations(state: State<'_, AppState>) -> Result<Vec<ConversationSummary>, String> {
-    let storage = state.storage.lock().await;
-    storage.list_conversations().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn reset_conversation(
+pub async fn list_conversations(
     state: State<'_, AppState>,
-    conversation_id: String,
-) -> Result<(), String> {
+    project_id: Option<String>,
+) -> Result<Vec<ConversationSummary>, String> {
     let storage = state.storage.lock().await;
     storage
-        .delete_session(&conversation_id)
+        .list_conversations(project_id.as_deref())
         .map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize)]
 pub struct AgentSessionInfo {
+    pub project_id: String,
     pub conversation_id: String,
     pub agent_session_id: String,
     pub agent_cwd: String,
 }
 
-/// A6.1.2：查看会话关联的 Agent 会话状态。未建档返回 None。
+/// A6.1.2：查看某项目下会话关联的 Agent 会话状态。未建档返回 None。
 #[tauri::command]
 pub async fn conversation_session(
     state: State<'_, AppState>,
+    project_id: String,
     conversation_id: String,
 ) -> Result<Option<AgentSessionInfo>, String> {
     let storage = state.storage.lock().await;
     let found = storage
-        .get_session(&conversation_id)
+        .get_session(&project_id, &conversation_id)
         .map_err(|e| e.to_string())?;
 
     Ok(found.map(|(agent_session_id, agent_cwd)| AgentSessionInfo {
+        project_id,
         conversation_id,
         agent_session_id,
         agent_cwd,
     }))
 }
 
-/// 回复引擎当前真正生效的设置（含自动解析出来的 Agent CLI）。
-/// 用于界面上「设置是否已生效」的如实展示，而不是只回显 settings.json。
+#[tauri::command]
+pub async fn reset_conversation(
+    state: State<'_, AppState>,
+    project_id: String,
+    conversation_id: String,
+) -> Result<(), String> {
+    let storage = state.storage.lock().await;
+    storage
+        .delete_session(&project_id, &conversation_id)
+        .map_err(|e| e.to_string())
+}
+
+/// 该项目实际生效的运行期设置（供界面如实展示，而不是回显 settings.json）。
 #[derive(serde::Serialize)]
 pub struct RuntimeSettings {
+    pub project_id: String,
     pub reply_enabled: bool,
     pub agent_platform: String,
     pub agent_cli_path: Option<String>,
     pub agent_args: Option<Vec<String>>,
+    /// 实际驱动 Agent 的工作目录 —— 来自项目的 work_dir。
     pub agent_cwd: String,
     pub timeout_ms: u64,
     pub max_chars: usize,
@@ -191,8 +234,13 @@ pub struct RuntimeSettings {
     pub im_cli_path: Option<String>,
 }
 
-fn to_runtime(settings: crate::reply::ReplySettings, im_cli: Option<String>) -> RuntimeSettings {
+fn to_runtime(
+    project_id: String,
+    settings: crate::reply::ReplySettings,
+    im_cli: Option<String>,
+) -> RuntimeSettings {
     RuntimeSettings {
+        project_id,
         reply_enabled: settings.enabled,
         agent_platform: settings.agent_platform,
         agent_cli_path: settings.agent_cli_path,
@@ -211,22 +259,18 @@ fn to_runtime(settings: crate::reply::ReplySettings, im_cli: Option<String>) -> 
     }
 }
 
-/// 只读：查看当前生效的运行期设置。
 #[tauri::command]
-pub async fn runtime_settings(state: State<'_, AppState>) -> Result<RuntimeSettings, String> {
-    let orchestrator = state.orchestrator.lock().await;
-    let settings = orchestrator.reply_settings().await;
-    let im_cli = orchestrator.dws_path().await;
-    Ok(to_runtime(settings, im_cli))
-}
-
-/// 保存 settings.json 之后调用：让回复开关与预算立即生效，无需重启监听。
-#[tauri::command]
-pub async fn apply_settings(state: State<'_, AppState>) -> Result<RuntimeSettings, String> {
-    let orchestrator = state.orchestrator.lock().await;
-    let settings = orchestrator.refresh_reply_settings().await;
-    let im_cli = orchestrator.dws_path().await;
-    Ok(to_runtime(settings, im_cli))
+pub async fn project_runtime_settings(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<RuntimeSettings, String> {
+    let project = load_project(&project_id)?;
+    let settings = effective_settings(&project).await;
+    let im_cli = {
+        let orchestrator = state.orchestrator.lock().await;
+        orchestrator.dws_path().await
+    };
+    Ok(to_runtime(project_id, settings, im_cli))
 }
 
 #[tauri::command]
@@ -240,15 +284,19 @@ pub async fn get_summary(
         .map_err(|e| e.to_string())
 }
 
-/// 手动压缩（A7.1.3）。前端负责二次确认，后端不再弹确认。
+/// 手动压缩（A7.1.3）。压缩要走 Agent，所以需要项目来决定用哪个 CLI 与工作目录。
 #[tauri::command]
 pub async fn compress_now(
     state: State<'_, AppState>,
+    project_id: String,
     conversation_id: String,
 ) -> Result<crate::storage::Summary, String> {
+    let project = load_project(&project_id)?;
+    let settings = effective_settings(&project).await;
+
     let orchestrator = state.orchestrator.lock().await;
     orchestrator
-        .compress_conversation(&conversation_id)
+        .compress_conversation(settings, &conversation_id)
         .await
         .map_err(|e| e.to_string())
 }

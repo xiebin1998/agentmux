@@ -181,3 +181,33 @@ pub fn configured_im_cli() -> Option<String> {
         .and_then(|config| config.im_cli_path)
         .filter(|path| !path.trim().is_empty())
 }
+
+/// 把「项目 + 全局设置」合并成该项目**实际生效**的回复设置。
+///
+/// **项目优先、全局兜底**：
+/// - 工作目录必须用项目创建时指定的 `work_dir` —— 那是 Agent 的可见范围，
+///   不能被全局值顶替；
+/// - CLI、回复开关、超时、字数、上下文预算都取项目自己的；
+/// - 自身身份（openDingTalkId）是用户级信息，取全局；
+/// - Agent 启动参数与压缩策略目前仍是全局项。
+pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::reply::ReplySettings {
+    let global = load_config().unwrap_or_default();
+
+    crate::reply::ReplySettings {
+        enabled: project.reply_enabled,
+        agent_platform: project.agent_platform.clone(),
+        agent_cli_path: Some(project.agent_cli_path.clone())
+            .filter(|path| !path.trim().is_empty()),
+        agent_args: global.agent_args.clone().filter(|args| !args.is_empty()),
+        agent_cwd: project.work_dir.clone(),
+        timeout_ms: project.reply_timeout_ms,
+        max_chars: project.reply_max_chars,
+        self_open_dingtalk_id: global.self_open_dingtalk_id.clone(),
+        context_enabled: project.context_enabled,
+        context_message_limit: project.context_message_limit,
+        context_max_chars: project.context_max_chars,
+        auto_compress: global.auto_compress,
+        compress_trigger_turns: global.compress_trigger_turns,
+        compress_trigger_chars: global.compress_trigger_chars,
+    }
+}
