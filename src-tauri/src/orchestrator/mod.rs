@@ -2062,6 +2062,168 @@ process.stdin.on("end", function () {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 桩 dws 的事件端：同一会话**分两次**发消息（间隔大于攒批窗口），
+    /// 用来验证「第二轮才拿到占比、于是按占比触发压缩」。
+    const RATIO_EVENT_STUB: &str = r#"
+const READY = "[event] ready event_key=user_im_message_receive_at subscribe_id=subId-ratio bus_pid=1";
+function evt(id) {
+  return JSON.stringify({
+    type: "user_im_message_receive_at",
+    subscribe_id: "subId-ratio",
+    message_id: id,
+    conversation_id: "cid-ratio",
+    sender: "Maren",
+    sender_open_dingtalk_id: "open-other",
+    content: "@我 你好",
+    create_time: "2026-09-19 21:00:00"
+  });
+}
+process.stderr.write(READY + "\n");
+setTimeout(function () { process.stdout.write(evt("msg-r1") + "\n"); }, 100);
+setTimeout(function () { process.stdout.write(evt("msg-r2") + "\n"); }, 1600);
+process.stdin.resume();
+process.stdin.on("end", function () { process.exit(0); });
+"#;
+
+    /// 桩 Agent CLI：**按 qodercli `-o json` 的真实形状**输出，且带噪声前缀行。
+    /// 占比刻意给 0.85（高于测试里设的 75% 阈值），用来驱动自适应压缩。
+    const RATIO_AGENT_STUB: &str = r#"
+process.stdout.write("1 error loading agent configs. Use /agents to see details.\n");
+process.stdout.write(JSON.stringify({
+  type: "result",
+  subtype: "success",
+  result: "在的，还没吃呢，你吃了没？",
+  usage: { input_tokens: 0, output_tokens: 0, context_usage_ratio: 0.85 },
+  modelUsage: { "bailian/qwen3.7-plus-cp": { contextWindow: 0 } }
+}) + "\n");
+"#;
+
+    /// 端到端验证「读到模型名与真实占比 → 据此触发压缩」整条链。
+    /// 分段单测不够：必须证明占比真的从 CLI 输出流到了压缩判定里。
+    #[tokio::test]
+    async fn reported_context_ratio_flows_into_compression_decision() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let base = std::env::temp_dir().join("agentmux-e2e-ratio");
+        let _ = std::fs::remove_dir_all(&base);
+        let stub_dir = base.join("stub");
+        let work_dir = base.join("project-workdir");
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        std::fs::write(stub_dir.join("event"), RATIO_EVENT_STUB).unwrap();
+        std::fs::write(stub_dir.join("chat"), APPEND_CHAT_STUB).unwrap();
+        std::fs::write(stub_dir.join("agentstub"), RATIO_AGENT_STUB).unwrap();
+        let agent_stub_path = stub_dir.join("agentstub").to_string_lossy().to_string();
+
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let mut orchestrator = Orchestrator::new(storage.clone());
+        // 600ms 窗口：两条消息间隔 1500ms，会分成两批，第二轮才能用上第一轮的占比。
+        orchestrator.set_reply_batch_window(Duration::from_millis(600));
+
+        let settings = ReplySettings {
+            enabled: true,
+            agent_platform: "stub".to_string(),
+            agent_cli_path: Some(node.clone()),
+            agent_args: Some(vec![agent_stub_path]),
+            agent_cwd: work_dir.to_string_lossy().to_string(),
+            timeout_ms: 20_000,
+            max_chars: 500,
+            auto_compress: true,
+            compress_trigger_percent: Some(75),
+            ..Default::default()
+        };
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener("proj-ratio".to_string(), ListenKind::AtMe, settings, None)
+            .await
+            .expect("应能启动监听");
+
+        for _ in 0..150 {
+            sleep(Duration::from_millis(100)).await;
+            let rows = storage
+                .lock()
+                .await
+                .list_events(&EventQuery {
+                    limit: 10,
+                    project_id: Some("proj-ratio".to_string()),
+                    ..Default::default()
+                })
+                .unwrap();
+            if rows.len() == 2 && rows.iter().all(|row| row.reply_status.is_some()) {
+                break;
+            }
+        }
+
+        let _ = orchestrator.stop_listener(&id).await;
+        let logs = orchestrator.get_logs(500).await.join("\n");
+        let ratio = {
+            let map = orchestrator.last_context_ratio.lock().await;
+            map.get("cid-ratio").copied()
+        };
+        std::env::set_current_dir(previous).unwrap();
+
+        let rows = storage
+            .lock()
+            .await
+            .list_events(&EventQuery {
+                limit: 10,
+                project_id: Some("proj-ratio".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // 1) 占比真的被解析出来了，并记到了这个会话上。
+        assert_eq!(
+            ratio,
+            Some(0.85),
+            "应把 CLI 回报的占比记到该会话，实际 {:?}；日志:\n{}",
+            ratio,
+            logs
+        );
+
+        // 2) 日志里能看见模型名与占比——用户要「读得到」的东西。
+        assert!(
+            logs.contains("模型=bailian/qwen3.7-plus-cp"),
+            "日志应回报模型名，实际:\n{}",
+            logs
+        );
+        assert!(
+            logs.contains("上下文占比=85.00%"),
+            "日志应回报上下文占比，实际:\n{}",
+            logs
+        );
+
+        // 3) 第二轮按占比越阈值 → 真的触发了压缩。
+        assert!(
+            logs.contains("→ 触发压缩"),
+            "占比 85% 超过阈值 75%，应触发压缩，实际:\n{}",
+            logs
+        );
+
+        // 4) 两条都正常回复（压缩不阻塞回复）。
+        for row in &rows {
+            assert_eq!(
+                row.reply_status.as_deref(),
+                Some("sent"),
+                "{} 应已回复",
+                row.message_id
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn ready_line_parses_subscribe_id_and_bus_pid() {
         let line = "[event] ready event_key=user_im_message_receive_at bus_pid=22304 subscribe_id=subId-3a58";
