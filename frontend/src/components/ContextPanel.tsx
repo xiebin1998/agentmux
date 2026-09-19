@@ -40,6 +40,25 @@ interface ContextPanelProps {
   project: Project | null;
 }
 
+const KIND_LABEL: Record<string, string> = { group: "群聊", direct: "单聊" };
+
+/** conversation_details 命令的返回：会话名/类型 + 上下文用量 + 当前模型。 */
+interface ConversationDetails {
+  conversation_id: string;
+  name: string;
+  kind: string;
+  context_budget_chars: number;
+  context_used_chars: number;
+  context_message_limit: number;
+  /** Agent 最近一次回报的真实占用比例（0~1）；没跑过为 null */
+  context_usage_ratio: number | null;
+  compress_trigger_percent: number | null;
+  /** Agent 最近一次实际用的模型 */
+  model: string | null;
+  /** 配置里显式指定的模型；空 = 用 CLI 默认 */
+  model_override: string | null;
+}
+
 interface AgentSessionInfo {
   conversation_id: string;
   agent_session_id: string;
@@ -98,6 +117,58 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
   const [listeners, setListeners] = useState<ListenerStatus[]>([]);
   const [sessionNotice, setSessionNotice] = useState<string | null>(null);
   const [agentSession, setAgentSession] = useState<AgentSessionInfo | null>(null);
+  const [details, setDetails] = useState<ConversationDetails | null>(null);
+  const [models, setModels] = useState<string[]>([]);
+  const [modelNotice, setModelNotice] = useState<string | null>(null);
+
+  // 会话窗口要显示的上下文用量与当前模型；跟着会话切换刷新。
+  useEffect(() => {
+    if (!project) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const next = await invoke<ConversationDetails>("conversation_details", {
+          projectId: project.id,
+          conversationId: session.conversation_id,
+        });
+        if (!cancelled) setDetails(next);
+      } catch (e) {
+        console.error("Failed to load conversation details:", e);
+      }
+    };
+    load();
+    // 上下文占比/模型都是「最近一次生成」的快照，回复后要跟着变，所以轮询。
+    const timer = setInterval(load, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [project, session.conversation_id]);
+
+  useEffect(() => {
+    if (!project) return;
+    let cancelled = false;
+    // 可选模型列表来自 CLI，启动/切会话时拉一次即可，不轮询。
+    invoke<string[]>("list_agent_models", { projectId: project.id })
+      .then((list) => {
+        if (!cancelled) setModels(list);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [project]);
+
+  const handlePickModel = async (model: string) => {
+    try {
+      await invoke("set_agent_model", { model });
+      setModelNotice(
+        model ? `已切换到 ${model}（下一条消息生效）` : "已恢复用 CLI 默认模型（下一条消息生效）",
+      );
+    } catch (e) {
+      setModelNotice(`切换失败：${e}`);
+    }
+  };
 
   useEffect(() => {
     if (!project) return;
@@ -300,6 +371,110 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
               {project.context_enabled ? "已启用" : "已禁用"}
             </span>
           </div>
+          <div style={rowStyle}>
+            <span style={{ color: "var(--text-secondary)" }}>当前累计</span>
+            <span style={{ color: "var(--text-primary)" }}>
+              {details ? `${details.context_used_chars} 字符` : "—"}
+            </span>
+          </div>
+          <div style={rowStyle}>
+            <span style={{ color: "var(--text-secondary)" }}>实际占用</span>
+            <span
+              style={{
+                color:
+                  details?.context_usage_ratio != null &&
+                  details.compress_trigger_percent != null &&
+                  details.context_usage_ratio * 100 >= details.compress_trigger_percent
+                    ? "var(--warn)"
+                    : "var(--text-primary)",
+              }}
+            >
+              {details?.context_usage_ratio != null
+                ? `${(details.context_usage_ratio * 100).toFixed(2)}%`
+                : "暂无（回复过一次后由 Agent 回报）"}
+            </span>
+          </div>
+          {details?.context_usage_ratio != null && (
+            <div
+              style={{
+                height: "6px",
+                borderRadius: "3px",
+                backgroundColor: "var(--bg-active)",
+                overflow: "hidden",
+              }}
+              title={`压缩阈值 ${details.compress_trigger_percent ?? "未设"}%`}
+            >
+              <div
+                style={{
+                  height: "100%",
+                  width: `${Math.min(100, details.context_usage_ratio * 100).toFixed(1)}%`,
+                  backgroundColor:
+                    details.compress_trigger_percent != null &&
+                    details.context_usage_ratio * 100 >= details.compress_trigger_percent
+                      ? "var(--warn)"
+                      : "var(--accent)",
+                }}
+              />
+            </div>
+          )}
+          <div style={rowStyle}>
+            <span style={{ color: "var(--text-secondary)" }}>压缩阈值</span>
+            <span style={{ color: "var(--text-muted)" }}>
+              {details?.compress_trigger_percent != null
+                ? `用到 ${details.compress_trigger_percent}% 时压缩`
+                : "未设置"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ padding: "16px", borderBottom: "1px solid var(--border)" }}>
+        <div style={sectionTitle}>模型</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          <div style={rowStyle}>
+            <span style={{ color: "var(--text-secondary)" }}>当前使用</span>
+            <span
+              style={{
+                color: "var(--text-primary)",
+                wordBreak: "break-all",
+                textAlign: "right",
+              }}
+            >
+              {details?.model ?? "暂无（回复过一次后由 Agent 回报）"}
+            </span>
+          </div>
+          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <span style={{ fontSize: "12px", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+              切换为
+            </span>
+            <select
+              value={details?.model_override ?? ""}
+              onChange={(e) => handlePickModel(e.target.value)}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                padding: "4px 6px",
+                fontSize: "12px",
+                backgroundColor: "var(--bg-app)",
+                color: "var(--text-primary)",
+                border: "1px solid var(--border)",
+                borderRadius: "4px",
+              }}
+            >
+              <option value="">CLI 默认模型</option>
+              {models.map((model) => (
+                <option key={model} value={model}>
+                  {model}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+            {models.length === 0
+              ? "读不到可选模型列表（该 CLI 不支持 --list-models），可只用默认模型"
+              : "切换写进全局设置，下一条消息生效；重启监听不需要"}
+            {modelNotice ? ` · ${modelNotice}` : ""}
+          </div>
         </div>
       </div>
       <CompressionSection
@@ -309,6 +484,62 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
 
       <div style={{ padding: "16px", borderTop: "1px solid var(--border)" }}>
         <div style={sectionTitle}>会话</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginBottom: "10px" }}>
+          <div style={rowStyle}>
+            <span style={{ color: "var(--text-secondary)" }}>类型</span>
+            <span
+              style={{
+                color:
+                  details?.kind === "group"
+                    ? "var(--accent)"
+                    : details?.kind === "direct"
+                      ? "var(--success)"
+                      : "var(--text-muted)",
+              }}
+            >
+              {KIND_LABEL[details?.kind ?? ""] ?? "未知（尚未同步）"}
+            </span>
+          </div>
+          <div style={{ ...rowStyle, alignItems: "flex-start" }}>
+            <span style={{ color: "var(--text-secondary)" }}>名称</span>
+            <span
+              style={{
+                color: details?.name ? "var(--text-primary)" : "var(--text-muted)",
+                textAlign: "right",
+                wordBreak: "break-all",
+              }}
+            >
+              {details?.name || session.name}
+            </span>
+          </div>
+        </div>
+        <button
+          onClick={async () => {
+            try {
+              const count = await invoke<number>("refresh_conversation_meta");
+              const next = await invoke<ConversationDetails>("conversation_details", {
+                projectId: project.id,
+                conversationId: session.conversation_id,
+              });
+              setDetails(next);
+              setSessionNotice(`已同步 ${count} 个会话的名称与类型`);
+            } catch (e) {
+              setSessionNotice(`同步失败：${e}`);
+            }
+          }}
+          style={{
+            marginBottom: "10px",
+            padding: "4px 10px",
+            fontSize: "12px",
+            backgroundColor: "transparent",
+            color: "var(--text-secondary)",
+            border: "1px solid var(--border)",
+            borderRadius: "4px",
+            cursor: "pointer",
+          }}
+        >
+          刷新会话信息（群名/单聊名）
+        </button>
         <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "10px" }}>
           Agent 会话状态：首次回复时按 conversation_id 建档，之后按会话续接。
         </div>

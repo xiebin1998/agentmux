@@ -101,6 +101,8 @@ pub struct Orchestrator {
     /// 每个会话最近一次生成时 CLI 报的**上下文占用比例**（0~1）。
     /// 自适应压缩的依据：比按字符估算准，因为它是 Agent 自己算的。
     last_context_ratio: Arc<Mutex<HashMap<String, f64>>>,
+    /// 每个会话最近一次生成实际用的模型名，界面上要显示「当前用什么模型」。
+    last_model: Arc<Mutex<HashMap<String, String>>>,
     /// 追踪用：每条消息的接收时刻，用来在日志里打「距收到多少毫秒」。
     trace_started: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
@@ -122,6 +124,7 @@ impl Orchestrator {
             reply_inflight: Arc::new(Mutex::new(HashSet::new())),
             reply_batch_window: DEFAULT_REPLY_BATCH_WINDOW,
             last_context_ratio: Arc::new(Mutex::new(HashMap::new())),
+            last_model: Arc::new(Mutex::new(HashMap::new())),
             trace_started: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -130,6 +133,23 @@ impl Orchestrator {
     #[cfg(test)]
     pub fn set_reply_batch_window(&mut self, window: Duration) {
         self.reply_batch_window = window;
+    }
+
+    /// 某个会话的运行期观测值：Agent 最近回报的上下文占比与实际用的模型。
+    /// 都是「最近一次生成」的快照，重启后为空——它们来自 CLI 回报，不是配置。
+    pub async fn conversation_runtime(
+        &self,
+        conversation_id: &str,
+    ) -> (Option<f64>, Option<String>) {
+        let ratio = {
+            let ratios = self.last_context_ratio.lock().await;
+            ratios.get(conversation_id).copied()
+        };
+        let model = {
+            let models = self.last_model.lock().await;
+            models.get(conversation_id).cloned()
+        };
+        (ratio, model)
     }
 
     pub async fn push_global_log(&self, line: &str) {
@@ -238,6 +258,7 @@ impl Orchestrator {
             reply_inflight: self.reply_inflight.clone(),
             reply_batch_window: self.reply_batch_window,
             last_context_ratio: self.last_context_ratio.clone(),
+            last_model: self.last_model.clone(),
             trace_started: self.trace_started.clone(),
             compress_failures: Arc::new(Mutex::new(0)),
             malformed_streak: Arc::new(Mutex::new(0)),
@@ -337,6 +358,7 @@ struct Shared {
     reply_inflight: Arc<Mutex<HashSet<String>>>,
     reply_batch_window: Duration,
     last_context_ratio: Arc<Mutex<HashMap<String, f64>>>,
+    last_model: Arc<Mutex<HashMap<String, String>>>,
     trace_started: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     compress_failures: Arc<Mutex<u32>>,
     /// 连续畸形事件计数：仅在连续出现时提示（D-40）。
@@ -1032,6 +1054,13 @@ impl Shared {
                 .lock()
                 .await
                 .insert(event.conversation_id.clone(), ratio);
+        }
+        // 记下实际用的模型：界面要显示「当前用什么模型」。
+        if let Some(model) = raw.model.as_ref().filter(|name| !name.trim().is_empty()) {
+            self.last_model
+                .lock()
+                .await
+                .insert(event.conversation_id.clone(), model.clone());
         }
 
         if !resume {

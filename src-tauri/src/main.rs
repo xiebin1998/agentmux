@@ -2,6 +2,7 @@
 
 mod commands;
 mod config;
+mod conversations;
 mod orchestrator;
 mod process;
 mod project;
@@ -132,6 +133,10 @@ fn main() {
             commands::get_stats,
             commands::list_events,
             commands::list_conversations,
+            commands::refresh_conversation_meta,
+            commands::conversation_details,
+            commands::list_agent_models,
+            commands::set_agent_model,
             commands::assign_conversation,
             commands::reset_conversation,
             commands::conversation_session,

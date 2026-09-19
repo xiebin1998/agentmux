@@ -18,6 +18,8 @@ pub struct ReplySettings {
     pub agent_cli_path: Option<String>,
     /// 为空 = 用该平台默认的只读参数（A2.2.4 允许显式覆盖）。
     pub agent_args: Option<Vec<String>>,
+    /// 模型覆盖（`-m <model>`）。为空 = 用 CLI 自己的默认模型。
+    pub agent_model: Option<String>,
     pub agent_cwd: String,
     pub timeout_ms: u64,
     pub max_chars: usize,
@@ -43,6 +45,7 @@ impl Default for ReplySettings {
             agent_platform: "qoder".to_string(),
             agent_cli_path: None,
             agent_args: None,
+            agent_model: None,
             agent_cwd: String::new(),
             timeout_ms: 120_000,
             max_chars: 500,
@@ -85,6 +88,49 @@ pub fn json_output_args(platform_id: &str) -> Vec<String> {
         "claude" => vec!["--output-format".to_string(), "json".to_string()],
         _ => Vec::new(),
     }
+}
+
+/// 解析 `qodercli --list-models` 的输出：一行一个模型名，首行是表头 MODEL。
+pub fn parse_available_models(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.eq_ignore_ascii_case("MODEL"))
+        .map(|line| line.to_string())
+        .collect()
+}
+
+/// 列出可选模型。CLI 不支持或失败时返回空，界面据此隐藏下拉。
+pub async fn list_available_models(settings: &ReplySettings) -> Vec<String> {
+    let Some(bin) = settings.agent_cli_path.as_ref() else {
+        return Vec::new();
+    };
+    let mut command = Command::new(bin);
+    command
+        .arg("--list-models")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::process::hide_console(&mut command);
+    for key in [
+        "QODER_AGENT_SDK_ENTRYPOINT",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "AGENT_SDK_ENTRYPOINT",
+    ] {
+        command.env_remove(key);
+    }
+
+    let Ok(child) = command.spawn() else {
+        return Vec::new();
+    };
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_available_models(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// 一次生成的结果：正文 + 可观测元信息。
@@ -377,6 +423,16 @@ pub async fn generate(
             args
         }
     };
+    // 模型用 `-m <name>` 指定；实测 qodercli 支持（--model / -m）。
+    if let Some(model) = settings
+        .agent_model
+        .as_ref()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+    {
+        args.push("-m".to_string());
+        args.push(model.to_string());
+    }
     // 会话参数必须追加在末尾，理由见模块头注释。
     if let Some(session_id) = session_id {
         args.push(if resume { "--resume" } else { "--session-id" }.to_string());

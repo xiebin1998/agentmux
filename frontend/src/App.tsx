@@ -37,6 +37,10 @@ interface Session {
   name: string;
   conversation_id: string;
   created_at: string;
+  /** group / direct / unknown，用来打「群聊·单聊」标签 */
+  kind: string;
+  /** 是否已知名字；未知时界面回退显示会话 id */
+  name_known: boolean;
 }
 
 type ListenKind = "at-me" | "all-direct";
@@ -63,6 +67,10 @@ interface ConversationSummary {
   last_sender: string;
   last_received_at: string;
   replied: number;
+  /** 群名或对方用户名；还没拉到元信息时为空 */
+  name: string;
+  /** group / direct / unknown */
+  kind: string;
 }
 
 type ListenerUpdate =
@@ -127,11 +135,13 @@ function App() {
     const toSession = (projectId: string, conversation: ConversationSummary): Session => ({
       id: conversation.conversation_id,
       project_id: projectId,
-      name: conversation.last_sender
-        ? `${conversation.last_sender}（${conversation.events} 条）`
-        : conversation.conversation_id,
+      // 命名规范：群聊用群名、单聊用对方用户名；两者都是 dws 给的 name。
+      // 还没拉到（或 dws 说 nameKnown=false）时回退成会话 id，不至于显示空白。
+      name: conversation.name?.trim() ? conversation.name : conversation.conversation_id,
       conversation_id: conversation.conversation_id,
       created_at: conversation.last_received_at,
+      kind: conversation.kind || "unknown",
+      name_known: Boolean(conversation.name?.trim()),
     });
 
     await Promise.all(
@@ -188,7 +198,16 @@ function App() {
   }, []);
 
   useEffect(() => {
-    loadProjects().then((list) => loadSessions(list));
+    // 会话名/群聊单聊来自 dws，会真的启子进程，所以只在启动时拉一次，
+    // 之后靠会话窗口里的「刷新会话信息」手动触发（与 CLI 检测同一原则）。
+    const refreshMetaOnce = async () => {
+      try {
+        await invoke("refresh_conversation_meta");
+      } catch (e) {
+        console.error("Failed to refresh conversation meta:", e);
+      }
+    };
+    refreshMetaOnce().then(() => loadProjects().then((list) => loadSessions(list)));
     loadStatuses();
     const timer = setInterval(async () => {
       const list = await loadProjects();

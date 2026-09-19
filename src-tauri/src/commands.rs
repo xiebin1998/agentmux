@@ -30,6 +30,127 @@ async fn effective_settings(
     settings
 }
 
+/// 拉一次会话元信息（群名/对方用户名 + 群聊单聊）。
+///
+/// 事件流里只有 conversation_id，名字和类型都得靠 dws 的会话列表补；
+/// 返回这次写入的条数，界面据此提示「已刷新 N 个会话」。
+#[tauri::command]
+pub async fn refresh_conversation_meta(state: State<'_, AppState>) -> Result<usize, String> {
+    let Some(dws_path) = crate::resolve::resolve_executable("dingtalk").await else {
+        return Err("没解析到 dws，无法拉取会话列表".to_string());
+    };
+    let items = crate::conversations::fetch_conversation_meta(
+        &dws_path,
+        crate::conversations::DEFAULT_LOOKBACK_HOURS,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let storage = state.storage.lock().await;
+    storage
+        .upsert_conversations(&items)
+        .map_err(|e| e.to_string())
+}
+
+/// 会话窗口要显示的一组信息：名称/类型 + 上下文用量 + 当前模型。
+#[derive(serde::Serialize)]
+pub struct ConversationDetails {
+    pub conversation_id: String,
+    pub name: String,
+    pub kind: String,
+    /// 上下文预算（字符，来自项目配置）。
+    pub context_budget_chars: usize,
+    /// 当前会话累计的字符数（上下文就是从这里取的）。
+    pub context_used_chars: usize,
+    pub context_message_limit: usize,
+    /// Agent 最近一次回报的真实上下文占用比例（0~1）；没跑过则为 null。
+    pub context_usage_ratio: Option<f64>,
+    /// 压缩阈值百分比（滑块值）；未设置则为 null。
+    pub compress_trigger_percent: Option<u8>,
+    /// Agent 最近一次实际用的模型；没跑过则为 null。
+    pub model: Option<String>,
+    /// 配置里显式指定的模型（-m）；空 = 用 CLI 默认。
+    pub model_override: Option<String>,
+}
+
+#[tauri::command]
+pub async fn conversation_details(
+    state: State<'_, AppState>,
+    project_id: String,
+    conversation_id: String,
+) -> Result<ConversationDetails, String> {
+    let project = load_project(&project_id)?;
+    let settings = effective_settings(&project).await;
+
+    let (meta, used_chars) = {
+        let storage = state.storage.lock().await;
+        let meta = storage
+            .conversation_meta(&conversation_id)
+            .map_err(|e| e.to_string())?;
+        let rows = storage
+            .recent_messages(&conversation_id, settings.context_message_limit)
+            .unwrap_or_default();
+        let used: usize = rows
+            .iter()
+            .map(|(sender, content)| sender.chars().count() + content.chars().count())
+            .sum();
+        (meta, used)
+    };
+
+    let (ratio, model) = {
+        let orchestrator = state.orchestrator.lock().await;
+        orchestrator
+            .conversation_runtime(&conversation_id)
+            .await
+    };
+
+    Ok(ConversationDetails {
+        conversation_id: conversation_id.clone(),
+        name: meta.as_ref().map(|m| m.name.clone()).unwrap_or_default(),
+        kind: meta
+            .as_ref()
+            .map(|m| m.kind.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        context_budget_chars: project.context_max_chars,
+        context_used_chars: used_chars,
+        context_message_limit: settings.context_message_limit,
+        context_usage_ratio: ratio,
+        compress_trigger_percent: settings.compress_trigger_percent,
+        model,
+        model_override: settings.agent_model,
+    })
+}
+
+/// 列出 Agent CLI 支持切换的模型（qodercli --list-models）。
+#[tauri::command]
+pub async fn list_agent_models(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<String>, String> {
+    let project = load_project(&project_id)?;
+    let settings = effective_settings(&project).await;
+    let _ = state;
+    Ok(crate::reply::list_available_models(&settings).await)
+}
+
+/// 设置模型覆盖。空字符串表示恢复「用 CLI 默认模型」。
+#[tauri::command]
+pub async fn set_agent_model(
+    state: State<'_, AppState>,
+    model: String,
+) -> Result<Option<String>, String> {
+    let _ = state;
+    let trimmed = model.trim().to_string();
+    let mut config = crate::config::load_config().unwrap_or_default();
+    config.agent_model = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
+    crate::config::save_config(&config).map_err(|e| e.to_string())?;
+    Ok(config.agent_model)
+}
+
 /// 启动某项目的一路监听（@我 / 单聊各自独立，可并发）。
 #[tauri::command]
 pub async fn start_listener(

@@ -57,6 +57,19 @@ pub struct ConversationSummary {
     pub last_sender: String,
     pub last_received_at: String,
     pub replied: i64,
+    /// 会话名：群聊是群名、单聊是对方用户名。事件流里没有，靠 dws 会话列表补。
+    pub name: String,
+    /// group / direct / unknown，供界面打「群聊·单聊」标签。
+    pub kind: String,
+}
+
+/// dws 会话列表查出的一条会话元信息。
+#[derive(Debug, Clone)]
+pub struct ConversationMeta {
+    pub conversation_id: String,
+    pub name: String,
+    pub kind: String,
+    pub name_known: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +147,16 @@ impl Storage {
                 content TEXT NOT NULL,
                 source_events INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
+            );
+
+            -- 会话元信息：事件流里只有 conversation_id，没有名字也没有群/单聊标记，
+            -- 靠 dws 的会话列表补上（详见 resolve 里的拉取逻辑）。
+            CREATE TABLE IF NOT EXISTS conversations (
+                conversation_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT 'unknown',
+                name_known INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
             );",
         )?;
 
@@ -190,6 +213,63 @@ impl Storage {
 
     pub fn archive_dir(&self) -> &PathBuf {
         &self.archive_dir
+    }
+
+    /// 写入会话元信息（群名/用户名 + 群聊单聊）。以 dws 为准覆盖本地旧值。
+    pub fn upsert_conversations(&self, items: &[ConversationMeta]) -> Result<usize> {
+        let now = chrono::Local::now().to_rfc3339();
+        let mut written = 0;
+        for item in items {
+            if item.conversation_id.trim().is_empty() {
+                continue;
+            }
+            self.db.execute(
+                "INSERT INTO conversations (conversation_id, name, kind, name_known, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                    name = excluded.name,
+                    kind = excluded.kind,
+                    name_known = excluded.name_known,
+                    updated_at = excluded.updated_at",
+                params![
+                    item.conversation_id,
+                    item.name,
+                    item.kind,
+                    item.name_known as i32,
+                    now
+                ],
+            )?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// 单条会话元信息（会话窗口用）。
+    pub fn conversation_meta(&self, conversation_id: &str) -> Result<Option<ConversationMeta>> {
+        let mut stmt = self.db.prepare(
+            "SELECT conversation_id, name, kind, name_known FROM conversations
+             WHERE conversation_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![conversation_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(ConversationMeta {
+                conversation_id: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                name_known: row.get::<_, i32>(3)? != 0,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// 已知会话元的最近更新时间；界面据此判断要不要再拉一次。
+    pub fn conversations_meta_updated_at(&self) -> Option<String> {
+        self.db
+            .query_row("SELECT MAX(updated_at) FROM conversations", [], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .ok()
+            .flatten()
     }
 
     /// 返回 true 表示这是新事件（非重复）。仅在真正插入时才写归档。
@@ -368,12 +448,24 @@ impl Storage {
                     |row| row.get(0),
                 )
                 .unwrap_or_default();
+            // 元信息可能还没拉到（比如刚收到第一条消息、还没刷新过会话列表），
+            // 这时 name 为空、kind 为 unknown，界面自己决定怎么显示。
+            let (name, kind): (String, String) = self
+                .db
+                .query_row(
+                    "SELECT name, kind FROM conversations WHERE conversation_id = ?1",
+                    params![conversation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or_default();
             out.push(ConversationSummary {
                 conversation_id,
                 events,
                 last_sender,
                 last_received_at,
                 replied,
+                name,
+                kind,
             });
         }
 

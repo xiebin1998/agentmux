@@ -43,6 +43,9 @@ pub struct AppConfig {
     /// Agent 启动参数覆盖（A2.2.4）。为空 = 用该平台的只读默认参数。
     #[serde(default)]
     pub agent_args: Option<Vec<String>>,
+    /// 模型覆盖（-m）。空 = 用 CLI 默认模型。
+    #[serde(default)]
+    pub agent_model: Option<String>,
     pub reply_enabled: bool,
     pub reply_timeout_ms: u64,
     pub reply_max_chars: usize,
@@ -79,6 +82,7 @@ impl Default for AppConfig {
             self_open_dingtalk_id: None,
             agent_cwd: None,
             agent_args: None,
+            agent_model: None,
             reply_enabled: false,
             reply_timeout_ms: 120_000,
             reply_max_chars: 500,
@@ -338,6 +342,7 @@ pub fn reply_settings() -> crate::reply::ReplySettings {
             .agent_args
             .clone()
             .filter(|args| !args.is_empty()),
+        agent_model: config.agent_model.clone(),
         agent_cwd,
         timeout_ms: config.reply_timeout_ms,
         max_chars: config.reply_max_chars,
@@ -404,6 +409,10 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
         agent_cli_path: Some(project.agent_cli_path.clone())
             .filter(|path| !path.trim().is_empty()),
         agent_args: global.agent_args.clone().filter(|args| !args.is_empty()),
+        agent_model: global
+            .agent_model
+            .clone()
+            .filter(|model| !model.trim().is_empty()),
         agent_cwd: project.work_dir.clone(),
         timeout_ms: project.reply_timeout_ms,
         max_chars: project.reply_max_chars,

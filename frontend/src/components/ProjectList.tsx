@@ -24,6 +24,34 @@ interface Session {
   name: string;
   conversation_id: string;
   created_at: string;
+  /** group / direct / unknown */
+  kind: string;
+  /** 名字是否已知；未知时显示会话 id 作提示 */
+  name_known: boolean;
+}
+
+/** 群聊 / 单聊标签：样式与文案都在这里，列表里两处复用。 */
+function KindTag({ kind }: { kind: string }) {
+  const label =
+    kind === "group" ? "群聊" : kind === "direct" ? "单聊" : null;
+  if (!label) return null;
+  return (
+    <span
+      style={{
+        marginRight: "5px",
+        padding: "0 5px",
+        borderRadius: "3px",
+        fontSize: "10px",
+        lineHeight: "15px",
+        display: "inline-block",
+        verticalAlign: "1px",
+        color: kind === "group" ? "var(--accent)" : "var(--success)",
+        border: `1px solid ${kind === "group" ? "var(--accent)" : "var(--success)"}`,
+      }}
+    >
+      {label}
+    </span>
+  );
 }
 
 type ListenKind = "at-me" | "all-direct";
@@ -249,18 +277,20 @@ export default function ProjectList({
                           }}
                         >
                           <div style={{ fontSize: "12px", color: "var(--text-primary)" }}>
+                            <KindTag kind={session.kind} />
                             {session.name}
                           </div>
-                          <div
-                            style={{
-                              fontSize: "10px",
-                              color: "var(--text-muted)",
-                              fontFamily: "ui-monospace, Consolas, monospace",
-                              wordBreak: "break-all",
-                            }}
-                          >
-                            {session.conversation_id}
-                          </div>
+                          {/* 名字已知时不再重复显示会话 id，省一行视觉噪音 */}
+                          {!session.name_known && (
+                            <div
+                              style={{
+                                fontSize: "10px",
+                                color: "var(--text-muted)",
+                              }}
+                            >
+                              名称未知，显示会话 id
+                            </div>
+                          )}
                         </div>
                       );
                     })
@@ -303,18 +333,14 @@ export default function ProjectList({
                   style={{ cursor: "pointer" }}
                 >
                   <div style={{ fontSize: "12px", color: "var(--text-primary)" }}>
+                    <KindTag kind={session.kind} />
                     {session.name}
                   </div>
-                  <div
-                    style={{
-                      fontSize: "10px",
-                      color: "var(--text-muted)",
-                      fontFamily: "ui-monospace, Consolas, monospace",
-                      wordBreak: "break-all",
-                    }}
-                  >
-                    {session.conversation_id}
-                  </div>
+                  {!session.name_known && (
+                    <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>
+                      名称未知，显示会话 id
+                    </div>
+                  )}
                 </div>
                 <div style={{ display: "flex", gap: "6px", marginTop: "4px" }}>
                   <select
