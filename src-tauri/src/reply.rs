@@ -123,24 +123,11 @@ pub const REPLY_PERSONA: &str = "\
 3. 只输出要发出去的那句话本身：不要加引号、前缀、署名、括号说明或任何解释。
 4. 像真人在钉钉里打字，一到两句话说完，不要长篇大论，不要列点。";
 
-pub fn build_prompt(content: &str, context_lines: &[String], context_enabled: bool) -> String {
-    build_prompt_with_summary(content, None, context_lines, context_enabled)
-}
-
-/// 带历史摘要的 prompt。摘要存在时优先用摘要，避免把整段历史重复塞进去。
-pub fn build_prompt_with_summary(
-    content: &str,
-    summary: Option<&str>,
-    context_lines: &[String],
-    context_enabled: bool,
-) -> String {
-    build_prompt_for_batch(&[content.to_string()], summary, context_lines, context_enabled)
-}
-
 /// 一批消息合成一条回复的 prompt。
 ///
 /// 对方在很短时间内连发 n 条时，逐条各回一条会刷屏；这里把它们并成一次回复，
-/// 让 Agent 看到整批内容后只输出一条。
+/// 让 Agent 看到整批内容后只输出一条。**只有这一个入口**：单条也走这里，
+/// 免得有人绕开 `REPLY_PERSONA` 拼 prompt。
 pub fn build_prompt_for_batch(
     contents: &[String],
     summary: Option<&str>,
@@ -397,6 +384,11 @@ fn truncate(input: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// 单条消息的 prompt：测试里最常用，包一层省得每处都写数组字面量。
+    fn one(content: &str, context: &[String], context_enabled: bool) -> String {
+        build_prompt_for_batch(&[content.to_string()], None, context, context_enabled)
+    }
+
     #[test]
     fn sanitize_strips_mentions_and_collapses_whitespace() {
         assert_eq!(sanitize_reply("@谢斌(谢斌) 你好   世界\n第二行", 500), "你好 世界 第二行");
@@ -421,7 +413,7 @@ mod tests {
 
     #[test]
     fn prompt_omits_context_when_disabled() {
-        let prompt = build_prompt("@我 你好", &["甲: 旧消息".to_string()], false);
+        let prompt = one("@我 你好", &["甲: 旧消息".to_string()], false);
         assert!(!prompt.contains("旧消息"), "关掉上下文就不该带历史消息");
         assert!(prompt.contains("你好"), "来信正文必须在 prompt 里");
     }
@@ -430,7 +422,7 @@ mod tests {
     /// 而且用英文回。这段 persona 是强制中文 + 明确寒暄属于职责的唯一手段。
     #[test]
     fn prompt_always_requires_chinese_and_forbids_refusing() {
-        let prompt = build_prompt("@我 你好，吃晚饭了吗", &[], false);
+        let prompt = one("@我 你好，吃晚饭了吗", &[], false);
 
         assert!(prompt.starts_with(crate::reply::REPLY_PERSONA));
         assert!(prompt.contains("一律使用简体中文回复"), "必须强制中文");
@@ -475,7 +467,7 @@ mod tests {
     #[test]
     fn bare_mention_gets_a_placeholder_instead_of_an_empty_question() {
         // 回归：裸 @ 曾经被上层直接跳过，导致「收到消息但没回复」
-        let prompt = build_prompt("@谢斌 ", &[], false);
+        let prompt = one("@谢斌 ", &[], false);
         assert!(!prompt.trim().is_empty(), "裸 @ 不应产生空 prompt");
         assert!(
             prompt.contains("只是 @ 了我"),
@@ -486,8 +478,12 @@ mod tests {
 
     #[test]
     fn prompt_includes_summary_even_when_context_off() {
-        let prompt =
-            build_prompt_with_summary("@我 进展如何", Some("上轮结论：待定"), &[], false);
+        let prompt = build_prompt_for_batch(
+            &["@我 进展如何".to_string()],
+            Some("上轮结论：待定"),
+            &[],
+            false,
+        );
         assert!(prompt.contains("上轮结论：待定"));
         assert!(prompt.ends_with("进展如何"));
     }
