@@ -816,10 +816,44 @@ impl Shared {
             );
         }
 
-        let text = crate::reply::sanitize_reply(&raw, reply.max_chars);
+        let mut text = crate::reply::sanitize_reply(&raw, reply.max_chars);
         if text.is_empty() {
             self.finish_batch(&events, "failed", Some("清洗后回复为空")).await;
             return;
+        }
+
+        // 会话是有记忆的：一旦某次按「我是编程助手」拒绝了，这条拒绝就留在会话里，
+        // 之后 resume 同一会话会一直拒绝（实测）。识别到就换新会话重试一次，
+        // 并把坏会话替换掉，让后续 resume 不再踩同一脚。
+        if resume && crate::reply::looks_like_refusal(&text) {
+            self.push_log(
+                "本次回复像是在拒绝（旧会话里可能有拒绝惯性），换新会话重试一次",
+            )
+            .await;
+
+            let fresh_id = uuid::Uuid::new_v4().to_string();
+            match crate::reply::generate(&settings, &prompt, Some(&fresh_id), false).await {
+                Ok(fresh_raw) => {
+                    let fresh_text = crate::reply::sanitize_reply(&fresh_raw, reply.max_chars);
+                    if fresh_text.is_empty() {
+                        self.push_log("新会话重试得到空回复，保留原回复").await;
+                    } else {
+                        text = fresh_text;
+                        let storage = self.storage.lock().await;
+                        let _ = storage.save_session(
+                            &self.project_id,
+                            &event.conversation_id,
+                            &fresh_id,
+                            &settings.agent_cwd,
+                        );
+                        self.push_log("已切换到新会话").await;
+                    }
+                }
+                Err(err) => {
+                    self.push_log(&format!("新会话重试失败，保留原回复: {}", err))
+                        .await;
+                }
+            }
         }
 
         // 强制中文是 prompt 里的要求，模型有可能不遵守。这里只提醒不改写：

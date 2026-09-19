@@ -182,6 +182,52 @@ pub fn has_cjk(text: &str) -> bool {
         .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
 }
 
+/// 回复像不像「拒答 / 声明自己不是干这个的」。
+///
+/// 实测（2026-09-19）：Agent 会话是有记忆的。某次按编程助手身份拒绝之后，
+/// 这条拒绝会留在会话里；下次 `--resume` 同一会话，哪怕 prompt 已经明确写了
+/// 「你是替本人回消息的、寒暄属于职责」，它照样回
+/// 「我是 Qoder，一个软件工程助手。我不能代替你在钉钉里发消息」。
+/// 同一条 prompt 换新会话就正常回「在的，还没吃呢，你吃了没？」。
+/// 所以识别出这种回复时要用**新会话**重试一次，把会话里的惯性洗掉。
+pub fn looks_like_refusal(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        // 自我身份声明
+        "软件工程助手",
+        "我是 Qoder",
+        "我是Qoder",
+        "作为 AI",
+        "作为AI",
+        "我是一个 AI",
+        // 拒绝代回
+        "不能代替",
+        "无法代替",
+        "不能替你",
+        "不能扮演",
+        "不能帮你发",
+        "不能帮你回",
+        "无法帮你发",
+        "不适合代替",
+        // 推给别人
+        "超出了我的",
+        "超出我的",
+        "不在我的职责",
+        "不是我的职责",
+        "不负责这类",
+        "我不能参与",
+        "不能参与",
+        // 英文版本
+        "software engineering assistant",
+        "not the right tool",
+        "I'm not going to",
+        "I am not going to",
+        "I shouldn't be drafting",
+        "I can't impersonate",
+        "I cannot impersonate",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
 /// 生成摘要用的 prompt。要求保留关键事实且不得编造。
 pub fn build_summary_prompt(rows: &[(String, String)]) -> String {
     let transcript = rows
@@ -462,6 +508,52 @@ mod tests {
         assert!(prompt.contains("请回复对方这条消息"));
         assert!(!prompt.contains("只回一条"));
         assert!(prompt.ends_with("你好"));
+    }
+
+    /// 回归：这两种拒答都是真实抓到的原文（含修复后仍是中文版的拒绝）。
+    /// 识别不出来就会一直把拒绝发给对方。
+    #[test]
+    fn refusal_detection_catches_the_real_world_refusals() {
+        let real = [
+            "I'm a software engineering assistant, not the right tool for composing personal chat replies.",
+            "Same as before — I'm not going to draft replies to your personal chats.",
+            "我是 Qoder，一个软件工程助手。我不能代替你在钉钉里发消息或扮演你的角色。",
+            "我不负责这类问题，它超出了我的范围。",
+            "这个请求超出了我的职责范围，我不能参与。",
+        ];
+        for text in real {
+            assert!(
+                looks_like_refusal(text),
+                "这种拒答必须被识别出来: {}",
+                text
+            );
+        }
+    }
+
+    /// 正常的寒暄回复不能被误判成拒绝，否则会白白多跑一次生成、还会丢掉会话记忆。
+    #[test]
+    fn normal_greetings_are_not_treated_as_refusals() {
+        let normal = [
+            "在的，还没吃呢，你吃了没？",
+            "你好呀，吃过啦，你吃了吗？",
+            "收到，我看下再回你。",
+            "这个我不太清楚，帮你问下相关同事。",
+            "好，那明天上午十点会议室见。",
+        ];
+        for text in normal {
+            assert!(
+                !looks_like_refusal(text),
+                "正常回复不该被判成拒答: {}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn cjk_detection_flags_english_only_replies() {
+        assert!(has_cjk("在的，还没吃呢"));
+        assert!(!has_cjk("I'm not going to do that."));
+        assert!(has_cjk("ok，收到")); // 夹带英文但有中文，算通过
     }
 
     #[test]
