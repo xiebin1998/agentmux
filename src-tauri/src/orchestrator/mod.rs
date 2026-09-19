@@ -1438,23 +1438,28 @@ fn truncate(input: &str, max: usize) -> String {
 ///
 /// 两个名单都空 = 不限制（监听所有群、所有人）。只要指定了名单，命中其一就放行：
 /// - 群名单按**会话 id** 命中（群聊会话、单聊会话都能配）；
-/// - 人名单按**发送者 open id** 或**会话 id** 命中（前者来自历史发送人，后者来自会话列表里的单聊）。
+/// - 人名单按**发送者 open id** 或**会话 id** 命中（前者来自钉钉搜索或历史发送人，
+///   后者来自会话列表里的单聊）。
 ///
 /// 取并集而不是交集：指定「群 A + 人 B」表示 A 群和 B 人的消息都处理，
 /// 交集会让「同时属于指定群又是指定人」这种组合几乎永远不成立。
-pub fn event_in_scope(group_ids: &[String], member_ids: &[String], event: &ChatEvent) -> bool {
+pub fn event_in_scope(
+    group_ids: &[crate::project::ScopeEntry],
+    member_ids: &[crate::project::ScopeEntry],
+    event: &ChatEvent,
+) -> bool {
     if group_ids.is_empty() && member_ids.is_empty() {
         return true;
     }
     let conversation = event.conversation_id.as_str();
     if !conversation.is_empty()
-        && (group_ids.iter().any(|id| id == conversation)
-            || member_ids.iter().any(|id| id == conversation))
+        && (group_ids.iter().any(|entry| entry.id == conversation)
+            || member_ids.iter().any(|entry| entry.id == conversation))
     {
         return true;
     }
     let sender = event.sender_open_dingtalk_id.as_str();
-    !sender.is_empty() && member_ids.iter().any(|id| id == sender)
+    !sender.is_empty() && member_ids.iter().any(|entry| entry.id == sender)
 }
 
 /// 压缩某会话：调 Agent 生成摘要并落盘为最新一版。
@@ -1666,8 +1671,13 @@ mod tests {
             malformed: false,
             raw: String::new(),
         };
-        let ids = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let none: Vec<String> = Vec::new();
+        let ids = |items: &[&str]| {
+            items
+                .iter()
+                .map(|id| crate::project::ScopeEntry::new(*id, ""))
+                .collect::<Vec<_>>()
+        };
+        let none: Vec<crate::project::ScopeEntry> = Vec::new();
 
         assert!(
             event_in_scope(&none, &none, &event("cid-any", "open-9")),
@@ -1768,7 +1778,7 @@ mod tests {
             node.clone(),
             "agentmux-scope-dropped",
             ReplySettings {
-                group_ids: vec!["cid-not-listen".to_string()],
+                group_ids: vec![crate::project::ScopeEntry::new("cid-not-listen", "别的群")],
                 ..ReplySettings::default()
             },
         )
@@ -1778,7 +1788,7 @@ mod tests {
             node,
             "agentmux-scope-kept",
             ReplySettings {
-                member_ids: vec!["open-1".to_string()],
+                member_ids: vec![crate::project::ScopeEntry::new("open-1", "张同事")],
                 ..ReplySettings::default()
             },
         )

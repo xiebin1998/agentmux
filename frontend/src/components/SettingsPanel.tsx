@@ -424,29 +424,31 @@ function Shell({ children, onClose }: { children: ReactNode; onClose: () => void
         alignItems: "center",
         justifyContent: "center",
         zIndex: 1000,
+        overflow: "hidden",
       }}
     >
+      {/* 三段式：只有中间那块滚。整块弹窗滚的话，标题和 × 会被表单里的下拉顶出可视区。 */}
       <div
         style={{
+          display: "flex",
+          flexDirection: "column",
           backgroundColor: "var(--bg-elevated)",
           border: "1px solid var(--border)",
           borderRadius: "8px",
           width: "660px",
           maxHeight: "88vh",
-          overflow: "auto",
+          overflow: "hidden",
           boxShadow: "var(--shadow)",
         }}
       >
         <div
           style={{
+            flexShrink: 0,
             padding: "16px 20px",
             borderBottom: "1px solid var(--border)",
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
-            position: "sticky",
-            top: 0,
-            backgroundColor: "var(--bg-elevated)",
           }}
         >
           <h2 style={{ margin: 0, color: "var(--text-primary)", fontSize: "16px" }}>设置</h2>
@@ -464,7 +466,9 @@ function Shell({ children, onClose }: { children: ReactNode; onClose: () => void
             ×
           </button>
         </div>
-        <div style={{ padding: "20px" }}>{children}</div>
+        <div style={{ flex: 1, minHeight: 0, overflow: "auto", overscrollBehavior: "contain", padding: "20px" }}>
+          {children}
+        </div>
       </div>
     </div>
   );

@@ -72,17 +72,11 @@ pub struct ConversationMeta {
     pub name_known: bool,
 }
 
-/// 「指定群 / 指定人」的候选项：id 是会话 id 或 open id，name 只用于显示。
-#[derive(Debug, Clone, Serialize)]
-pub struct NamedId {
-    pub id: String,
-    pub name: String,
-}
-
+/// 「指定群 / 指定人」的候选项：id 是会话 id 或 open id，其余字段只用于显示。
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceCandidates {
-    pub groups: Vec<NamedId>,
-    pub people: Vec<NamedId>,
+    pub groups: Vec<crate::project::ScopeEntry>,
+    pub people: Vec<crate::project::ScopeEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,18 +299,18 @@ impl Storage {
     /// 建项目时「指定群 / 指定人」的候选名单。全部来自本地已有数据，不起 CLI 子进程。
     ///
     /// 人有两个来源：会话列表里的单聊（id 是会话 id）+ 历史事件的发送者（id 是 open id）。
-    /// 过滤时两者都能命中，所以这里都收进来。
+    /// 过滤时两者都能命中，所以这里都收进来。工号/职位本机没有，留给钉钉搜索补。
     pub fn source_candidates(&self) -> Result<SourceCandidates> {
         let mut stmt = self.db.prepare(
             "SELECT conversation_id, name FROM conversations
-             WHERE kind = ?1 AND conversation_id <> ''",
+             WHERE kind = ?1 AND conversation_id <> '' AND name <> ''",
         )?;
-        let mut collect = |kind: &str| -> Result<Vec<NamedId>> {
+        let mut collect = |kind: &str| -> Result<Vec<crate::project::ScopeEntry>> {
             let rows = stmt.query_map(params![kind], |row| {
-                Ok(NamedId {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                })
+                Ok(crate::project::ScopeEntry::new(
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         };
@@ -325,20 +319,20 @@ impl Storage {
         let mut people = collect("direct")?;
         let mut sender_stmt = self.db.prepare(
             "SELECT sender_open_dingtalk_id, sender FROM events
-             WHERE sender_open_dingtalk_id <> ''
+             WHERE sender_open_dingtalk_id <> '' AND sender <> ''
              GROUP BY sender_open_dingtalk_id",
         )?;
         let senders = sender_stmt.query_map([], |row| {
-            Ok(NamedId {
-                id: row.get(0)?,
-                name: row.get(1)?,
-            })
+            Ok(crate::project::ScopeEntry::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
         })?;
         for sender in senders {
             people.push(sender?);
         }
 
-        let dedupe = |mut items: Vec<NamedId>| {
+        let dedupe = |mut items: Vec<crate::project::ScopeEntry>| {
             items.sort_by(|a, b| a.name.cmp(&b.name));
             items.dedup_by(|a, b| a.id == b.id);
             items.retain(|item| !item.id.trim().is_empty());
@@ -348,6 +342,57 @@ impl Storage {
         people = dedupe(people);
 
         Ok(SourceCandidates { groups, people })
+    }
+
+    /// 按 id 反查名字：群查会话表、人查历史发送人。
+    ///
+    /// 用途是给**旧数据补显示名** —— 早期版本的范围名单只存了 id，
+    /// 打开编辑时不该只看到一个 id。查不到的就不返回，界面显示占位。
+    pub fn resolve_scope_names(&self, ids: &[String]) -> Result<Vec<crate::project::ScopeEntry>> {
+        let wanted: Vec<String> = ids
+            .iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; wanted.len()].join(",");
+        let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        let group_sql = format!(
+            "SELECT conversation_id, name FROM conversations
+             WHERE conversation_id IN ({}) AND name <> ''",
+            placeholders
+        );
+        let mut stmt = self.db.prepare(&group_sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(wanted.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, name) = row?;
+            found.insert(id, name);
+        }
+
+        let people_sql = format!(
+            "SELECT sender_open_dingtalk_id, sender FROM events
+             WHERE sender_open_dingtalk_id IN ({}) AND sender <> ''
+             GROUP BY sender_open_dingtalk_id",
+            placeholders
+        );
+        let mut stmt = self.db.prepare(&people_sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(wanted.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, name) = row?;
+            found.entry(id).or_insert(name);
+        }
+
+        Ok(found
+            .into_iter()
+            .map(|(id, name)| crate::project::ScopeEntry::new(id, name))
+            .collect())
     }
 
     /// 已知会话元的最近更新时间；界面据此判断要不要再拉一次。
@@ -999,6 +1044,44 @@ mod tests {
         assert_eq!(after[0].name, "客服一群");
         assert_eq!(storage.get_stats(Some("p1")).unwrap().conversations, 1);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 按 id 补名字：群的会话 id 与人的 open id 两种键都要能反查到。
+    #[test]
+    fn resolve_scope_names_fills_names_for_both_kinds() {
+        let dir = std::env::temp_dir().join("agentmux-resolve-scope-names-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir.clone()).unwrap();
+
+        storage
+            .upsert_conversations(&[meta("cid-group", "客服一群", "group")])
+            .unwrap();
+        storage
+            .save_event(&sample_event("msg-1", "cid-group", "p1"))
+            .unwrap();
+
+        let found = storage
+            .resolve_scope_names(&[
+                "cid-group".to_string(),
+                "open-other".to_string(),
+                "查不到的 id".to_string(),
+            ])
+            .unwrap();
+        let map: std::collections::HashMap<String, String> = found
+            .into_iter()
+            .map(|entry| (entry.id, entry.name))
+            .collect();
+
+        assert_eq!(map.get("cid-group").map(String::as_str), Some("客服一群"));
+        assert_eq!(
+            map.get("open-other").map(String::as_str),
+            Some("同事"),
+            "人的 open id 要能用历史发送人补出名字"
+        );
+        assert!(!map.contains_key("查不到的 id"), "查不到的不要编一个名字出来");
+
+        assert!(storage.resolve_scope_names(&[]).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

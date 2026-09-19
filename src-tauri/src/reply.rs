@@ -37,8 +37,8 @@ pub struct ReplySettings {
     /// 压缩只按占比判定（自适应），字符阈值退成没有基线时的兜底。
     pub compress_trigger_percent: Option<u8>,
     /// 监听范围：只处理这些群的会话 / 这些人的消息。两个都空 = 不限制。
-    pub group_ids: Vec<String>,
-    pub member_ids: Vec<String>,
+    pub group_ids: Vec<crate::project::ScopeEntry>,
+    pub member_ids: Vec<crate::project::ScopeEntry>,
 }
 
 impl Default for ReplySettings {

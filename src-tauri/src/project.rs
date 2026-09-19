@@ -3,6 +3,33 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// 监听范围里的一个条目：`id` 用于过滤，其余字段只用于显示。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScopeEntry {
+    /// 群的会话 id，或人的 open id。
+    pub id: String,
+    /// 群名 / 姓名。老数据可能只有 id、没名字，界面先显示占位再补。
+    #[serde(default)]
+    pub name: String,
+    /// 工号（人）。群为空。
+    #[serde(default)]
+    pub code: String,
+    /// 区分信息：群是「42人」，人是职位。重名时靠它区分。
+    #[serde(default)]
+    pub extra: String,
+}
+
+impl ScopeEntry {
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            code: String::new(),
+            extra: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -20,10 +47,10 @@ pub struct Project {
     pub context_max_chars: usize,
     /// 监听范围：只处理这些群（会话 id）。空 = 不限群。
     #[serde(default)]
-    pub group_ids: Vec<String>,
+    pub group_ids: Vec<ScopeEntry>,
     /// 监听范围：只处理这些人（open id，或单聊的会话 id）。空 = 不限人。
     #[serde(default)]
-    pub member_ids: Vec<String>,
+    pub member_ids: Vec<ScopeEntry>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -65,12 +92,60 @@ const SELECT_COLUMNS: &str = "id, name, work_dir, agent_cli_path, dingtalk_cli_p
     context_enabled, context_message_limit, context_max_chars, created_at, updated_at,
     group_ids, member_ids";
 
-/// 名单列存的是 JSON 数组文本；解析失败按空名单处理（不限制）。
-fn parse_ids(raw: String) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+/// 名单列存的是 JSON 数组文本。兼容两种历史形态：
+/// - 旧：`["cid-1"]`（只有 id，没名字）→ 补成只有 id 的条目；
+/// - 新：`[{"id":"cid-1","name":"客服一群"}]`。
+/// 解析失败按空名单处理（不限制范围）。
+fn parse_ids(raw: String) -> Vec<ScopeEntry> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = match item {
+                serde_json::Value::String(id) => id.trim().to_string(),
+                serde_json::Value::Object(map) => map
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                _ => return None,
+            };
+            if id.is_empty() {
+                return None;
+            }
+            if let serde_json::Value::Object(map) = item {
+                return Some(ScopeEntry {
+                    id,
+                    name: map
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    code: map
+                        .get("code")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    extra: map
+                        .get("extra")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+            Some(ScopeEntry::new(id, ""))
+        })
+        .collect()
 }
 
-fn ids_to_json(ids: &[String]) -> String {
+fn ids_to_json(ids: &[ScopeEntry]) -> String {
     serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -240,8 +315,8 @@ pub async fn create_project(
     dingtalk_cli_path: String,
     im_platform: Option<String>,
     agent_platform: Option<String>,
-    group_ids: Option<Vec<String>>,
-    member_ids: Option<Vec<String>>,
+    group_ids: Option<Vec<ScopeEntry>>,
+    member_ids: Option<Vec<ScopeEntry>>,
 ) -> Result<Project, String> {
     let data_dir = crate::config::data_dir();
     let store = ProjectStore::new(data_dir).map_err(|e| e.to_string())?;
@@ -286,4 +361,56 @@ pub async fn delete_project(id: String) -> Result<(), String> {
     let data_dir = crate::config::data_dir();
     let store = ProjectStore::new(data_dir).map_err(|e| e.to_string())?;
     store.delete(&id).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 早期的范围名单只存了 id（`["cid-1"]`），新格式存对象。
+    /// 两种都要能读：旧数据不能因为升级就变成空范围（那会让过滤静默失效）。
+    #[test]
+    fn scope_ids_parse_both_legacy_and_new_shape() {
+        let legacy = parse_ids(r#"["cid-1","open-2"]"#.to_string());
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(legacy[0].id, "cid-1");
+        assert!(legacy[0].name.is_empty(), "旧数据没有名字，等界面去补");
+
+        let current = parse_ids(
+            r#"[{"id":"cid-1","name":"客服一群","extra":"42人"},{"id":"open-2","name":"张三","code":"53716","extra":"工程师"}]"#
+                .to_string(),
+        );
+        assert_eq!(current[0].name, "客服一群");
+        assert_eq!(current[0].extra, "42人");
+        assert_eq!(current[1].code, "53716");
+        assert_eq!(current[1].extra, "工程师");
+    }
+
+    /// 脏数据不能让整个名单变成空：坏条目丢掉，好条目留着。
+    #[test]
+    fn scope_ids_skip_junk_without_losing_the_rest() {
+        let parsed = parse_ids(r#"["cid-1",{"name":"没有 id"},"",42,null]"#.to_string());
+        assert_eq!(parsed.len(), 1, "实际解析: {:?}", parsed);
+        assert_eq!(parsed[0].id, "cid-1");
+
+        assert!(parse_ids("不是 json".to_string()).is_empty());
+        assert!(parse_ids("{}".to_string()).is_empty());
+    }
+
+    /// 存回去的是对象数组，读回来要等价。
+    #[test]
+    fn scope_ids_round_trip() {
+        let entries = vec![
+            ScopeEntry {
+                id: "cid-1".to_string(),
+                name: "客服一群".to_string(),
+                code: String::new(),
+                extra: "42人".to_string(),
+            },
+            ScopeEntry::new("open-2", "张三"),
+        ];
+        let json = ids_to_json(&entries);
+        assert!(json.starts_with("[{"), "新格式应是对象数组: {}", json);
+        assert_eq!(parse_ids(json), entries);
+    }
 }

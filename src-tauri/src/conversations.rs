@@ -15,6 +15,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
+use crate::project::ScopeEntry;
 use crate::storage::ConversationMeta;
 
 /// 一次最多拉多久以前的会话。窗口越大翻页越多、越慢，默认 24 小时足够覆盖
@@ -74,6 +75,182 @@ fn normalize_kind(raw: Option<&str>) -> String {
     }
 }
 
+/// 统一跑一次 dws：隐藏控制台 + 超时 + 失败时把 stderr 摘要带回来。
+async fn run_dws(dws_path: &str, args: &[&str], timeout_secs: u64) -> anyhow::Result<String> {
+    let mut command = tokio::process::Command::new(dws_path);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::process::hide_console(&mut command);
+
+    let child = command.spawn()?;
+    let output = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+        .await
+    {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!("dws {} 超时（{}s）", args.join(" "), timeout_secs),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "dws {} 失败 code={:?}: {}",
+            args.join(" "),
+            output.status.code(),
+            stderr.trim().chars().take(200).collect::<String>()
+        );
+    }
+    Ok(stdout)
+}
+
+/// 解析 `dws chat +chat-search` 的输出：按群名搜群。
+///
+/// 实测形状（2026-09-19）：
+/// ```json
+/// {"chats":[{"name":"四海饭堂沟通群","openConversationId":"cidoMkZ...==","memberCount":392}]}
+/// ```
+/// **没有名字的候选直接丢掉**：界面上只显示名字，没名字的条目选不出来也说不清是谁。
+pub fn parse_group_search(stdout: &str) -> Vec<ScopeEntry> {
+    let Some(start) = stdout.find('{') else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&stdout[start..]) else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("chats").and_then(|chats| chats.as_array()) else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = item
+                .get("openConversationId")
+                .and_then(|id| id.as_str())?
+                .trim()
+                .to_string();
+            let name = item
+                .get("name")
+                .and_then(|name| name.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if id.is_empty() || name.is_empty() {
+                return None;
+            }
+            let members = item.get("memberCount").and_then(|count| count.as_i64());
+            Some(ScopeEntry {
+                id,
+                name,
+                code: String::new(),
+                extra: members
+                    .filter(|count| *count > 0)
+                    .map(|count| format!("{}人", count))
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// 解析 `dws contact +search-user` 的输出：按姓名 / 工号搜人。
+///
+/// 实测形状（2026-09-19）：
+/// ```json
+/// {"data":{"users":[{"name":"谢斌","openDingTalkId":"Dq4c2...","userId":"53716",
+///                    "title":"软件开发副高级工程师"}]}}
+/// ```
+/// `openDingTalkId` 就是事件里的 `sender_open_dingtalk_id`，能直接用于过滤。
+/// 外部联系人可能只有 `openDingTalkId`、没有姓名 —— 按用户要求直接不列。
+pub fn parse_people_search(stdout: &str) -> Vec<ScopeEntry> {
+    let Some(start) = stdout.find('{') else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&stdout[start..]) else {
+        return Vec::new();
+    };
+    let Some(items) = value
+        .get("data")
+        .and_then(|data| data.get("users"))
+        .and_then(|users| users.as_array())
+    else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = item
+                .get("openDingTalkId")
+                .and_then(|id| id.as_str())?
+                .trim()
+                .to_string();
+            let name = item
+                .get("name")
+                .and_then(|name| name.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if id.is_empty() || name.is_empty() {
+                return None;
+            }
+            Some(ScopeEntry {
+                id,
+                name,
+                code: item
+                    .get("userId")
+                    .and_then(|code| code.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                extra: item
+                    .get("title")
+                    .and_then(|title| title.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// 按关键词搜群（`dws chat +chat-search`）。
+pub async fn search_groups(
+    dws_path: &str,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<ScopeEntry>> {
+    let limit = limit.clamp(1, 100).to_string();
+    let stdout = run_dws(
+        dws_path,
+        &[
+            "chat",
+            "+chat-search",
+            "--query",
+            query,
+            "--limit",
+            &limit,
+            "-f",
+            "json",
+        ],
+        60,
+    )
+    .await?;
+    Ok(parse_group_search(&stdout))
+}
+
+/// 按姓名 / 工号搜人（`dws contact +search-user`）。
+pub async fn search_people(dws_path: &str, query: &str) -> anyhow::Result<Vec<ScopeEntry>> {
+    let stdout = run_dws(
+        dws_path,
+        &["contact", "+search-user", "--query", query, "-f", "json"],
+        60,
+    )
+    .await?;
+    Ok(parse_people_search(&stdout))
+}
+
 /// 拉一次会话列表。`dws_path` 是解析出来的可执行文件路径。
 pub async fn fetch_conversation_meta(
     dws_path: &str,
@@ -82,36 +259,21 @@ pub async fn fetch_conversation_meta(
     let end = chrono::Local::now();
     let start = end - chrono::Duration::hours(lookback_hours.max(1));
 
-    let mut command = tokio::process::Command::new(dws_path);
-    command
-        .arg("chat")
-        .arg("+recent-conversations")
-        .arg("--start")
-        .arg(start.format("%Y-%m-%d %H:%M:%S").to_string())
-        .arg("--end")
-        .arg(end.format("%Y-%m-%d %H:%M:%S").to_string())
-        .arg("-f")
-        .arg("json")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    crate::process::hide_console(&mut command);
-
-    let child = command.spawn()?;
-    let output = match tokio::time::timeout(Duration::from_secs(120), child.wait_with_output()).await
-    {
-        Ok(result) => result?,
-        Err(_) => anyhow::bail!("拉取会话列表超时（120s）"),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "拉取会话列表失败 code={:?}: {}",
-            output.status.code(),
-            stderr.trim().chars().take(200).collect::<String>()
-        );
-    }
+    let stdout = run_dws(
+        dws_path,
+        &[
+            "chat",
+            "+recent-conversations",
+            "--start",
+            &start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "--end",
+            &end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "-f",
+            "json",
+        ],
+        120,
+    )
+    .await?;
 
     Ok(parse_recent_conversations(&stdout))
 }
@@ -169,5 +331,49 @@ mod tests {
 
         assert!(parse_recent_conversations("not json at all").is_empty());
         assert!(parse_recent_conversations("").is_empty());
+    }
+
+    /// 真实抓到的 `dws chat +chat-search --query 饭堂` 输出（2026-09-19 实测）。
+    const REAL_GROUP_SEARCH: &str = r#"{"chats":[{"channel":false,"createAt":"2026-03-05 08:14:43","extension":{"newCSpaceIdIM":"27331702980"},"groupType":"INTERNAL_GROUP","memberCount":392,"name":"四海饭堂沟通群","openConversationId":"cidoMkZ/4lcHQDv2mtKAOWgZQ==","ownerOpenDingtalkId":"DYqlNTWfxxDOZgWSQK78dCw2QKNgrgRiPK","title":"四海饭堂沟通群"},{"memberCount":0,"name":"","openConversationId":"cid-noname=="}],"complete":true,"count":2}"#;
+
+    /// 真实抓到的 `dws contact +search-user --query 谢斌` 输出（2026-09-19 实测）。
+    /// 关键是 `openDingTalkId`——事件里的 `sender_open_dingtalk_id` 就是它。
+    const REAL_PEOPLE_SEARCH: &str = r#"{"ok":true,"outcome":"success","data":{"count":2,"users":[{"name":"谢斌","openDingTalkId":"Dq4c2eHMKEFlaF0M2ytLiiSyB1vJGJiPK5t","title":"软件开发副高级工程师","userId":"53716"}]}}"#;
+
+    /// 外部联系人只回标识、没有姓名（实测胡汉吟如此）。
+    const REAL_PEOPLE_SEARCH_WITHOUT_NAME: &str =
+        r#"{"ok":true,"outcome":"success","data":{"count":1,"users":[{"openDingTalkId":"Dq4c2eHMKEFm5bLn6VrDO6M2naVkkDKPC"}]}}"#;
+
+    #[test]
+    fn parses_group_search_with_name_and_member_count() {
+        let found = parse_group_search(REAL_GROUP_SEARCH);
+
+        assert_eq!(found.len(), 1, "没名字的群候选要丢掉");
+        assert_eq!(found[0].id, "cidoMkZ/4lcHQDv2mtKAOWgZQ==");
+        assert_eq!(found[0].name, "四海饭堂沟通群", "界面显示的就是群名");
+        assert_eq!(found[0].extra, "392人", "人数用于同名群之间区分");
+        assert!(found[0].code.is_empty(), "群没有工号");
+    }
+
+    #[test]
+    fn parses_people_search_with_code_and_title() {
+        let noisy = format!("正在查询通讯录…\n{}", REAL_PEOPLE_SEARCH);
+        let found = parse_people_search(&noisy);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "Dq4c2eHMKEFlaF0M2ytLiiSyB1vJGJiPK5t");
+        assert_eq!(found[0].name, "谢斌");
+        assert_eq!(found[0].code, "53716", "工号");
+        assert_eq!(found[0].extra, "软件开发副高级工程师", "职位用于同名区分");
+    }
+
+    #[test]
+    fn people_without_a_name_are_dropped() {
+        assert!(
+            parse_people_search(REAL_PEOPLE_SEARCH_WITHOUT_NAME).is_empty(),
+            "只有 openDingTalkId 的外部联系人按用户要求直接不列"
+        );
+        assert!(parse_people_search("").is_empty());
+        assert!(parse_group_search("not json").is_empty());
     }
 }

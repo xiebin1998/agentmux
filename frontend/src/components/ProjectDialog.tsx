@@ -2,7 +2,7 @@ import { useEffect, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import PlatformCliPicker, { type CliSelection } from "./PlatformCliPicker";
-import type { NamedId, Project, SourceCandidates } from "../types";
+import type { Project, ScopeEntry, SourceCandidates } from "../types";
 
 interface ProjectDialogProps {
   project: Project | null;
@@ -36,8 +36,8 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
   const [contextEnabled, setContextEnabled] = useState(true);
   const [contextLimit, setContextLimit] = useState(50);
   const [contextMaxChars, setContextMaxChars] = useState(8000);
-  const [groupIds, setGroupIds] = useState<string[]>([]);
-  const [memberIds, setMemberIds] = useState<string[]>([]);
+  const [groupIds, setGroupIds] = useState<ScopeEntry[]>([]);
+  const [memberIds, setMemberIds] = useState<ScopeEntry[]>([]);
   const [candidates, setCandidates] = useState<SourceCandidates>({ groups: [], people: [] });
   const [loadingCandidates, setLoadingCandidates] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -57,6 +57,33 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
     }
   };
 
+  /** 去钉钉按关键词搜群 / 搜人（显式动作，点按钮才调用）。 */
+  const searchScope = (kind: "group" | "member", query: string) =>
+    invoke<ScopeEntry[]>("search_scope_candidates", { kind, query });
+
+  /**
+   * 老数据只存了 id，没有名字和工号。用本机库（会话名 / 历史发送人）补一下，
+   * 否则打开编辑时只能看到一串 id —— 正是这次要消掉的东西。
+   */
+  const fillMissingNames = async (entries: ScopeEntry[]) => {
+    const missing = entries.filter((entry) => !entry.name.trim());
+    if (missing.length === 0) {
+      return entries;
+    }
+    try {
+      const found = await invoke<ScopeEntry[]>("resolve_scope_names", {
+        ids: missing.map((entry) => entry.id),
+      });
+      const names = new Map(found.map((entry) => [entry.id, entry.name]));
+      return entries.map((entry) =>
+        entry.name.trim() ? entry : { ...entry, name: names.get(entry.id) ?? "" },
+      );
+    } catch (e) {
+      console.error("Failed to resolve scope names:", e);
+      return entries;
+    }
+  };
+
   useEffect(() => {
     loadCandidates(false);
   }, []);
@@ -73,14 +100,23 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
     setContextEnabled(project.context_enabled);
     setContextLimit(project.context_message_limit);
     setContextMaxChars(project.context_max_chars);
-    setGroupIds(project.group_ids ?? []);
-    setMemberIds(project.member_ids ?? []);
     if (project.dingtalk_cli_path) {
       setImSelection({ platform: project.im_platform || "dingtalk", path: project.dingtalk_cli_path });
     }
     if (project.agent_cli_path) {
       setAgentSelection({ platform: project.agent_platform || "qoder", path: project.agent_cli_path });
     }
+    // 范围条目异步补名，补完再落进表单状态。
+    const groups = project.group_ids ?? [];
+    const members = project.member_ids ?? [];
+    setGroupIds(groups);
+    setMemberIds(members);
+    Promise.all([fillMissingNames(groups), fillMissingNames(members)]).then(
+      ([nextGroups, nextMembers]) => {
+        setGroupIds(nextGroups);
+        setMemberIds(nextMembers);
+      },
+    );
   }, [project]);
 
   const handleSubmit = async () => {
@@ -154,21 +190,27 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
         alignItems: "center",
         justifyContent: "center",
         zIndex: 1000,
+        overflow: "hidden",
       }}
     >
+      {/* 三段式：只有中间的表单区滚。整块弹窗滚的话，表单里的下拉一打开
+          就会把标题、× 和底部按钮顶出可视区。 */}
       <div
         style={{
+          display: "flex",
+          flexDirection: "column",
           backgroundColor: "var(--bg-elevated)",
           border: "1px solid var(--border)",
           borderRadius: "8px",
           width: "560px",
           maxHeight: "85vh",
-          overflow: "auto",
+          overflow: "hidden",
           boxShadow: "var(--shadow)",
         }}
       >
         <div
           style={{
+            flexShrink: 0,
             padding: "16px 20px",
             borderBottom: "1px solid var(--border)",
             display: "flex",
@@ -194,7 +236,15 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
           </button>
         </div>
 
-        <div style={{ padding: "20px" }}>
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflow: "auto",
+            overscrollBehavior: "contain",
+            padding: "20px",
+          }}
+        >
           <div style={{ marginBottom: "16px" }}>
             <label style={fieldLabel}>项目名称 *</label>
             <input
@@ -291,24 +341,30 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
             <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "10px" }}>
               都不选 = 监听<strong>所有群、所有人</strong>。选了之后只处理命中的消息：命中「指定的群」
               <strong>或</strong>「指定的人」其一即可，其余消息在落盘前就被丢弃
-              （可在「监听日志」里看到丢弃记录）。候选来自本机已有的会话与历史发送人。
+              （可在「监听日志」里看到丢弃记录）。下面先给本机已有记录，也可按名字去钉钉搜。
             </div>
 
             <div style={{ display: "flex", gap: "16px", alignItems: "flex-start" }}>
-              <IdPicker
+              <ScopePicker
                 title="指定群"
+                kind="group"
                 options={candidates.groups}
                 selected={groupIds}
                 loading={loadingCandidates}
-                placeholder="也可手输群会话 id"
+                placeholder="粘贴会话 id"
+                searchPlaceholder="搜群名，如：客服"
+                onSearch={(query) => searchScope("group", query)}
                 onChange={setGroupIds}
               />
-              <IdPicker
+              <ScopePicker
                 title="指定人"
+                kind="member"
                 options={candidates.people}
                 selected={memberIds}
                 loading={loadingCandidates}
-                placeholder="也可手输 open id"
+                placeholder="粘贴 open id"
+                searchPlaceholder="搜姓名或工号"
+                onSearch={(query) => searchScope("member", query)}
                 onChange={setMemberIds}
               />
             </div>
@@ -332,7 +388,7 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
                   cursor: loadingCandidates ? "not-allowed" : "pointer",
                 }}
               >
-                {loadingCandidates ? "刷新中…" : "刷新候选（拉一次会话名）"}
+                {loadingCandidates ? "刷新中…" : "刷新本机候选（拉一次会话名）"}
               </button>
             </div>
           </div>
@@ -452,38 +508,48 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
               </div>
             </div>
           </div>
+        </div>
 
-          <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
-            <button
-              onClick={onClose}
-              style={{
-                padding: "8px 16px",
-                backgroundColor: "transparent",
-                color: "var(--text-secondary)",
-                border: "1px solid var(--border)",
-                borderRadius: "4px",
-                cursor: "pointer",
-                fontSize: "13px",
-              }}
-            >
-              取消
-            </button>
-            <button
-              onClick={handleSubmit}
-              disabled={saving}
-              style={{
-                padding: "8px 16px",
-                backgroundColor: saving ? "var(--text-muted)" : "var(--accent)",
-                color: "var(--accent-contrast)",
-                border: "none",
-                borderRadius: "4px",
-                cursor: saving ? "not-allowed" : "pointer",
-                fontSize: "13px",
-              }}
-            >
-              {saving ? "保存中…" : "保存"}
-            </button>
-          </div>
+        {/* 底部操作固定在弹窗外壳上：不必把表单滚到底才能点 */}
+        <div
+          style={{
+            flexShrink: 0,
+            display: "flex",
+            gap: "8px",
+            justifyContent: "flex-end",
+            padding: "12px 20px",
+            borderTop: "1px solid var(--border)",
+          }}
+        >
+          <button
+            onClick={onClose}
+            style={{
+              padding: "8px 16px",
+              backgroundColor: "transparent",
+              color: "var(--text-secondary)",
+              border: "1px solid var(--border)",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontSize: "13px",
+            }}
+          >
+            取消
+          </button>
+          <button
+            onClick={handleSubmit}
+            disabled={saving}
+            style={{
+              padding: "8px 16px",
+              backgroundColor: saving ? "var(--text-muted)" : "var(--accent)",
+              color: "var(--accent-contrast)",
+              border: "none",
+              borderRadius: "4px",
+              cursor: saving ? "not-allowed" : "pointer",
+              fontSize: "13px",
+            }}
+          >
+            {saving ? "保存中…" : "保存"}
+          </button>
         </div>
       </div>
     </div>
@@ -491,55 +557,154 @@ export default function ProjectDialog({ project, onClose, onSaved }: ProjectDial
 }
 
 /**
- * 「指定群 / 指定人」的选择器：候选勾选 + 手输 id 兜底。
- * 手输是必要的：首次使用还没有任何会话记录时，候选是空的。
+ * 「指定群 / 指定人」的选择器。
+ *
+ * 默认列本机已有的记录（会话列表 + 历史发送人），也可以按名字去钉钉搜：
+ * 搜群名走 `chat +chat-search`，搜人走 `contact +search-user`（姓名或工号都行）。
+ * 搜索是**显式动作** —— 只有点「搜索」才起 dws 子进程。
+ *
+ * 列表只显示名字（群还带人数、人还带工号和职位），**不显示 id**；id 放在悬停提示里备查。
+ * 手输框保留，用于粘贴 id 兜底（首次使用、或本机与钉钉都搜不到时）。
  */
-function IdPicker({
+function ScopePicker({
   title,
+  kind,
   options,
   selected,
   loading,
   placeholder,
+  searchPlaceholder,
+  onSearch,
   onChange,
 }: {
   title: string;
-  options: NamedId[];
-  selected: string[];
+  kind: "group" | "member";
+  options: ScopeEntry[];
+  selected: ScopeEntry[];
   loading: boolean;
   placeholder: string;
-  onChange: (next: string[]) => void;
+  searchPlaceholder: string;
+  onSearch: (query: string) => Promise<ScopeEntry[]>;
+  onChange: (next: ScopeEntry[]) => void;
 }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<ScopeEntry[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const has = (id: string) => selected.includes(id);
 
-  const toggle = (id: string) =>
-    onChange(has(id) ? selected.filter((item) => item !== id) : [...selected, id]);
+  const isSelected = (id: string) => selected.some((entry) => entry.id === id);
+  const toggle = (entry: ScopeEntry) =>
+    onChange(
+      isSelected(entry.id)
+        ? selected.filter((item) => item.id !== entry.id)
+        : [...selected, entry],
+    );
+
+  const runSearch = async () => {
+    const keyword = query.trim();
+    if (!keyword || searching) return;
+    setSearching(true);
+    setNotice(null);
+    try {
+      const found = await onSearch(keyword);
+      setResults(found);
+      setNotice(
+        found.length === 0
+          ? `钉钉里没搜到「${keyword}」相关的${kind === "group" ? "群" : "人"}`
+          : null,
+      );
+    } catch (e) {
+      setNotice(String(e));
+    } finally {
+      setSearching(false);
+    }
+  };
 
   const add = () => {
     const id = draft.trim();
     if (!id) return;
-    if (!has(id)) onChange([...selected, id]);
+    if (!isSelected(id)) {
+      onChange([...selected, { id, name: "", code: "", extra: "" }]);
+    }
     setDraft("");
   };
 
-  // 已选但不在候选里的（手输的、或候选刷新后消失的）也要显示，否则删不掉。
-  const extras = selected.filter((id) => !options.some((option) => option.id === id));
+  const shown = results ?? options;
+  const shownIds = new Set(shown.map((entry) => entry.id));
+  // 已选但不在当前列表里的（旧数据、或不是这次搜索的结果）也要显示，否则删不掉。
+  const extras = selected.filter((entry) => !shownIds.has(entry.id));
 
-  const idStyle: CSSProperties = {
-    color: "var(--text-muted)",
-    fontFamily: "ui-monospace, Consolas, monospace",
-    fontSize: "10px",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
+  const rowStyle: CSSProperties = {
+    display: "flex",
+    gap: "6px",
+    alignItems: "baseline",
+    fontSize: "12px",
+    padding: "2px 0",
+    cursor: "pointer",
   };
+  const metaStyle: CSSProperties = { color: "var(--text-muted)", fontSize: "10px" };
+
+  const renderRow = (entry: ScopeEntry, manual = false) => (
+    <label
+      key={entry.id}
+      // id 只放在悬停提示里，列表上不显示
+      title={entry.id}
+      style={rowStyle}
+    >
+      <input
+        type="checkbox"
+        checked={isSelected(entry.id)}
+        onChange={() => toggle(entry)}
+        style={{ accentColor: "var(--accent)" }}
+      />
+      <span style={{ color: "var(--text-primary)" }}>
+        {entry.name || "(名称未知)"}
+        {manual && <span style={metaStyle}> · 已选</span>}
+      </span>
+      {entry.code && <span style={metaStyle}>工号 {entry.code}</span>}
+      {entry.extra && <span style={metaStyle}>{entry.extra}</span>}
+    </label>
+  );
 
   return (
     <div style={{ flex: 1, minWidth: 0 }}>
       <label style={fieldLabel}>{title}</label>
+
+      <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              runSearch();
+            }
+          }}
+          placeholder={searchPlaceholder}
+          style={{ flex: 1, minWidth: 0, padding: "4px 8px", fontSize: "12px" }}
+        />
+        <button
+          type="button"
+          onClick={runSearch}
+          disabled={searching || !query.trim()}
+          style={{
+            padding: "4px 10px",
+            fontSize: "12px",
+            backgroundColor: searching ? "var(--bg-active)" : "var(--accent)",
+            color: "var(--accent-contrast)",
+            border: "none",
+            borderRadius: "4px",
+            cursor: searching || !query.trim() ? "not-allowed" : "pointer",
+          }}
+        >
+          {searching ? "搜索中…" : "搜索"}
+        </button>
+      </div>
+
       <div
         style={{
-          maxHeight: "120px",
+          maxHeight: "130px",
           overflow: "auto",
           border: "1px solid var(--border)",
           borderRadius: "4px",
@@ -547,61 +712,22 @@ function IdPicker({
           backgroundColor: "var(--bg-app)",
         }}
       >
-        {loading && options.length === 0 && (
+        {loading && shown.length === 0 && (
           <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>加载中…</div>
         )}
-        {!loading && options.length === 0 && extras.length === 0 && (
+        {shown.map((entry) => renderRow(entry))}
+        {extras.map((entry) => renderRow(entry, true))}
+        {!loading && shown.length === 0 && extras.length === 0 && (
           <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-            暂无可选记录，可在下面手输 id
+            本机还没有记录，可以按名字搜钉钉，或在下面直接粘贴 id
           </div>
         )}
-        {options.map((option) => (
-          <label
-            key={option.id}
-            title={option.id}
-            style={{
-              display: "flex",
-              gap: "6px",
-              alignItems: "baseline",
-              fontSize: "12px",
-              padding: "2px 0",
-              cursor: "pointer",
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={has(option.id)}
-              onChange={() => toggle(option.id)}
-              style={{ accentColor: "var(--accent)" }}
-            />
-            <span style={{ color: "var(--text-primary)" }}>{option.name || "(未命名)"}</span>
-            <span style={idStyle}>{option.id}</span>
-          </label>
-        ))}
-        {extras.map((id) => (
-          <label
-            key={id}
-            title={id}
-            style={{
-              display: "flex",
-              gap: "6px",
-              alignItems: "baseline",
-              fontSize: "12px",
-              padding: "2px 0",
-              cursor: "pointer",
-            }}
-          >
-            <input
-              type="checkbox"
-              checked
-              onChange={() => toggle(id)}
-              style={{ accentColor: "var(--accent)" }}
-            />
-            <span style={{ color: "var(--text-secondary)" }}>(手输)</span>
-            <span style={idStyle}>{id}</span>
-          </label>
-        ))}
       </div>
+
+      {notice && (
+        <div style={{ fontSize: "11px", color: "var(--warn)", marginTop: "4px" }}>{notice}</div>
+      )}
+
       <div style={{ display: "flex", gap: "6px", marginTop: "6px" }}>
         <input
           value={draft}
@@ -631,6 +757,28 @@ function IdPicker({
           添加
         </button>
       </div>
+
+      {results && (
+        <button
+          type="button"
+          onClick={() => {
+            setResults(null);
+            setNotice(null);
+          }}
+          style={{
+            marginTop: "4px",
+            padding: "0",
+            fontSize: "11px",
+            backgroundColor: "transparent",
+            color: "var(--text-muted)",
+            border: "none",
+            textDecoration: "underline",
+            cursor: "pointer",
+          }}
+        >
+          返回本机候选
+        </button>
+      )}
     </div>
   );
 }

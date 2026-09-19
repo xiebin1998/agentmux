@@ -337,6 +337,45 @@ pub async fn list_source_candidates(
     storage.source_candidates().map_err(|e| e.to_string())
 }
 
+/// 按关键词去钉钉搜「群」或「人」。
+///
+/// 这是**显式动作**：只有用户点「搜索」才会起 dws 子进程。
+/// `kind` 取 `group`（`dws chat +chat-search`）或 `member`（`dws contact +search-user`）。
+#[tauri::command]
+pub async fn search_scope_candidates(
+    kind: String,
+    query: String,
+) -> Result<Vec<crate::project::ScopeEntry>, String> {
+    let keyword = query.trim();
+    if keyword.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(dws_path) = crate::resolve::resolve_executable("dingtalk").await else {
+        return Err("没解析到 dws，无法搜索（可在「运行总览」点重新检测）".to_string());
+    };
+
+    match kind.as_str() {
+        "group" => crate::conversations::search_groups(&dws_path, keyword, 20)
+            .await
+            .map_err(|e| e.to_string()),
+        "member" => crate::conversations::search_people(&dws_path, keyword)
+            .await
+            .map_err(|e| e.to_string()),
+        other => Err(format!("未知的搜索类型: {}", other)),
+    }
+}
+
+/// 按 id 反查名字（群查会话表、人查历史发送人），给旧数据补上显示名。
+#[tauri::command]
+pub async fn resolve_scope_names(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<Vec<crate::project::ScopeEntry>, String> {
+    let storage = state.storage.lock().await;
+    storage.resolve_scope_names(&ids).map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 pub struct AgentSessionInfo {
     pub project_id: String,

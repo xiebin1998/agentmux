@@ -139,6 +139,8 @@ fn main() {
             commands::assign_conversation,
             commands::delete_conversation,
             commands::list_source_candidates,
+            commands::search_scope_candidates,
+            commands::resolve_scope_names,
             commands::reset_conversation,
             commands::conversation_session,
             // 运行期设置（按项目）
