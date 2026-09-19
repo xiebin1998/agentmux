@@ -164,8 +164,8 @@ pub struct CliCandidate {
     pub path: String,
     /// 来源：PATH / known（已知安装位置）。
     pub source: String,
-    /// 包装脚本（.cmd/.bat/.ps1/.sh/无扩展名）——不能不带 shell 直接 spawn。
-    pub is_wrapper: bool,
+    /// direct | via_cmd | unsupported —— 见 [`Launch`]。
+    pub launch_mode: String,
     pub version: Option<String>,
     pub auth_state: AuthState,
     pub detail: Option<String>,
@@ -180,8 +180,12 @@ pub struct PlatformCandidates {
 }
 
 impl PlatformCandidates {
+    /// 推荐路径只从**能启动**的候选里挑：unsupported 的选了也起不来。
     pub fn recommended_path(&self) -> Option<String> {
-        self.candidates.first().map(|c| c.path.clone())
+        self.candidates
+            .iter()
+            .find(|c| launch_kind(&c.path) != Launch::Unsupported)
+            .map(|c| c.path.clone())
     }
 }
 
@@ -201,15 +205,62 @@ fn windows_extensions() -> Vec<String> {
     exts
 }
 
-fn is_wrapper_path(path: &str) -> bool {
+/// 候选可执行文件在本机能否被直接启动。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launch {
+    /// 可直接 spawn（`.exe`）
+    Direct,
+    /// 需要 `cmd /C` 才能跑（`.cmd` / `.bat`）
+    ViaCmd,
+    /// 本机无法直接启动。
+    ///
+    /// `.ps1` 用 `cmd /C` **不会执行，而是被文件关联"打开"**（实测：会弹出
+    /// 编辑器/ISE）；无扩展名的 sh 脚本同理。这类候选**绝不 spawn**。
+    Unsupported,
+}
+
+impl Launch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Launch::Direct => "direct",
+            Launch::ViaCmd => "via_cmd",
+            Launch::Unsupported => "unsupported",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Launch::Direct => 0,
+            Launch::ViaCmd => 1,
+            Launch::Unsupported => 2,
+        }
+    }
+}
+
+pub fn launch_kind(path: &str) -> Launch {
     let ext = Path::new(path)
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase());
-    match ext {
-        Some(e) => matches!(e.as_str(), "cmd" | "bat" | "ps1" | "sh"),
-        // 无扩展名：多半是 sh 包装脚本（例如插件 cache 里的 dws）。
-        None => true,
+
+    #[cfg(windows)]
+    {
+        match ext.as_deref() {
+            Some("exe") => Launch::Direct,
+            Some("cmd") | Some("bat") => Launch::ViaCmd,
+            _ => Launch::Unsupported,
+        }
     }
+
+    #[cfg(not(windows))]
+    {
+        let _ = ext;
+        Launch::Direct
+    }
+}
+
+/// 非「可直接启动」的都算包装脚本，界面上要如实标注。
+pub fn is_wrapper_path(path: &str) -> bool {
+    launch_kind(path) != Launch::Direct
 }
 
 fn normalize(path: &str) -> String {
@@ -242,12 +293,15 @@ fn scan_path(name: &str) -> Vec<String> {
 }
 
 async fn probe_version(path: &str, args: &[&str]) -> Option<String> {
-    let mut command = if is_wrapper_path(path) && cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(path);
-        c
-    } else {
-        Command::new(path)
+    let mut command = match launch_kind(path) {
+        Launch::Direct => Command::new(path),
+        Launch::ViaCmd => {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(path);
+            c
+        }
+        // 绝不 spawn：`.ps1` 会被文件关联打开，无扩展名脚本也跑不起来。
+        Launch::Unsupported => return None,
     };
 
     command
@@ -286,12 +340,14 @@ async fn probe_version(path: &str, args: &[&str]) -> Option<String> {
 }
 
 async fn probe_auth(path: &str) -> AuthState {
-    let mut command = if is_wrapper_path(path) && cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(path);
-        c
-    } else {
-        Command::new(path)
+    let mut command = match launch_kind(path) {
+        Launch::Direct => Command::new(path),
+        Launch::ViaCmd => {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(path);
+            c
+        }
+        Launch::Unsupported => return AuthState::Unknown,
     };
 
     command
@@ -334,11 +390,11 @@ pub async fn list_platform(kind: CliKind) -> Vec<PlatformCandidates> {
                 return;
             }
             seen.push(key);
-            let is_wrapper = is_wrapper_path(&path);
+            let launch_mode = launch_kind(&path).as_str().to_string();
             candidates.push(CliCandidate {
                 path,
                 source: source.to_string(),
-                is_wrapper,
+                launch_mode,
                 version: None,
                 auth_state: AuthState::Unknown,
                 detail: None,
@@ -356,13 +412,20 @@ pub async fn list_platform(kind: CliKind) -> Vec<PlatformCandidates> {
             }
         }
 
-        // 真实可执行文件优先，其次是包装脚本。
-        candidates.sort_by_key(|c| c.is_wrapper);
+        // 能直接启动的优先，其次是 .cmd，无法启动的排最后。
+        candidates.sort_by_key(|c| launch_kind(&c.path).rank());
 
         for candidate in candidates.iter_mut() {
             candidate.version = probe_version(&candidate.path, spec.version_args).await;
             if candidate.version.is_none() {
-                candidate.detail = Some("无法获取版本（可能不可执行）".to_string());
+                candidate.detail = Some(
+                    match launch_kind(&candidate.path) {
+                        Launch::Unsupported => {
+                            "本机无法直接启动（.ps1 / 无扩展名脚本），未探测".to_string()
+                        }
+                        _ => "无法获取版本（可能不可执行）".to_string(),
+                    },
+                );
             }
             if spec.id == "dingtalk" {
                 candidate.auth_state = probe_auth(&candidate.path).await;
@@ -422,9 +485,9 @@ mod tests {
         );
 
         let best = &dingtalk.candidates[0];
-        assert!(
-            !best.is_wrapper,
-            "首选候选不应是包装脚本，实际选中的是 {}",
+        assert_eq!(
+            best.launch_mode, "direct",
+            "首选候选应可直接启动，实际选中的是 {}",
             best.path
         );
         assert!(best.version.is_some(), "首选候选应能取到版本号");
@@ -433,6 +496,50 @@ mod tests {
             AuthState::LoggedIn,
             "实测环境应为已登录"
         );
+    }
+
+    #[test]
+    fn launch_kind_classifies_windows_script_types() {
+        assert_eq!(launch_kind(r"C:\x\dws.exe"), Launch::Direct);
+        assert_eq!(launch_kind(r"C:\x\claude.cmd"), Launch::ViaCmd);
+        assert_eq!(launch_kind(r"C:\x\claude.bat"), Launch::ViaCmd);
+        // 这两类用 cmd /C 会被文件关联"打开"，绝不能当可执行文件对待
+        assert_eq!(launch_kind(r"C:\x\claude.ps1"), Launch::Unsupported);
+        assert_eq!(launch_kind(r"C:\x\bin\dws"), Launch::Unsupported);
+
+        assert!(!is_wrapper_path(r"C:\x\dws.exe"));
+        assert!(is_wrapper_path(r"C:\x\claude.cmd"));
+        assert!(is_wrapper_path(r"C:\x\claude.ps1"));
+    }
+
+    /// 回归：曾经对所有候选都跑 `cmd /C <path> --version`，导致 `.ps1`
+    /// 被文件关联打开、弹出编辑器。这类候选必须完全不 spawn。
+    #[tokio::test]
+    async fn script_wrappers_are_never_probed() {
+        for kind in [CliKind::Im, CliKind::Agent] {
+            for platform in list_platform(kind).await {
+                for candidate in platform.candidates {
+                    if launch_kind(&candidate.path) != Launch::Unsupported {
+                        continue;
+                    }
+                    assert!(
+                        candidate.version.is_none(),
+                        "不应探测无法启动的候选: {}",
+                        candidate.path
+                    );
+                    assert_eq!(candidate.auth_state, AuthState::Unknown);
+                    assert!(
+                        candidate
+                            .detail
+                            .as_deref()
+                            .unwrap_or_default()
+                            .contains("无法直接启动"),
+                        "应如实说明未探测的原因: {:?}",
+                        candidate.detail
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

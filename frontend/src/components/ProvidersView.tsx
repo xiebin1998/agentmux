@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 interface CliCandidate {
   path: string;
   source: string;
-  is_wrapper: boolean;
+  launch_mode: "direct" | "via_cmd" | "unsupported";
   version: string | null;
   auth_state: "logged_in" | "not_logged_in" | "unknown";
   detail: string | null;
@@ -263,10 +263,13 @@ function PlatformCard({
           <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "4px" }}>
             版本：{best.version ?? "未知（不显示推测值）"} · 来源：{best.source} · 候选{" "}
             {platform.candidates.length} 个
-            {best.is_wrapper && (
+            {best.launch_mode === "via_cmd" && (
+              <span style={{ color: "var(--warn)" }}> · 首选是包装脚本（经 cmd 启动）</span>
+            )}
+            {best.launch_mode === "unsupported" && (
               <span style={{ color: "var(--warn)" }}>
                 {" "}
-                · 首选是包装脚本，无法直接启动
+                · 首选本机无法直接启动（.ps1 / 脚本），请装 CLI 的 .exe 版本
               </span>
             )}
           </div>

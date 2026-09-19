@@ -4,7 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 export interface CliCandidate {
   path: string;
   source: string;
-  is_wrapper: boolean;
+  /** direct=可直接启动；via_cmd=需 cmd /C；unsupported=本机无法直接启动（.ps1 等） */
+  launch_mode: "direct" | "via_cmd" | "unsupported";
   version: string | null;
   auth_state: "logged_in" | "not_logged_in" | "unknown";
   detail: string | null;
@@ -59,16 +60,17 @@ export default function PlatformCliPicker({
       const result = await invoke<PlatformCandidates[]>("list_cli_platforms", { kind });
       setPlatforms(result);
 
-      // 默认选中第一个真实可执行文件，用户不需要手输路径。
-      const firstPlatform = result.find((p) => p.candidates.length > 0);
+      // 默认选中第一个**能启动**的候选，用户不需要手输路径。
+      const firstPlatform = result.find((p) =>
+        p.candidates.some((c) => c.launch_mode !== "unsupported"),
+      );
       if (firstPlatform) {
-        const stillValid =
-          value && firstPlatform.candidates.some((c) => c.path === value.path);
+        const stillValid = value && firstPlatform.candidates.some((c) => c.path === value.path);
         if (!stillValid) {
-          onChange({
-            platform: firstPlatform.platform_id,
-            path: firstPlatform.candidates[0].path,
-          });
+          const launchable = firstPlatform.candidates.find(
+            (c) => c.launch_mode !== "unsupported",
+          )!;
+          onChange({ platform: firstPlatform.platform_id, path: launchable.path });
         }
       } else {
         onChange(null);
@@ -162,6 +164,7 @@ export default function PlatformCliPicker({
                   const selected =
                     value?.platform === platform.platform_id && value?.path === candidate.path;
                   const badge = authBadge(candidate.auth_state);
+                  const unusable = candidate.launch_mode === "unsupported";
                   return (
                     <label
                       key={`${platform.platform_id}:${candidate.path}`}
@@ -170,15 +173,17 @@ export default function PlatformCliPicker({
                         alignItems: "flex-start",
                         gap: "8px",
                         padding: "8px 12px",
-                        cursor: "pointer",
+                        cursor: unusable ? "not-allowed" : "pointer",
                         borderBottom: "1px solid var(--border)",
                         backgroundColor: selected ? "var(--bg-active)" : "transparent",
+                        opacity: unusable ? 0.6 : 1,
                       }}
                     >
                       <input
                         type="radio"
                         name={`cli-${kind}`}
                         checked={selected}
+                        disabled={unusable}
                         onChange={() =>
                           onChange({ platform: platform.platform_id, path: candidate.path })
                         }
@@ -210,10 +215,13 @@ export default function PlatformCliPicker({
                               {candidate.version}
                             </span>
                           )}
-                          {candidate.is_wrapper && (
+                          {candidate.launch_mode === "unsupported" && (
                             <span style={{ color: "var(--warn)" }}>
-                              包装脚本（不能直接启动）
+                              本机无法直接启动（.ps1 / 脚本）
                             </span>
+                          )}
+                          {candidate.launch_mode === "via_cmd" && (
+                            <span style={{ color: "var(--warn)" }}>包装脚本（经 cmd 启动）</span>
                           )}
                           {kind === "im" && (
                             <span style={{ color: badge.color }}>{badge.label}</span>
