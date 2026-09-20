@@ -46,7 +46,52 @@ interface ConversationSummary {
 type ListenerUpdate =
   | { type: "status"; status: ListenerStatus }
   | { type: "event"; event: unknown }
-  | { type: "log"; listener_id: string; line: string };
+  | { type: "log"; listener_id: string; line: string }
+  | { type: "progress"; conversation_id: string; message_id: string; phase: ReplyPhase; text: string };
+
+/** 生成中的块：模型在想 / 在答。CLI 只给块级输出，所以这里是一段段攒起来的。 */
+type ReplyPhase = "thinking" | "answer";
+
+/** 某条消息正在生成时的增量文本。权威正文最终仍以落库事件为准，这里只管观感。 */
+export interface StreamingReply {
+  thinking: string;
+  answer: string;
+  /** 最后一次收到块的时刻，用来判断「还在生成」还是「已经卡住/结束」。 */
+  updatedAt: number;
+}
+
+/** 生成中的块最多留这么多条，超了丢最旧的 —— 不然连跑几天会一直涨。 */
+const MAX_STREAMING_ENTRIES = 50;
+
+/**
+ * 把到达的块追加进「正在生成」的字典。
+ *
+ * 后端一块一块推（CLI 没有逐 token 的开关），同一阶段的块用换行拼接，
+ * 这样界面上是多段浮现而不是糊成一行。
+ */
+function appendChunk(
+  prev: Record<string, StreamingReply>,
+  chunk: { message_id: string; phase: ReplyPhase; text: string },
+): Record<string, StreamingReply> {
+  const current = prev[chunk.message_id] ?? { thinking: "", answer: "", updatedAt: 0 };
+  const field = chunk.phase === "thinking" ? "thinking" : "answer";
+  const merged = current[field] ? `${current[field]}\n${chunk.text}` : chunk.text;
+
+  const next: Record<string, StreamingReply> = {
+    ...prev,
+    [chunk.message_id]: { ...current, [field]: merged, updatedAt: Date.now() },
+  };
+
+  const keys = Object.keys(next);
+  if (keys.length <= MAX_STREAMING_ENTRIES) {
+    return next;
+  }
+  const oldestFirst = keys.sort((a, b) => next[a].updatedAt - next[b].updatedAt);
+  for (const key of oldestFirst.slice(0, keys.length - MAX_STREAMING_ENTRIES)) {
+    delete next[key];
+  }
+  return next;
+}
 
 /** check_update 命令的返回。 */
 interface UpdateInfo {
@@ -86,6 +131,8 @@ function App() {
   const [view, setView] = useState<View>("overview");
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
+  /** 正在生成的块，按 message_id 归位（监听频道的 progress 分支往里追加）。 */
+  const [streamingByMessage, setStreamingByMessage] = useState<Record<string, StreamingReply>>({});
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [showCloseDialog, setShowCloseDialog] = useState(false);
@@ -293,6 +340,8 @@ function App() {
             }));
           } else if (message.type === "event") {
             setRefreshToken((token) => token + 1);
+          } else if (message.type === "progress") {
+            setStreamingByMessage((prev) => appendChunk(prev, message));
           }
         };
         await invoke<string>("start_listener", {
@@ -538,7 +587,16 @@ function App() {
 
           <div style={{ flex: 1, overflow: "hidden" }}>
             {selectedSession ? (
-              <MessageView session={selectedSession} />
+              <MessageView
+                session={selectedSession}
+                streamingByMessage={streamingByMessage}
+                onRefreshMeta={async () => {
+                  const count = await invoke<number>("refresh_conversation_meta");
+                  // 群名/单聊名可能变了，左侧树也要跟着显示新的。
+                  await loadSessions(await loadProjects());
+                  return `已同步 ${count} 个会话的名称与类型`;
+                }}
+              />
             ) : view === "overview" ? (
               <OverviewView projects={projects} />
             ) : view === "events" ? (

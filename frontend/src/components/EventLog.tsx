@@ -15,8 +15,6 @@ export interface EventRow {
   processed: boolean;
   reply_status: string | null;
   reply_text: string | null;
-  /** 本次回复的模型思考过程；没思考或还没回过就是 null */
-  reasoning: string | null;
 }
 
 interface ProjectOption {
@@ -413,26 +411,6 @@ export default function EventLog({ refreshToken, projects }: EventLogProps) {
                       >
                         <span style={{ color: "var(--text-muted)" }}>回复：</span>
                         {event.reply_text}
-                      </div>
-                    )}
-
-                    {/* 思考过程：没有就不渲染空块，别占位置 */}
-                    {event.reasoning && event.reasoning.trim() && (
-                      <div
-                        style={{
-                          marginTop: "6px",
-                          padding: "6px 8px",
-                          fontSize: "11px",
-                          color: "var(--text-muted)",
-                          backgroundColor: "var(--bg-app)",
-                          borderLeft: "2px solid var(--border)",
-                          borderRadius: "3px",
-                          whiteSpace: "pre-wrap",
-                          wordBreak: "break-word",
-                        }}
-                      >
-                        <span>思考过程：</span>
-                        {event.reasoning}
                       </div>
                     )}
 
