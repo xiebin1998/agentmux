@@ -15,6 +15,12 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
 tauri-plugin-dialog = "2.7.3"
 tauri-plugin-updater = "2"
+# xlsx 解析（应用侧把表格转成 CSV，好让只读的 Read 工具读得到）。
+# 关掉默认 feature：zip 的默认集包含 zstd/lzma/bzip2/aes 等一大堆编码器，
+# 只需要 deflate —— xlsx 实际用的就是它。后端必须显式选：只写 `deflate-flate2`
+# 时 flate2 没有任何 backend，会直接编译报错。
+zip = { version = "4.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+quick-xml = "0.42"
 
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }

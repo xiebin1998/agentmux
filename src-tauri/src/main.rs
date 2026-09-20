@@ -4,6 +4,7 @@ mod attachments;
 mod commands;
 mod config;
 mod conversations;
+mod ooxml;
 mod orchestrator;
 mod process;
 mod project;
