@@ -31,6 +31,10 @@ pub struct ReplySettings {
     /// 开了才能把思考存下来、在界面上看到；代价是**每条回复更慢**（实测一节思考几秒），
     /// 所以给开关。实测 `--thinking enabled` 还要求配 `--thinking-budget`，故用 adaptive。
     pub thinking_enabled: bool,
+    /// 收到消息后是否自动标为已读。
+    ///
+    /// **对方可见**：机器人一收到就读，对方会以为你一直在看手机。所以给开关。
+    pub auto_mark_read: bool,
     /// 权限放行档位。为空 = 完全不传、用 CLI 自己的默认行为。
     /// 取值是**归一化**的 `auto` / `no_ask` / `full`，由 [`permission_args`] 按平台翻译。
     pub permission_mode: Option<String>,
@@ -68,6 +72,7 @@ impl Default for ReplySettings {
             agent_model: None,
             reasoning_effort: None,
             thinking_enabled: true,
+            auto_mark_read: true,
             permission_mode: None,
             reply_batch_window_ms: crate::config::DEFAULT_REPLY_BATCH_WINDOW_MS,
             agent_cwd: String::new(),

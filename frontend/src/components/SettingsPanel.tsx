@@ -23,6 +23,8 @@ interface AppConfig {
   reply_batch_window_ms?: number | null;
   /** 是否让模型输出思考过程 */
   thinking_enabled?: boolean | null;
+  /** 收到消息后是否自动标为已读 */
+  auto_mark_read?: boolean | null;
   reply_enabled: boolean;
   reply_timeout_ms: number;
   reply_max_chars: number;
@@ -390,6 +392,28 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
           开着才能在「事件与回复」里点开某条消息看到它的思考过程。
           <strong>关掉看不到思考，但每条回复更快</strong>。
           注意思考是<strong>整段出现</strong>的，不是逐字流式（CLI 没有逐字输出能力）。
+        </div>
+
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            fontSize: "13px",
+            marginTop: "12px",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={config.auto_mark_read ?? true}
+            onChange={(e) => patch({ auto_mark_read: e.target.checked })}
+            style={{ accentColor: "var(--accent)" }}
+          />
+          收到消息后自动标为已读
+        </label>
+        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
+          这是<strong>对方可见</strong>的动作：机器人一收到就读，对方会以为你一直在看手机。
+          不想这样就把开关关掉。无论这个项目开不开自动回复，都会标已读。
         </div>
       </div>
 

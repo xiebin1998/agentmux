@@ -53,6 +53,9 @@ pub struct AppConfig {
     /// 是否让模型输出思考过程。开了才能在界面上看到思考，代价是每条回复更慢。
     #[serde(default = "default_true")]
     pub thinking_enabled: bool,
+    /// 收到消息后是否自动标为已读。**对方可见**，所以做成开关。
+    #[serde(default = "default_true")]
+    pub auto_mark_read: bool,
     /// 权限放行档位（归一化的 `auto` / `no_ask` / `full`）。空 = 不传、用 CLI 默认。
     ///
     /// 三个 CLI 的旗标与大小写都不同，由 `reply::permission_args` 按平台翻译。
@@ -125,6 +128,7 @@ impl Default for AppConfig {
             agent_model: None,
             reasoning_effort: None,
             thinking_enabled: true,
+            auto_mark_read: true,
             permission_mode: None,
             reply_batch_window_ms: DEFAULT_REPLY_BATCH_WINDOW_MS,
             reply_enabled: false,
@@ -382,6 +386,7 @@ pub fn reply_settings() -> crate::reply::ReplySettings {
         agent_model: config.agent_model.clone(),
         reasoning_effort: config.reasoning_effort.clone(),
         thinking_enabled: config.thinking_enabled,
+        auto_mark_read: config.auto_mark_read,
         permission_mode: config.permission_mode.clone(),
         reply_batch_window_ms: config.reply_batch_window_ms,
         agent_cwd,
@@ -462,6 +467,7 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
             .clone()
             .filter(|effort| !effort.trim().is_empty()),
         thinking_enabled: global.thinking_enabled,
+        auto_mark_read: global.auto_mark_read,
         permission_mode: global
             .permission_mode
             .clone()

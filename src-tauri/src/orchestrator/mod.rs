@@ -877,6 +877,18 @@ impl Shared {
         }
 
         // 先落盘再推流再回复：回复失败不影响事件已经安全落盘。
+        // 标已读放在回复开关**之前**：不管这个项目回不回复，收到的消息都该标已读。
+        let from_me = reply_settings
+            .self_open_id
+            .as_deref()
+            .is_some_and(|me| !me.is_empty() && me == event.sender_open_dingtalk_id);
+        if reply_settings.auto_mark_read && !from_me {
+            let shared = self.clone();
+            let conversation = event.conversation_id.clone();
+            let message = event.message_id.clone();
+            tokio::spawn(async move { shared.mark_read(&conversation, &message).await });
+        }
+
         if reply_settings.enabled {
             self.trace(
                 &event.message_id,
@@ -903,6 +915,29 @@ impl Shared {
                     .finish_reply(&event, "skipped", Some("该项目未启用自动回复"))
                     .await
             });
+        }
+    }
+
+    /// 把这条消息及其之前的消息都标为已读。
+    ///
+    /// 实测：非交互环境**必须显式传 `--yes`**，否则 dws 报 `confirmation_required`
+    /// 而根本不执行（探测时确认过）。失败只记一行日志 —— 标已读是锦上添花，
+    /// 不该因为它影响回复或落盘。
+    async fn mark_read(&self, conversation_id: &str, message_id: &str) {
+        if conversation_id.is_empty() || message_id.is_empty() {
+            return;
+        }
+        let args = [
+            "chat",
+            "+conversation-mark-read",
+            "--conversation-id",
+            conversation_id,
+            "--message-id",
+            message_id,
+            "--yes",
+        ];
+        if let Err(err) = crate::conversations::run_dws_in(&self.path, &args, None, 30).await {
+            self.push_log(&format!("标记已读失败：{err}")).await;
         }
     }
 
@@ -3003,6 +3038,14 @@ fs.appendFileSync("send-log.jsonl", JSON.stringify(process.argv.slice(2)) + "\n"
 process.stdout.write(JSON.stringify({ result: { messageId: "sent-burst" } }));
 "#;
 
+    /// 桩记录的是**每次 dws 调用**的参数（JSON 数组）。只数真正发消息的那些 ——
+    /// 标已读走的是同一个 `chat` 桩，不能混进「回复条数」里。
+    fn count_sends(log: &str) -> usize {
+        log.lines()
+            .filter(|line| line.contains("+messages-send"))
+            .count()
+    }
+
     /// 桩 Agent CLI：把 stdin 收到的 prompt 原样落到**项目工作目录**，再回一句中文。
     /// 落盘是为了断言「这几条消息都被交给了 Agent」，而不只是宿主内部合并了。
     const PROMPT_AGENT_STUB: &str = r#"
@@ -3049,6 +3092,139 @@ process.stdin.on("end", function () {
   setTimeout(function () { process.stdout.write("你好呀，吃过啦，你吃了吗？"); }, 1500);
 });
 "#;
+
+    /// 标已读（默认开）：收到消息后调 `+conversation-mark-read`，且**必须带 `--yes`**
+    /// —— 实测非交互环境下不带会报 `confirmation_required` 而根本不执行。
+    #[tokio::test]
+    async fn marks_incoming_message_read_when_enabled() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+        let base = std::env::temp_dir().join("agentmux-markread-on");
+        let _ = std::fs::remove_dir_all(&base);
+        let stub_dir = base.join("stub");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::write(stub_dir.join("event"), STUB).unwrap();
+        std::fs::write(stub_dir.join("chat"), APPEND_CHAT_STUB).unwrap();
+
+        let storage = Arc::new(Mutex::new(Storage::new(base.join("data")).unwrap()));
+        let orchestrator = Orchestrator::new(storage.clone());
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener(
+                "p-read".to_string(),
+                ListenKind::AtMe,
+                ReplySettings {
+                    auto_mark_read: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("应能启动监听");
+
+        for _ in 0..60 {
+            sleep(Duration::from_millis(100)).await;
+            if storage
+                .lock()
+                .await
+                .list_events(&EventQuery {
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .iter()
+                .any(|row| row.processed)
+            {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(400)).await;
+
+        let _ = orchestrator.stop_listener(&id).await;
+        let log = std::fs::read_to_string(stub_dir.join("send-log.jsonl")).unwrap_or_default();
+        std::env::set_current_dir(previous).unwrap();
+
+        let mark_read = log
+            .lines()
+            .find(|line| line.contains("+conversation-mark-read"))
+            .unwrap_or_else(|| panic!("应调用标已读，实际记录：{log}"));
+        assert!(
+            mark_read.contains("--yes"),
+            "非交互环境必须带 --yes，否则 dws 根本不执行：{mark_read}"
+        );
+        assert!(mark_read.contains("--conversation-id"), "{mark_read}");
+        assert!(mark_read.contains("--message-id"), "{mark_read}");
+    }
+
+    /// 关掉就一次都不调 —— 开关必须真的有效。
+    #[tokio::test]
+    async fn does_not_mark_read_when_disabled() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+        let base = std::env::temp_dir().join("agentmux-markread-off");
+        let _ = std::fs::remove_dir_all(&base);
+        let stub_dir = base.join("stub");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::write(stub_dir.join("event"), STUB).unwrap();
+        std::fs::write(stub_dir.join("chat"), APPEND_CHAT_STUB).unwrap();
+
+        let storage = Arc::new(Mutex::new(Storage::new(base.join("data")).unwrap()));
+        let orchestrator = Orchestrator::new(storage.clone());
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener(
+                "p-read-off".to_string(),
+                ListenKind::AtMe,
+                ReplySettings {
+                    auto_mark_read: false,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("应能启动监听");
+
+        for _ in 0..60 {
+            sleep(Duration::from_millis(100)).await;
+            if storage
+                .lock()
+                .await
+                .list_events(&EventQuery {
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .iter()
+                .any(|row| row.processed)
+            {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(400)).await;
+
+        let _ = orchestrator.stop_listener(&id).await;
+        let log = std::fs::read_to_string(stub_dir.join("send-log.jsonl")).unwrap_or_default();
+        std::env::set_current_dir(previous).unwrap();
+
+        assert!(
+            !log.contains("+conversation-mark-read"),
+            "开关关掉后不该调标已读，实际记录：{log}"
+        );
+    }
 
     /// **队列排空的核心主张**：处理期间到达的消息会被并成**一条**后续回复，
     /// 而不是各自单回一条、也不再各自等一个窗口。
@@ -3146,7 +3322,7 @@ process.stdin.on("end", function () {
         );
 
         let sends = sends.expect("桩 dws 应记录到发送调用");
-        let send_count = sends.lines().filter(|line| !line.trim().is_empty()).count();
+        let send_count = count_sends(&sends);
         assert_eq!(
             send_count, 2,
             "第 1 条单发 + 后两条合并成一条 = 共 2 条；实际 {send_count} 条：{sends}"
@@ -3244,7 +3420,7 @@ process.stdin.on("end", function () {
 
         // 只发一条：这是「合并回复」的核心证据。
         let sends = sends.expect("桩 dws 应记录到发送调用");
-        let send_count = sends.lines().filter(|line| !line.trim().is_empty()).count();
+        let send_count = count_sends(&sends);
         assert_eq!(
             send_count, 1,
             "一批 3 条消息只应发出 1 条回复，实际 {} 条：{}",
