@@ -35,7 +35,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY0MjlFNjU3QjdENzU2MTIKUldRU1Z0ZTNWK1lwWkVYTHI5V1RKWm84bTFqQ25TQ0g3T043NERUa29uK0pQaXlNcVcrcm1TejkK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY0MjlFNjU3QjdENzU2MTIKUldRU1Z0ZTNWK1lwWkVYTHI5V1RKWm84bTFqQ25TQ0g3M043NERUa29uK0pQaXlNcVcrcm1TejkK",
       "endpoints": [
         "https://github.com/xiebin1998/agentmux/releases/latest/download/latest.json"
       ]
