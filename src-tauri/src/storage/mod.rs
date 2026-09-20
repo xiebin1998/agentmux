@@ -1050,6 +1050,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 会话窗口渲染「历史思考」靠的是 `list_events` 回读 reasoning。
+    ///
+    /// 钉住 `set_event_reasoning` → `list_events` 的往返：SELECT 的列顺序一旦和
+    /// `EventRow` 的取值下标错位，界面上的思考块会**静默消失**（不报错，永远 None）。
+    #[test]
+    fn reasoning_round_trips_through_list_events() {
+        let dir = std::env::temp_dir().join("agentmux-event-reasoning-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir.clone()).unwrap();
+
+        storage
+            .save_event(&sample_event("msg-think-1", "cid-1", "p1"))
+            .unwrap();
+
+        let rows = storage
+            .list_events(&EventQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reasoning, None, "还没生成过就不该有思考过程");
+
+        storage
+            .set_event_reasoning("msg-think-1", "先算 17×20 再补 17×3")
+            .unwrap();
+
+        let rows = storage
+            .list_events(&EventQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            rows[0].reasoning.as_deref(),
+            Some("先算 17×20 再补 17×3"),
+            "思考过程必须能原样读回（列下标错位会静默变 None）"
+        );
+        // 别串到相邻列：正文与回复正文不能被 reasoning 顶掉。
+        assert_eq!(rows[0].content, "@我 看一下");
+        assert_eq!(rows[0].reply_text, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 项目维度可写入可读回；两个项目对同一会话各自独立。
     #[test]
     fn sessions_are_isolated_per_project() {

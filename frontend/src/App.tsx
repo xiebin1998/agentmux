@@ -81,7 +81,7 @@ const MAX_STREAMING_ENTRIES = 50;
  * 后端一块一块推（CLI 没有逐 token 的开关），同一阶段的块用换行拼接，
  * 这样界面上是多段浮现而不是糊成一行。
  */
-function appendChunk(
+export function appendChunk(
   prev: Record<string, StreamingReply>,
   chunk: { message_id: string; phase: ReplyPhase; text: string },
 ): Record<string, StreamingReply> {
