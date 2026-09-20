@@ -15,6 +15,9 @@ use serde::Serialize;
 /// 不在此列，免得白下载。
 const ATTACHMENT_PREFIXES: &[&str] = &["[文件]", "[图片]"];
 
+/// 图片前缀。单独提出来是因为图片要**区别对待**：不做转换，且模型可能看不见。
+const IMAGE_PREFIX: &str = "[图片]";
+
 /// 从事件 raw JSON 里解析出的引用信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QuotedRef {
@@ -26,6 +29,8 @@ pub struct QuotedRef {
     pub is_file: bool,
     /// 文件消息里的文件名（仅 is_file 时有值）。
     pub file_name: Option<String>,
+    /// 是不是图片。图片不做转换，但**模型未必有视觉能力**，提示词里要区别对待。
+    pub is_image: bool,
 }
 
 /// 从事件原始 JSON 解析 `quoted_message`。
@@ -50,14 +55,15 @@ pub fn quoted_from_raw(raw: &str) -> Option<QuotedRef> {
         .trim()
         .to_string();
 
-    let (is_file, file_name) = match ATTACHMENT_PREFIXES
+    let (is_file, is_image, file_name) = match ATTACHMENT_PREFIXES
         .iter()
-        .find_map(|prefix| text.strip_prefix(prefix))
+        .find_map(|prefix| text.strip_prefix(prefix).map(|rest| (*prefix, rest)))
     {
-        Some(rest) => {
+        Some((prefix, rest)) => {
             let name = rest.trim();
             (
                 true,
+                prefix == IMAGE_PREFIX,
                 if name.is_empty() {
                     None
                 } else {
@@ -65,7 +71,7 @@ pub fn quoted_from_raw(raw: &str) -> Option<QuotedRef> {
                 },
             )
         }
-        None => (false, None),
+        None => (false, false, None),
     };
 
     Some(QuotedRef {
@@ -73,6 +79,7 @@ pub fn quoted_from_raw(raw: &str) -> Option<QuotedRef> {
         text,
         is_file,
         file_name,
+        is_image,
     })
 }
 
@@ -189,6 +196,117 @@ pub async fn download_attachment(
         .collect())
 }
 
+/// 附件大小上限。超过就只告知名字、不给路径 —— 免得 Agent 去读一个巨大文件把
+/// 上下文撑爆，转换它也没有意义。
+pub const MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 写进提示词的一条附件说明。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttachmentNote {
+    /// 对方发来时叫什么。
+    pub name: String,
+    /// 工作目录内的相对路径；`None` = 取不到可读内容，原因见 `reason`。
+    pub rel_path: Option<String>,
+    /// 是不是图片。图片要单独措辞：模型未必具备视觉能力。
+    pub is_image: bool,
+    /// 路径是不是应用侧转换出来的（xlsx → CSV）。
+    pub converted: bool,
+    /// `rel_path` 为 `None` 时的原因，会写进提示词让 Agent 如实说明。
+    pub reason: Option<String>,
+}
+
+/// `Read` 能直接读的文本类扩展名。
+const TEXT_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "csv", "tsv", "json", "xml", "yaml", "yml", "log", "ini", "toml",
+    "html", "htm", "pdf",
+];
+
+/// 图片扩展名。作为 quoted 前缀之外的兜底判断。
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+fn name_of(rel_path: &str) -> String {
+    rel_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(rel_path)
+        .to_string()
+}
+
+fn extension_of(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// 把下载好的附件变成提示词能用的说明。
+///
+/// 图片与文本类直接给路径（`Read` 能读）；xlsx 由应用侧转成 CSV、给转换后的路径；
+/// 其余二进制与超大文件只给名字加原因 —— 让 Agent 如实说"这个我读不了"，
+/// 而不是对着一个它打不开的文件编内容。
+pub fn to_notes(work_dir: &Path, fetched: &[Fetched], image_hint: bool) -> Vec<AttachmentNote> {
+    fetched
+        .iter()
+        .map(|item| note_for(work_dir, item, image_hint))
+        .collect()
+}
+
+fn note_for(work_dir: &Path, item: &Fetched, image_hint: bool) -> AttachmentNote {
+    let name = name_of(&item.rel_path);
+    let extension = extension_of(&name);
+    let is_image = image_hint || IMAGE_EXTENSIONS.contains(&extension.as_str());
+
+    let skipped = |reason: &str| AttachmentNote {
+        name: name.clone(),
+        rel_path: None,
+        is_image,
+        converted: false,
+        reason: Some(reason.to_string()),
+    };
+
+    if item.size_bytes > MAX_ATTACHMENT_BYTES {
+        return skipped("文件超过 8MB，未读取内容");
+    }
+
+    if is_image || TEXT_EXTENSIONS.contains(&extension.as_str()) {
+        return AttachmentNote {
+            name,
+            rel_path: Some(item.rel_path.clone()),
+            is_image,
+            converted: false,
+            reason: None,
+        };
+    }
+
+    // xlsx 是二进制，Read 读不了；转成 CSV 再给路径。
+    if extension == "xlsx" || extension == "xlsm" {
+        let Some(absolute) = resolve_within(work_dir, &item.rel_path) else {
+            return skipped("附件路径不合法，未读取");
+        };
+        let Some(csv) = std::fs::read(&absolute)
+            .ok()
+            .and_then(|bytes| crate::ooxml::xlsx_to_csv(&bytes).ok())
+        else {
+            return skipped("表格转换失败，未读取内容");
+        };
+        let csv_rel = format!("{}.csv", item.rel_path);
+        let Some(csv_absolute) = resolve_within(work_dir, &csv_rel) else {
+            return skipped("附件路径不合法，未读取");
+        };
+        if std::fs::write(&csv_absolute, csv).is_err() {
+            return skipped("表格转换结果写盘失败，未读取内容");
+        }
+        return AttachmentNote {
+            name,
+            rel_path: Some(csv_rel),
+            is_image: false,
+            converted: true,
+            reason: None,
+        };
+    }
+
+    skipped("该格式无法转成文本，未读取内容")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +325,7 @@ mod tests {
             Some("内部款-预警规则-测试用例（后端）.xlsx")
         );
         assert_eq!(q.text, "[文件] 内部款-预警规则-测试用例（后端）.xlsx");
+        assert!(!q.is_image, "文件不是图片");
     }
 
     #[test]
@@ -232,6 +351,7 @@ mod tests {
         let q = quoted_from_raw(raw).expect("引用图片也应有引用信息");
 
         assert!(q.is_file, "图片也是需要取回来的附件");
+        assert!(q.is_image, "前缀是 [图片] 就应标记为图片");
         assert_eq!(q.file_name.as_deref(), Some("截图.png"));
     }
 
@@ -338,6 +458,137 @@ mod tests {
         );
         assert!(resolve_within(&work, "/etc/passwd").is_none(), "绝对路径必须拒绝");
         assert!(resolve_within(&work, "").is_none(), "空路径必须拒绝");
+    }
+
+    /// 现场造一个最小 xlsx（只有一张表、无共享字符串），用于 to_notes 的转换测试。
+    fn write_min_xlsx(path: &std::path::Path, rows: &str) {
+        use std::io::Write;
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            let options = zip::write::SimpleFileOptions::default();
+            let parts = [
+                (
+                    "xl/workbook.xml",
+                    r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<Relationships><Relationship Id="rId1" Type="worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    &format!(r#"<worksheet><sheetData>{rows}</sheetData></worksheet>"#),
+                ),
+            ];
+            for (name, body) in parts {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        std::fs::write(path, buffer.into_inner()).unwrap();
+    }
+
+    #[test]
+    fn note_gives_path_for_image_and_text_unchanged() {
+        let work = std::env::temp_dir().join("agentmux-note-test");
+        let fetched = vec![
+            Fetched {
+                rel_path: ".agentmux/attachments/截图.png".into(),
+                size_bytes: 1024,
+            },
+            Fetched {
+                rel_path: ".agentmux/attachments/说明.md".into(),
+                size_bytes: 2048,
+            },
+        ];
+
+        let notes = to_notes(&work, &fetched, false);
+
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].is_image, "png 应识别为图片");
+        assert_eq!(
+            notes[0].rel_path.as_deref(),
+            Some(".agentmux/attachments/截图.png"),
+            "图片原样给路径，不做转换"
+        );
+        assert!(!notes[0].converted);
+        assert!(!notes[1].is_image);
+        assert_eq!(notes[1].rel_path.as_deref(), Some(".agentmux/attachments/说明.md"));
+    }
+
+    #[test]
+    fn quoted_image_hint_marks_note_as_image() {
+        // 前缀是 [图片] 但扩展名认不出来时，也要当图片
+        let work = std::env::temp_dir().join("agentmux-note-test");
+        let fetched = vec![Fetched {
+            rel_path: ".agentmux/attachments/未知资源".into(),
+            size_bytes: 10,
+        }];
+
+        let notes = to_notes(&work, &fetched, true);
+
+        assert!(notes[0].is_image);
+    }
+
+    #[test]
+    fn note_converts_xlsx_to_csv_and_points_at_the_csv() {
+        let work = std::env::temp_dir().join("agentmux-note-xlsx-test");
+        let _ = std::fs::remove_dir_all(&work);
+        let dir = work.join(".agentmux/attachments");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_min_xlsx(
+            &dir.join("用例.xlsx"),
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>编号</t></is></c><c r="B1" t="inlineStr"><is><t>结论</t></is></c></row>
+               <row r="2"><c r="A2" t="inlineStr"><is><t>TC-001</t></is></c><c r="B2"><v>1</v></c></row>"#,
+        );
+
+        let fetched = vec![Fetched {
+            rel_path: ".agentmux/attachments/用例.xlsx".into(),
+            size_bytes: 4096,
+        }];
+        let notes = to_notes(&work, &fetched, false);
+
+        assert!(notes[0].converted, "xlsx 应由应用侧转成 CSV");
+        assert_eq!(
+            notes[0].rel_path.as_deref(),
+            Some(".agentmux/attachments/用例.xlsx.csv"),
+            "提示词里给的应是转换后的路径"
+        );
+        assert_eq!(notes[0].name, "用例.xlsx", "名字仍是对方发来的原名");
+
+        let csv = std::fs::read_to_string(dir.join("用例.xlsx.csv")).expect("CSV 应落盘");
+        assert_eq!(csv, "编号,结论\nTC-001,1");
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn oversized_and_unconvertible_attachments_get_no_path() {
+        let work = std::env::temp_dir().join("agentmux-note-test");
+        let fetched = vec![
+            Fetched {
+                rel_path: ".agentmux/attachments/巨大.xlsx".into(),
+                size_bytes: MAX_ATTACHMENT_BYTES + 1,
+            },
+            Fetched {
+                rel_path: ".agentmux/attachments/文档.docx".into(),
+                size_bytes: 1024,
+            },
+        ];
+
+        let notes = to_notes(&work, &fetched, false);
+
+        assert!(notes[0].rel_path.is_none(), "超限不给路径");
+        assert!(notes[0].reason.as_deref().unwrap().contains("8MB"));
+        assert!(notes[1].rel_path.is_none(), "docx 转不了，不给路径");
+        assert!(
+            notes[1].reason.is_some(),
+            "必须给原因，好让 Agent 如实说明读不了"
+        );
+        // 没有路径也要保留名字：Agent 至少能说清"哪个文件我读不了"
+        assert_eq!(notes[1].name, "文档.docx");
     }
 
     /// 真实环境：把被引用消息的附件**真的**下到工作目录。
