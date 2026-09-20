@@ -1,6 +1,6 @@
 {
   "productName": "AgentMux",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "identifier": "com.agentmux.app",
   "build": {
     "frontendDist": "../frontend/dist",
