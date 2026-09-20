@@ -2992,6 +2992,152 @@ process.stdin.on("end", function () {
 });
 "#;
 
+    /// 假 dws：三条事件**跨越一次生成** —— 第 1 条先被处理，第 2、3 条在生成期间到达。
+    const EVENT_STUB_ACROSS_GENERATION: &str = r#"
+const READY = "[event] ready event_key=user_im_message_receive_at subscribe_id=subId-stub bus_pid=1";
+function evt(id) {
+  return JSON.stringify({
+    type: "user_im_message_receive_at",
+    event_id: id,
+    subscribe_id: "subId-stub",
+    message_id: "msg-" + id,
+    conversation_id: "cid-1",
+    sender: "张三",
+    sender_open_dingtalk_id: "open-1",
+    content: "消息 " + id,
+    create_time: "2026-09-19T00:00:00Z"
+  });
+}
+process.stderr.write(READY + "\n");
+setTimeout(function () { process.stdout.write(evt("first") + "\n"); }, 200);
+setTimeout(function () { process.stdout.write(evt("second") + "\n"); }, 700);
+setTimeout(function () { process.stdout.write(evt("third") + "\n"); }, 900);
+process.stdin.resume();
+process.stdin.on("end", function () { process.exit(0); });
+"#;
+
+    /// 假 Agent：**故意慢**（1.5 秒），好让测试在「生成期间」再塞消息进来。
+    const SLOW_AGENT_STUB: &str = r#"
+const fs = require("fs");
+let prompt = "";
+process.stdin.on("data", function (chunk) { prompt += chunk; });
+process.stdin.on("end", function () {
+  fs.writeFileSync("agent-prompt.txt", prompt);
+  setTimeout(function () { process.stdout.write("你好呀，吃过啦，你吃了吗？"); }, 1500);
+});
+"#;
+
+    /// **队列排空的核心主张**：处理期间到达的消息会被并成**一条**后续回复，
+    /// 而不是各自单回一条、也不再各自等一个窗口。
+    ///
+    /// 窗口给 0（首条不等待）→ 第 1 条立刻处理；第 2、3 条在它 1.5 秒的生成期间到达，
+    /// 落进队列；上一批处理完**立即**一起答掉。所以总共应发出 **2 条**回复：
+    /// 第 1 条单发，第 2、3 条合并成一条。
+    ///
+    /// 旧逻辑下第 2、3 条会各自排一个新窗口（各等满 8 秒）→ 会发出 3 条。
+    #[tokio::test]
+    async fn messages_arriving_during_generation_are_merged() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let base = std::env::temp_dir().join("agentmux-e2e-drain");
+        let _ = std::fs::remove_dir_all(&base);
+        let stub_dir = base.join("stub");
+        let work_dir = base.join("project-workdir");
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        std::fs::write(stub_dir.join("event"), EVENT_STUB_ACROSS_GENERATION).unwrap();
+        std::fs::write(stub_dir.join("chat"), APPEND_CHAT_STUB).unwrap();
+        std::fs::write(stub_dir.join("agentstub"), SLOW_AGENT_STUB).unwrap();
+        let agent_stub_path = stub_dir.join("agentstub").to_string_lossy().to_string();
+
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let mut orchestrator = Orchestrator::new(storage.clone());
+        let settings = ReplySettings {
+            enabled: true,
+            // 0 = 首条不等待。合并完全靠「处理期间继续收 + 处理完排空」。
+            reply_batch_window_ms: 0,
+            agent_platform: "stub".to_string(),
+            agent_cli_path: Some(node.clone()),
+            agent_args: Some(vec![agent_stub_path]),
+            agent_cwd: work_dir.to_string_lossy().to_string(),
+            timeout_ms: 20_000,
+            max_chars: 500,
+            ..Default::default()
+        };
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener("proj-drain".to_string(), ListenKind::AtMe, settings, None)
+            .await
+            .expect("应能启动监听");
+
+        for _ in 0..150 {
+            sleep(Duration::from_millis(100)).await;
+            let rows = storage
+                .lock()
+                .await
+                .list_events(&EventQuery {
+                    limit: 10,
+                    project_id: Some("proj-drain".to_string()),
+                    ..Default::default()
+                })
+                .unwrap();
+            if rows.len() == 3 && rows.iter().all(|row| row.reply_status.is_some()) {
+                break;
+            }
+        }
+
+        let _ = orchestrator.stop_listener(&id).await;
+        let sends = std::fs::read_to_string(stub_dir.join("send-log.jsonl")).ok();
+        let logs = orchestrator
+            .get_logs(500)
+            .await
+            .iter()
+            .map(|entry| entry.line.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::env::set_current_dir(previous).unwrap();
+
+        let rows = storage
+            .lock()
+            .await
+            .list_events(&EventQuery {
+                limit: 10,
+                project_id: Some("proj-drain".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 3, "三条消息都应落盘");
+        assert!(
+            rows.iter().all(|row| row.reply_status.is_some()),
+            "三条都要有归宿（sent），否则界面会显示「收到了没回复」"
+        );
+
+        let sends = sends.expect("桩 dws 应记录到发送调用");
+        let send_count = sends.lines().filter(|line| !line.trim().is_empty()).count();
+        assert_eq!(
+            send_count, 2,
+            "第 1 条单发 + 后两条合并成一条 = 共 2 条；实际 {send_count} 条：{sends}"
+        );
+        assert!(
+            logs.contains("收到 2 条消息，合并成一条回复"),
+            "后两条必须是在**生成期间**攒起来一起答的，日志里应有合并记录：{logs}"
+        );
+        assert!(
+            !logs.contains("收到 3 条消息"),
+            "第 1 条不该和后两条并在一起 —— 它是不等待直接走的，这正是本次改动：{logs}"
+        );
+    }
+
     /// 回归（问题 2）：一次性连收 n 条时，只生成并发送**一条**回复，
     /// 且这批里的每条事件都要落到 sent（否则界面又会显示成「收到了没回复」）。
     #[tokio::test]
