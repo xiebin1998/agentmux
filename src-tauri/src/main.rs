@@ -65,6 +65,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
         .setup(|app| {
             println!("AgentMux starting...");
@@ -153,6 +154,9 @@ fn main() {
             // 窗口/托盘
             hide_to_tray,
             quit_app,
+            // 自动更新
+            commands::check_update,
+            commands::install_update,
             // 项目
             project::create_project,
             project::list_projects,

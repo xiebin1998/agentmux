@@ -47,16 +47,27 @@ interface ConversationDetails {
   conversation_id: string;
   name: string;
   kind: string;
-  context_budget_chars: number;
-  context_used_chars: number;
+  /** 回复时最多带多少条历史消息（agentmux 自己的裁剪，不是模型上下文） */
   context_message_limit: number;
   /** Agent 最近一次回报的真实占用比例（0~1）；没跑过为 null */
   context_usage_ratio: number | null;
+  /** 模型的上下文窗口（token）；非 qoder 平台没有这个概念，为 null */
+  context_window_tokens: number | null;
+  /** 窗口来源：session = 从 Agent 会话文件读到；default = 兜底默认值；none = 不适用 */
+  context_window_source: "session" | "default" | "none";
+  /** 已用 token（≈ 占比 × 窗口）；占比或窗口缺一为 null */
+  context_used_tokens: number | null;
   compress_trigger_percent: number | null;
   /** Agent 最近一次实际用的模型 */
   model: string | null;
   /** 配置里显式指定的模型；空 = 用 CLI 默认 */
   model_override: string | null;
+}
+
+/** token 数按 k 显示：200000 → "200k"，64801 → "64.8k"。 */
+function formatTokens(value: number) {
+  if (value < 1000) return String(value);
+  return `${(value / 1000).toFixed(1).replace(/\.0$/, "")}k`;
 }
 
 interface AgentSessionInfo {
@@ -351,17 +362,13 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
       </div>
 
       <div style={{ padding: "16px" }}>
-        <div style={sectionTitle}>上下文预算</div>
+        <div style={sectionTitle}>上下文</div>
         <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
           <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>消息条数</span>
+            <span style={{ color: "var(--text-secondary)" }}>随消息带的历史</span>
             <span style={{ color: "var(--text-primary)" }}>
               {project.context_message_limit} 条
             </span>
-          </div>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>字符预算</span>
-            <span style={{ color: "var(--text-primary)" }}>{project.context_max_chars} 字符</span>
           </div>
           <div style={rowStyle}>
             <span style={{ color: "var(--text-secondary)" }}>状态</span>
@@ -372,9 +379,21 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
             </span>
           </div>
           <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>当前累计</span>
+            <span style={{ color: "var(--text-secondary)" }}>会话大小</span>
             <span style={{ color: "var(--text-primary)" }}>
-              {details ? `${details.context_used_chars} 字符` : "—"}
+              {details?.context_used_tokens != null ? (
+                <>
+                  ≈ {formatTokens(details.context_used_tokens)} tokens
+                  {details.context_window_tokens != null && (
+                    <> / {formatTokens(details.context_window_tokens)}</>
+                  )}
+                </>
+              ) : (
+                "—"
+              )}
+              {details?.context_window_source === "default" && (
+                <span style={{ color: "var(--text-muted)" }}>（默认）</span>
+              )}
             </span>
           </div>
           <div style={rowStyle}>

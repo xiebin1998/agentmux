@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import ProjectList from "./components/ProjectList";
 import MessageView from "./components/MessageView";
@@ -47,6 +48,21 @@ type ListenerUpdate =
   | { type: "event"; event: unknown }
   | { type: "log"; listener_id: string; line: string };
 
+/** check_update 命令的返回。 */
+interface UpdateInfo {
+  current_version: string;
+  version: string;
+  notes: string | null;
+  date: string | null;
+}
+
+/** 更新提示条的状态机。 */
+type UpdateProgress =
+  | { phase: "idle" }
+  | { phase: "downloading"; percent: number }
+  | { phase: "installing" }
+  | { phase: "failed"; message: string };
+
 type View = "overview" | "events" | "logs";
 
 const VIEWS: { view: View; label: string }[] = [
@@ -73,6 +89,13 @@ function App() {
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [showCloseDialog, setShowCloseDialog] = useState(false);
+  /** 当前运行的版本号；拿不到就显示不出来，不影响其它功能。 */
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  /** 远端可用的新版本；null = 没有更新（离线、被墙、已是最新都算）。 */
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress>({ phase: "idle" });
+  /** 启动只检查一次更新：StrictMode 下 effect 会跑两遍。 */
+  const updateChecked = useRef(false);
 
   // 点 × 时后端拦下关闭并通知前端，由用户选「最小化到托盘」还是「退出」。
   useEffect(() => {
@@ -81,6 +104,64 @@ function App() {
       pending.then((unlisten) => unlisten()).catch(() => {});
     };
   }, []);
+
+  // 启动只检查一次更新。失败就当没有更新：离线、被墙、还没配更新源都是常态，
+  // 不该为此弹错误（原因会写进「监听日志」）。
+  useEffect(() => {
+    if (updateChecked.current) return;
+    updateChecked.current = true;
+
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => {});
+
+    invoke<UpdateInfo | null>("check_update")
+      .then((info) => {
+        if (info) setUpdate(info);
+      })
+      .catch(() => {});
+  }, []);
+
+  // 下载进度与「开始安装」由后端推事件过来。
+  useEffect(() => {
+    const progress = listen<number>("update-progress", (event) => {
+      setUpdateProgress({ phase: "downloading", percent: event.payload });
+    });
+    const installing = listen("update-installing", () => {
+      setUpdateProgress({ phase: "installing" });
+    });
+    return () => {
+      progress.then((unlisten) => unlisten()).catch(() => {});
+      installing.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, []);
+
+  const handleInstallUpdate = async () => {
+    setUpdateProgress({ phase: "downloading", percent: 0 });
+    try {
+      await invoke("install_update");
+      // Windows 上安装器启动后本进程会被结束，正常不会走到这里。
+      setUpdateProgress({ phase: "failed", message: "安装没有启动，请手动下载安装包" });
+    } catch (e) {
+      setUpdateProgress({ phase: "failed", message: String(e) });
+    }
+  };
+
+  const updateText = (() => {
+    if (!update) return "";
+    switch (updateProgress.phase) {
+      case "downloading":
+        return `正在下载 v${update.version} · ${updateProgress.percent}%`;
+      case "installing":
+        return `正在安装 v${update.version}，安装器会自动重启应用`;
+      case "failed":
+        return `发现 v${update.version} · 更新失败：${updateProgress.message}`;
+      default:
+        return `发现新版本 v${update.version}（当前 v${update.current_version}）`;
+    }
+  })();
+  const canInstallUpdate =
+    updateProgress.phase === "idle" || updateProgress.phase === "failed";
 
   const loadProjects = useCallback(async () => {
     try {
@@ -288,6 +369,9 @@ function App() {
         }}
       >
         <h1 style={{ margin: 0, fontSize: "16px", fontWeight: 600 }}>AgentMux</h1>
+        {appVersion && (
+          <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>v{appVersion}</span>
+        )}
         <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
           监听开关在左侧每个项目里
         </span>
@@ -327,6 +411,39 @@ function App() {
           </button>
         </div>
       </header>
+
+      {update && (
+        <div
+          style={{
+            padding: "6px 16px",
+            backgroundColor: "var(--accent)",
+            color: "var(--accent-contrast)",
+            fontSize: "12px",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            flexWrap: "wrap",
+          }}
+        >
+          <span>{updateText}</span>
+          {canInstallUpdate && (
+            <button
+              onClick={handleInstallUpdate}
+              style={{
+                padding: "3px 10px",
+                fontSize: "12px",
+                backgroundColor: "transparent",
+                color: "var(--accent-contrast)",
+                border: "1px solid var(--accent-contrast)",
+                borderRadius: "4px",
+                cursor: "pointer",
+              }}
+            >
+              立即更新
+            </button>
+          )}
+        </div>
+      )}
 
       {banner && (
         <div

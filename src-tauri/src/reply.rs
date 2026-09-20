@@ -6,6 +6,7 @@
 //! - 发送：`dws chat +messages-send --group <会话> --text <正文> --uuid <原 message_id> --yes -f json`
 //! - 清洗：剔除正文里所有 @、压平空白、按字符截断
 
+use std::io::BufRead;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -93,6 +94,78 @@ pub fn json_output_args(platform_id: &str) -> Vec<String> {
         "claude" => vec!["--output-format".to_string(), "json".to_string()],
         _ => Vec::new(),
     }
+}
+
+/// qoder 会话默认的上下文窗口（token）。读不到会话文件时用它兜底。
+///
+/// 实测（2026-09-20，qodercli 1.1.55）：默认窗口就是 200000，而且
+/// `context_usage_ratio` 的分母正是它 —— 传 `--context-window 400000` 时
+/// 同一段上下文的占比精确减半，传回 200000 又完全复原。
+pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+
+/// qoder 的用户配置目录。`QODER_CONFIG_DIR` 优先（官方支持的环境变量）。
+fn qoder_config_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("QODER_CONFIG_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(std::path::PathBuf::from(dir));
+        }
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    Some(std::path::PathBuf::from(home).join(".qoder"))
+}
+
+/// 从会话 transcript 里读上下文窗口（token）。
+///
+/// 会话文件在 `<配置目录>/projects/<项目 slug>/<session-id>.jsonl`，是**明文**
+/// JSONL（路径见官方 `/zh/cli/sessions`），其中 `runtime-config` 行带 `contextWindow`。
+/// 同目录的 `state.json` 是加密的，别碰。
+///
+/// **不重建 slug**：实测它的生成规则不稳定（非 ASCII 字符一律变 `-`、盘符大小写
+/// 不一致、空格保留），所以按 session id 扫一层子目录认文件更可靠。
+///
+/// 取**最后一条**有效记录（会话中途换过模型/窗口时以最新的为准）；`contextWindow`
+/// 为 `null` 的记录视为没有、继续往下看 —— 实测显式传 `--context-window 100000`
+/// 就会留下这种记录，**不能当 0**。
+fn context_window_in(projects_dir: &std::path::Path, session_id: &str) -> Option<u64> {
+    let file_name = format!("{}.jsonl", session_id);
+    for entry in std::fs::read_dir(projects_dir).ok()?.flatten() {
+        let candidate = entry.path().join(&file_name);
+        if !candidate.is_file() {
+            continue;
+        }
+        let file = std::fs::File::open(&candidate).ok()?;
+
+        let mut window = None;
+        for line in std::io::BufReader::new(file).lines() {
+            let Ok(line) = line else { break };
+            // 绝大多数行是消息与工具输出，先按子串筛掉，省下整文件的 JSON 解析。
+            if !line.contains("runtime-config") {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if value.get("type").and_then(|item| item.as_str()) != Some("runtime-config") {
+                continue;
+            }
+            if let Some(found) = value.get("contextWindow").and_then(|item| item.as_u64()) {
+                if found > 0 {
+                    window = Some(found);
+                }
+            }
+        }
+        // 认到了这个会话的文件就以它为准，不再去别的项目目录里找同 id 的文件。
+        return window;
+    }
+    None
+}
+
+/// 读某个 Agent 会话的上下文窗口（token）。只有 qoder 的会话文件格式是已知的。
+pub fn read_context_window_tokens(session_id: &str) -> Option<u64> {
+    let projects_dir = qoder_config_dir()?.join("projects");
+    context_window_in(&projects_dir, session_id)
 }
 
 /// 解析 `qodercli --list-models` 的输出：一行一个模型名，首行是表头 MODEL。
@@ -734,6 +807,102 @@ mod tests {
         assert!((ratio - 0.01399).abs() < 1e-9, "实际 {}", ratio);
     }
 
+    /// 实测原文（2026-09-20，qodercli 1.1.55）的 `runtime-config` 行。
+    const REAL_RUNTIME_CONFIG: &str = "{\"type\":\"runtime-config\",\"sessionId\":\"79b5fe9f-fb0e-44a0-9035-2dffd0ae92b5\",\"model\":\"bailian/qwen3.7-plus-cp\",\"reasoningEffort\":null,\"contextWindow\":200000,\"generation\":null,\"timestamp\":1789817012156}";
+
+    /// 显式传 `--context-window 100000` 时实测留下的形态：窗口是 null。
+    const REAL_RUNTIME_CONFIG_NULL: &str = "{\"type\":\"runtime-config\",\"sessionId\":\"44444444-5555-4666-8777-888888888888\",\"model\":\"bailian/qwen3.7-plus-cp\",\"reasoningEffort\":null,\"contextWindow\":null,\"generation\":null,\"timestamp\":1789869617878}";
+
+    /// 造一个临时 projects 目录 + 一个项目 slug 子目录，返回 (projects 目录, 会话文件路径)。
+    fn temp_session_file(tag: &str, session_id: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "agentmux-window-test-{}-{}",
+            tag,
+            uuid::Uuid::new_v4()
+        ));
+        let slug_dir = root.join("D--workSpase-idea-agentmux");
+        std::fs::create_dir_all(&slug_dir).expect("应能建临时目录");
+        let file = slug_dir.join(format!("{}.jsonl", session_id));
+        (root, file)
+    }
+
+    #[test]
+    fn reads_context_window_from_transcript() {
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        let (root, file) = temp_session_file("basic", session_id);
+        std::fs::write(
+            &file,
+            format!(
+                "{{\"type\":\"workspace-directories\",\"sessionId\":\"{}\",\"directories\":[\"D:\\\\workSpace\"]}}\n{}\n{{\"type\":\"user\",\"uuid\":\"x\",\"message\":{{\"role\":\"user\",\"content\":\"runtime-config 只是文本里出现，不能被当成记录\"}}}}\n",
+                session_id, REAL_RUNTIME_CONFIG
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(context_window_in(&root, session_id), Some(200_000));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn last_runtime_config_wins_when_window_changed() {
+        let session_id = "22222222-3333-4444-8555-666666666666";
+        let (root, file) = temp_session_file("last-wins", session_id);
+        let later = REAL_RUNTIME_CONFIG.replace("200000", "400000");
+        std::fs::write(&file, format!("{}\n{}\n", REAL_RUNTIME_CONFIG, later)).unwrap();
+
+        assert_eq!(
+            context_window_in(&root, session_id),
+            Some(400_000),
+            "会话中途换过窗口时应以最后一条为准"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn null_context_window_is_not_zero_and_does_not_erase() {
+        let session_id = "33333333-4444-4555-8666-777777777777";
+        let (root, file) = temp_session_file("null", session_id);
+        std::fs::write(&file, format!("{}\n", REAL_RUNTIME_CONFIG_NULL)).unwrap();
+        assert_eq!(
+            context_window_in(&root, session_id),
+            None,
+            "contextWindow 为 null 时不能当 0，应视为没有"
+        );
+
+        // 有效记录之后又来一条 null：不能把已知的窗口抹掉。
+        let mixed = REAL_RUNTIME_CONFIG.replace(
+            "79b5fe9f-fb0e-44a0-9035-2dffd0ae92b5",
+            session_id,
+        );
+        std::fs::write(
+            &file,
+            format!("{}\n{}\n", mixed, REAL_RUNTIME_CONFIG_NULL),
+        )
+        .unwrap();
+        assert_eq!(context_window_in(&root, session_id), Some(200_000));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn missing_dir_or_other_session_yields_none() {
+        let missing = std::env::temp_dir().join("agentmux-window-test-missing-dir");
+        assert_eq!(context_window_in(&missing, "whatever"), None);
+
+        let session_id = "44444444-5555-4666-8777-888888888888";
+        let (root, file) = temp_session_file("other-session", session_id);
+        std::fs::write(&file, format!("{}\n", REAL_RUNTIME_CONFIG)).unwrap();
+        assert_eq!(
+            context_window_in(&root, "55555555-6666-4777-8888-999999999999"),
+            None,
+            "只认文件名与 session id 相同的那个会话文件"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// 不支持 JSON 的 CLI（或用户自定义参数）：整段当正文，行为与改前一致。
     #[test]
     fn plain_text_output_still_works() {
@@ -846,6 +1015,9 @@ mod tests {
             return;
         };
 
+        // 指定 session id 建会话，这样 CLI 会把 transcript 写到磁盘上，
+        // 下面的窗口读取才有东西可读。
+        let session_id = uuid::Uuid::new_v4().to_string();
         let settings = ReplySettings {
             agent_platform: "qoder".to_string(),
             agent_cli_path: Some(bin),
@@ -855,7 +1027,7 @@ mod tests {
             ..Default::default()
         };
 
-        let output = generate(&settings, "只回答两个字：收到", None, false)
+        let output = generate(&settings, "只回答两个字：收到", Some(&session_id), false)
             .await
             .expect("真实 qodercli 应能非交互生成");
 
@@ -867,6 +1039,18 @@ mod tests {
         assert!(
             output.context_usage_ratio.is_some(),
             "真实 qodercli 应回报 context_usage_ratio（自适应压缩的依据）"
+        );
+
+        // 会话大小要按「占比 × 窗口」换算，而窗口只能从这个会话的 transcript 里读。
+        // 这一段是整条链路上唯一的对外依赖：上游改了字段名或目录结构，就会在这里断。
+        assert_eq!(
+            DEFAULT_CONTEXT_WINDOW_TOKENS, 200_000,
+            "兜底默认值必须等于实测默认窗口，否则换算出的 token 数是错的"
+        );
+        assert_eq!(
+            read_context_window_tokens(&session_id),
+            Some(200_000),
+            "应从真实会话文件里读到上下文窗口"
         );
     }
 }

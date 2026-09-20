@@ -166,23 +166,6 @@ impl Orchestrator {
         self.reply_batch_window = window;
     }
 
-    /// 某个会话的运行期观测值：Agent 最近回报的上下文占比与实际用的模型。
-    /// 都是「最近一次生成」的快照，重启后为空——它们来自 CLI 回报，不是配置。
-    pub async fn conversation_runtime(
-        &self,
-        conversation_id: &str,
-    ) -> (Option<f64>, Option<String>) {
-        let ratio = {
-            let ratios = self.last_context_ratio.lock().await;
-            ratios.get(conversation_id).copied()
-        };
-        let model = {
-            let models = self.last_model.lock().await;
-            models.get(conversation_id).cloned()
-        };
-        (ratio, model)
-    }
-
     pub async fn push_global_log(&self, line: &str) {
         push_log_line(&self.logs, "", "", line).await;
     }
@@ -485,6 +468,42 @@ struct Shared {
 }
 
 impl Shared {
+    /// 记下这一轮生成实际用的模型与 Agent 回报的上下文占比。
+    ///
+    /// 两处都要写：内存是给**本进程**下一轮压缩判定用的（比字符估算准），
+    /// 落库是为了**应用重启后**界面还能显示会话大小与模型 —— 只放内存的话
+    /// 重启就变回「暂无」，即使这个会话本身还带着满上下文。
+    async fn record_runtime(&self, conversation_id: &str, raw: &crate::reply::Generation) {
+        let ratio = raw.context_usage_ratio;
+        let model = raw
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+
+        if let Some(value) = ratio {
+            self.last_context_ratio
+                .lock()
+                .await
+                .insert(conversation_id.to_string(), value);
+        }
+        if let Some(value) = model.as_ref() {
+            self.last_model
+                .lock()
+                .await
+                .insert(conversation_id.to_string(), value.clone());
+        }
+
+        let storage = self.storage.lock().await;
+        let _ = storage.save_session_runtime(
+            &self.project_id,
+            conversation_id,
+            ratio,
+            model.as_deref(),
+        );
+    }
+
     async fn run(&self) {
         let mut attempt: u32 = 0;
 
@@ -1012,10 +1031,19 @@ impl Shared {
         let _guard = self.reply_lock.lock().await;
 
         // 这个会话上一次生成时 CLI 报的上下文占比，自适应压缩的依据。
-        let last_ratio = {
+        // 内存里没有（应用刚重启就是这种情况）就用落库的那次，别退回字符估算。
+        let mut last_ratio = {
             let ratios = self.last_context_ratio.lock().await;
             ratios.get(&event.conversation_id).copied()
         };
+        if last_ratio.is_none() {
+            let storage = self.storage.lock().await;
+            last_ratio = storage
+                .session_runtime(&self.project_id, &event.conversation_id)
+                .ok()
+                .flatten()
+                .and_then(|(ratio, _)| ratio);
+        }
         let compress_percent = if reply.auto_compress {
             reply
                 .compress_trigger_percent
@@ -1194,21 +1222,6 @@ impl Shared {
         )
         .await;
 
-        // 记下这一轮的占比：下一轮压缩判定直接用，不再靠字符估算。
-        if let Some(ratio) = raw.context_usage_ratio {
-            self.last_context_ratio
-                .lock()
-                .await
-                .insert(event.conversation_id.clone(), ratio);
-        }
-        // 记下实际用的模型：界面要显示「当前用什么模型」。
-        if let Some(model) = raw.model.as_ref().filter(|name| !name.trim().is_empty()) {
-            self.last_model
-                .lock()
-                .await
-                .insert(event.conversation_id.clone(), model.clone());
-        }
-
         if !resume {
             let storage = self.storage.lock().await;
             let _ = storage.save_session(
@@ -1218,6 +1231,9 @@ impl Shared {
                 &settings.agent_cwd,
             );
         }
+
+        // 必须在 save_session 之后：首次回复时是那一步才建出这一行，而落库是 UPDATE。
+        self.record_runtime(&event.conversation_id, &raw).await;
 
         let mut text = crate::reply::sanitize_reply(&raw.text, reply.max_chars);
         if text.is_empty() {
@@ -1276,13 +1292,18 @@ impl Shared {
                         .await;
                     } else {
                         text = fresh_text;
-                        let storage = self.storage.lock().await;
-                        let _ = storage.save_session(
-                            &self.project_id,
-                            &event.conversation_id,
-                            &fresh_id,
-                            &settings.agent_cwd,
-                        );
+                        {
+                            let storage = self.storage.lock().await;
+                            let _ = storage.save_session(
+                                &self.project_id,
+                                &event.conversation_id,
+                                &fresh_id,
+                                &settings.agent_cwd,
+                            );
+                        }
+                        // 前面记下的占比/模型属于**被丢弃的那个会话**；新会话上下文是空的，
+                        // 沿用它既会让压缩误判，界面也会显示错误的大小。必须以新会话为准。
+                        self.record_runtime(&event.conversation_id, &fresh_raw).await;
                         self.push_log("已切换到新会话").await;
                         self.trace(
                             &event.conversation_id,

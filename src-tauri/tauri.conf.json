@@ -1,6 +1,6 @@
 {
   "productName": "AgentMux",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "identifier": "com.agentmux.app",
   "build": {
     "frontendDist": "../frontend/dist",
@@ -25,11 +25,20 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY0MjlFNjU3QjdENzU2MTIKUldRU1Z0ZTNWK1lwWkVYTHI5V1RKWm84bTFqQ25TQ0g3T043NERUa29uK0pQaXlNcVcrcm1TejkK",
+      "endpoints": [
+        "https://github.com/xiebin1998/agentmux/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

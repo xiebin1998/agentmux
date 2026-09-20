@@ -1,5 +1,5 @@
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 
 use crate::orchestrator::{ListenerStatus, ListenerUpdate, LogLine};
 use crate::providers::ListenKind;
@@ -58,13 +58,17 @@ pub struct ConversationDetails {
     pub conversation_id: String,
     pub name: String,
     pub kind: String,
-    /// 上下文预算（字符，来自项目配置）。
-    pub context_budget_chars: usize,
-    /// 当前会话累计的字符数（上下文就是从这里取的）。
-    pub context_used_chars: usize,
     pub context_message_limit: usize,
     /// Agent 最近一次回报的真实上下文占用比例（0~1）；没跑过则为 null。
     pub context_usage_ratio: Option<f64>,
+    /// 模型的上下文窗口（token）。相当于「会话最大能有这么大」。
+    /// 非 qoder 平台没有这个概念，为 null。
+    pub context_window_tokens: Option<u64>,
+    /// 窗口是哪来的：`session` = 从 Agent 会话文件读到的真实值，
+    /// `default` = 读不到、用了实测默认值，`none` = 该平台不适用。
+    pub context_window_source: String,
+    /// 已用 token（≈ 占比 × 窗口）。CLI 只回占比、不回 token 数，所以只能换算。
+    pub context_used_tokens: Option<u64>,
     /// 压缩阈值百分比（滑块值）；未设置则为 null。
     pub compress_trigger_percent: Option<u8>,
     /// Agent 最近一次实际用的模型；没跑过则为 null。
@@ -82,26 +86,46 @@ pub async fn conversation_details(
     let project = load_project(&project_id)?;
     let settings = effective_settings(&project).await;
 
-    let (meta, used_chars) = {
+    let (meta, session_id, ratio, model) = {
         let storage = state.storage.lock().await;
         let meta = storage
             .conversation_meta(&conversation_id)
             .map_err(|e| e.to_string())?;
-        let rows = storage
-            .recent_messages(&conversation_id, settings.context_message_limit)
-            .unwrap_or_default();
-        let used: usize = rows
-            .iter()
-            .map(|(sender, content)| sender.chars().count() + content.chars().count())
-            .sum();
-        (meta, used)
+        let session = storage
+            .get_session(&project_id, &conversation_id)
+            .map_err(|e| e.to_string())?;
+        // 从库里读：这轮数值是回复时落下来的，重启后照样在。
+        let runtime = storage
+            .session_runtime(&project_id, &conversation_id)
+            .map_err(|e| e.to_string())?
+            .unwrap_or((None, None));
+        (
+            meta,
+            session.map(|(agent_session_id, _cwd)| agent_session_id),
+            runtime.0,
+            runtime.1,
+        )
     };
 
-    let (ratio, model) = {
-        let orchestrator = state.orchestrator.lock().await;
-        orchestrator
-            .conversation_runtime(&conversation_id)
-            .await
+    // 窗口：只有 qoder 的会话文件格式是已知的；读不到就退回实测默认值。
+    let (context_window_tokens, context_window_source) =
+        match (settings.agent_platform.as_str(), session_id.as_deref()) {
+            ("qoder", Some(session_id)) => {
+                match crate::reply::read_context_window_tokens(session_id) {
+                    Some(window) => (Some(window), "session".to_string()),
+                    None => (
+                        Some(crate::reply::DEFAULT_CONTEXT_WINDOW_TOKENS),
+                        "default".to_string(),
+                    ),
+                }
+            }
+            _ => (None, "none".to_string()),
+        };
+
+    // 绝对大小只能换算：实测 `-o json` 里的 token 字段恒为 0，有值的只有占比。
+    let context_used_tokens = match (ratio, context_window_tokens) {
+        (Some(ratio), Some(window)) => Some((ratio * window as f64).round() as u64),
+        _ => None,
     };
 
     Ok(ConversationDetails {
@@ -111,10 +135,11 @@ pub async fn conversation_details(
             .as_ref()
             .map(|m| m.kind.clone())
             .unwrap_or_else(|| "unknown".to_string()),
-        context_budget_chars: project.context_max_chars,
-        context_used_chars: used_chars,
         context_message_limit: settings.context_message_limit,
         context_usage_ratio: ratio,
+        context_window_tokens,
+        context_window_source,
+        context_used_tokens,
         compress_trigger_percent: settings.compress_trigger_percent,
         model,
         model_override: settings.agent_model,
@@ -536,4 +561,107 @@ pub async fn delete_summary(
     storage
         .delete_summary(&conversation_id)
         .map_err(|e| e.to_string())
+}
+
+/// 一次更新检查的结果。
+#[derive(serde::Serialize)]
+pub struct UpdateInfo {
+    /// 当前正在运行的版本。
+    pub current_version: String,
+    /// 远端可用的版本。
+    pub version: String,
+    /// 发布说明（Release 正文）。
+    pub notes: Option<String>,
+    /// 发布时间（latest.json 的 pub_date）。
+    pub date: Option<String>,
+}
+
+/// 把更新相关的失败记进监听日志。
+///
+/// 更新检查**故意不打扰用户**（离线是常态），但「怎么一直不提示更新」必须有地方查，
+/// 所以原因写进日志：被墙、签名配置不对、endpoint 写错，都会在这里现形。
+async fn log_update(app: &tauri::AppHandle, line: &str) {
+    let orchestrator = app.state::<AppState>().orchestrator.clone();
+    orchestrator.lock().await.push_global_log(line).await;
+}
+
+/// 检查有没有新版本。**失败一律当作「没有更新」**，返回 Ok(None)。
+#[tauri::command]
+pub async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = match app.updater() {
+        Ok(updater) => updater,
+        Err(err) => {
+            log_update(&app, &format!("检查更新不可用: {}", err)).await;
+            return Ok(None);
+        }
+    };
+
+    match updater.check().await {
+        Ok(Some(update)) => Ok(Some(UpdateInfo {
+            current_version: update.current_version.clone(),
+            version: update.version.clone(),
+            notes: update.body.clone(),
+            date: update.date.map(|date| date.to_string()),
+        })),
+        Ok(None) => Ok(None),
+        Err(err) => {
+            log_update(&app, &format!("检查更新失败: {}", err)).await;
+            Ok(None)
+        }
+    }
+}
+
+/// 下载并安装新版本。
+///
+/// **装之前必须先把监听收干净**：Windows 上安装器一启动就让本进程退出，**不走**
+/// `RunEvent::ExitRequested`，留下的 `dws` 子进程会变成孤儿继续订阅、抢走事件。
+#[tauri::command]
+pub async fn install_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "已经没有可用更新".to_string())?;
+
+    {
+        let orchestrator = state.orchestrator.lock().await;
+        orchestrator.shutdown_all_listeners().await;
+    }
+
+    // 进度只在整数百分比变化时才发，否则一块一块地刷屏。
+    let handle = app.clone();
+    let mut last_percent = u64::MAX;
+    update
+        .download_and_install(
+            move |downloaded, total| {
+                let Some(total) = total.filter(|total| *total > 0) else {
+                    return;
+                };
+                let percent = downloaded as u64 * 100 / total;
+                if percent == last_percent {
+                    return;
+                }
+                last_percent = percent;
+                let _ = handle.emit("update-progress", percent);
+            },
+            {
+                let handle = app.clone();
+                move || {
+                    // 下载完了，接下来是安装：安装器会接管并重启应用。
+                    let _ = handle.emit("update-installing", ());
+                }
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
 }

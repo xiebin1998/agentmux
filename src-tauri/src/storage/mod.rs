@@ -138,6 +138,8 @@ impl Storage {
                 conversation_id TEXT NOT NULL,
                 agent_session_id TEXT NOT NULL,
                 agent_cwd TEXT NOT NULL,
+                last_context_ratio REAL,
+                last_model TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (project_id, conversation_id)
@@ -192,6 +194,15 @@ impl Storage {
 
         let storage = Self { db, archive_dir };
         storage.migrate_sessions_to_project_scoped();
+
+        // 这两列**必须**在重建之后补：旧库迁移是把 sessions 整表重建的（显式列清单），
+        // 放在迁移前补会被无声丢掉，表现是面板读占比时报 no such column。
+        for stmt in [
+            "ALTER TABLE sessions ADD COLUMN last_context_ratio REAL",
+            "ALTER TABLE sessions ADD COLUMN last_model TEXT",
+        ] {
+            let _ = storage.db.execute(stmt, []);
+        }
         Ok(storage)
     }
 
@@ -776,6 +787,47 @@ impl Storage {
         }
     }
 
+    /// 记下某会话最近一次生成时 Agent 回报的上下文占比与实际模型。
+    /// 只改这两列：建档与换会话 id 是 `save_session` 的事。
+    pub fn save_session_runtime(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        ratio: Option<f64>,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Local::now().to_rfc3339();
+        self.db.execute(
+            "UPDATE sessions SET last_context_ratio = ?3, last_model = ?4, updated_at = ?5
+             WHERE project_id = ?1 AND conversation_id = ?2",
+            params![project_id, conversation_id, ratio, model, now],
+        )?;
+        Ok(())
+    }
+
+    /// 读回会话最近一次回报的上下文占比与模型。落库是为了重启后还能显示。
+    /// 会话不存在（未建档）时返回 None。
+    pub fn session_runtime(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<(Option<f64>, Option<String>)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT last_context_ratio, last_model FROM sessions
+             WHERE project_id = ?1 AND conversation_id = ?2",
+        )?;
+
+        let result = stmt.query_row(params![project_id, conversation_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        });
+
+        match result {
+            Ok(runtime) => Ok(Some(runtime)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn delete_session(&self, project_id: &str, conversation_id: &str) -> Result<()> {
         self.db.execute(
             "DELETE FROM sessions WHERE project_id = ?1 AND conversation_id = ?2",
@@ -930,6 +982,52 @@ mod tests {
         let session = storage.get_session("", "cid-1").unwrap();
         assert!(session.is_some(), "旧会话应保留");
         assert_eq!(session.unwrap().0, "sess-1");
+
+        // 占比与模型这两列旧库没有，靠补列加出来：读得回、写得进。
+        assert_eq!(
+            storage.session_runtime("", "cid-1").unwrap(),
+            Some((None, None)),
+            "旧库补列后应是「有会话但还没回报过」"
+        );
+        storage
+            .save_session_runtime("", "cid-1", Some(0.42), Some("bailian/qwen3.7-plus-cp"))
+            .unwrap();
+        let runtime = storage.session_runtime("", "cid-1").unwrap().unwrap();
+        assert_eq!(runtime.0, Some(0.42));
+        assert_eq!(runtime.1.as_deref(), Some("bailian/qwen3.7-plus-cp"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 全新库也要带上这两列（CREATE 语句写错的话只有真跑起来才发现）。
+    #[test]
+    fn runtime_columns_exist_on_a_fresh_database() {
+        let dir = std::env::temp_dir().join("agentmux-fresh-runtime-columns-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir.clone()).unwrap();
+
+        // 未建档的会话没有运行期记录
+        assert_eq!(storage.session_runtime("p1", "cid-1").unwrap(), None);
+
+        storage.save_session("p1", "cid-1", "sess-a", "D:\\a").unwrap();
+        assert_eq!(
+            storage.session_runtime("p1", "cid-1").unwrap(),
+            Some((None, None)),
+            "刚建档时还没回报过占比与模型"
+        );
+
+        // 建档走 save_session，运行期信息走 save_session_runtime，两者互不覆盖
+        storage
+            .save_session_runtime("p1", "cid-1", Some(0.83), Some("Qwen3.8-Max"))
+            .unwrap();
+        assert_eq!(
+            storage.get_session("p1", "cid-1").unwrap().unwrap(),
+            ("sess-a".to_string(), "D:\\a".to_string()),
+            "写占比不该动会话 id 与工作目录"
+        );
+        let runtime = storage.session_runtime("p1", "cid-1").unwrap().unwrap();
+        assert_eq!(runtime.0, Some(0.83));
+        assert_eq!(runtime.1.as_deref(), Some("Qwen3.8-Max"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

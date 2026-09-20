@@ -2,6 +2,21 @@ name: Release
 
 # 打 tag（如 v0.1.0）时自动构建 Windows 安装包并创建 Release。
 # 用 Actions 自带的 GITHUB_TOKEN，不需要任何个人令牌。
+#
+# 注意：本仓库必须先配好两个 Secret 才能发布，缺了构建会直接失败：
+#   TAURI_SIGNING_PRIVATE_KEY          —— 私钥文件原文（单行 base64，不是路径）
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD —— 生成密钥时设的口令
+#
+# 本机密钥位置（2026-09-20 生成，Minisign）：
+#   C:\Users\XB-II-EN\.tauri\agentmux.key     私钥
+#   C:\Users\XB-II-EN\.tauri\agentmux.key.pub 公钥——已填进 src-tauri/tauri.conf.json 的 plugins.updater.pubkey
+#
+# 取值不用手打，复制到剪贴板再往 GitHub 粘贴即可，免得私钥留在终端回滚里：
+#   type "%USERPROFILE%\.tauri\agentmux.key" | clip
+# 粘贴位置：仓库 Settings → Secrets and variables → Actions → New repository secret
+#
+# 密钥或口令丢一个，已发布版本就永久收不到更新（Minisign 没有找回机制）。
+# 这两样请另存一份备份，并且不要重新生成密钥——换密钥会让所有旧版本的更新校验失败。
 on:
   push:
     tags:
@@ -41,20 +56,76 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      # 应用内更新靠版本号对比：tag 与 tauri.conf.json 的 version 对不上，
+      # 就会发出去一个谁都收不到更新的版本。这里直接拦住，别静默地错。
+      - name: 校验 tag 与 tauri.conf.json 版本一致
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "v$conf" != "$tag" ]; then
+            echo "::error::tag $tag 与 src-tauri/tauri.conf.json 的 version $conf 不一致，拒绝发布"
+            exit 1
+          fi
+          echo "版本一致：$tag"
+
+      # 两个 Secret 是只写的，配错了在本地看不出来，所以这里先卡一道。
+      # 私钥内容里混进换行（在 GitHub 网页上粘贴时最容易发生）会让 CLI 的 base64
+      # 严格解码在**打包末尾**才报 `Invalid symbol 10`：白等十几分钟，而且那时
+      # tauri-action 可能已经建出了空的 Release。提前失败 = 不跑 tauri-action = 不留脏数据。
+      - name: 校验签名密钥
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          node -e '
+            const key = process.env.TAURI_SIGNING_PRIVATE_KEY || "";
+            const password = process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || "";
+            const fail = (msg) => { console.error("::error::" + msg); process.exit(1) };
+
+            if (!key) fail("Secret TAURI_SIGNING_PRIVATE_KEY 没有配置");
+            if (!password) fail("Secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD 没有配置（生成密钥时输入的那个口令）");
+            if (/\s/.test(key)) fail("TAURI_SIGNING_PRIVATE_KEY 里含空白字符，多半是粘贴时带进了结尾换行。请只粘贴私钥文件的内容，末尾不要多按回车");
+
+            const lines = Buffer.from(key, "base64").toString("utf8").split("\n").filter((l) => l.trim());
+            if (lines.length < 2 || !lines[0].startsWith("untrusted comment:")) {
+              fail("TAURI_SIGNING_PRIVATE_KEY 不是 minisign 密钥文件的内容，请重新复制");
+            }
+            const box = Buffer.from(lines[1], "base64");
+            if (box.length !== 158) {
+              fail("私钥内容长度不对（" + box.length + " 字节，应为 158）——多半是粘贴被截断，或误粘了 42 字节的 .key.pub");
+            }
+
+            console.log("签名密钥格式正常（" + key.length + " 字符）");
+          '
+
       # tauri-action 会自动执行 build.beforeBuildCommand 构建前端、
       # 编译 Rust、生成 msi/nsis 安装包，并把它们作为 Release 资产上传。
       - name: 构建并发布
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 有这两个密钥，tauri-action 会额外产出 .sig 与 latest.json 并一起上传，
+          # 应用内的「检查更新」就是读 latest.json 的。取值见文件头注释。
+          # 本地手动打包同样躲不掉签名——tauri.conf.json 开了 createUpdaterArtifacts，
+          # 没带密钥跑 `cargo tauri build` 会直接失败，先在 cmd 里设：
+          #   set TAURI_SIGNING_PRIVATE_KEY_PATH=%USERPROFILE%\.tauri\agentmux.key
+          #   set TAURI_SIGNING_PRIVATE_KEY_PASSWORD=<口令>
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: "AgentMux ${{ github.event.inputs.tag || github.ref_name }}"
           releaseBody: |
             Windows 安装包（自动构建）：
 
+            - `AgentMux_*_x64-setup.exe` —— NSIS 安装程序（**推荐**）
             - `AgentMux_*_x64_en-US.msi` —— MSI 安装包
-            - `AgentMux_*_x64-setup.exe` —— NSIS 安装程序
+
+            装完之后不用再手动下载：应用启动时会自己检查新版本，界面上出现
+            「发现新版本」时点「立即更新」即可。自动更新走的是 NSIS 安装版，
+            MSI 只作首次安装的备选。
 
             装完首次使用：
 
