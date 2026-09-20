@@ -12,6 +12,7 @@
 //! 其中 `type` 是 `group` / `direct`，`name` 群聊给群名、单聊给对方用户名，
 //! 正好就是界面要显示的东西。
 
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -77,11 +78,28 @@ fn normalize_kind(raw: Option<&str>) -> String {
 
 /// 统一跑一次 dws：隐藏控制台 + 超时 + 失败时把 stderr 摘要带回来。
 async fn run_dws(dws_path: &str, args: &[&str], timeout_secs: u64) -> anyhow::Result<String> {
+    run_dws_in(dws_path, args, None, timeout_secs).await
+}
+
+/// 同 [`run_dws`]，但可以指定子进程的工作目录。
+///
+/// 附件下载**必须**带 cwd：`--output-dir` 只接受工作目录内的相对路径，dws 按
+/// 自己的 cwd 解析它 —— 而那个「工作目录」必须正是 Agent 的可见范围，否则下
+/// 载下来的文件 Agent 读不到。
+pub(crate) async fn run_dws_in(
+    dws_path: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout_secs: u64,
+) -> anyhow::Result<String> {
     let mut command = tokio::process::Command::new(dws_path);
     command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     crate::process::hide_console(&mut command);
 
     let child = command.spawn()?;
