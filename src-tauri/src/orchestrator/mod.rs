@@ -3054,6 +3054,134 @@ process.stdout.write("收到 " + process.cwd());
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 桩 Agent：先吐思考块，停一下再吐正文块与 result —— 模拟真实 CLI 的
+    /// stream-json（块级到达，思考在前、正文在后）。
+    const STREAMING_AGENT_STUB: &str = r#"
+process.stdout.write('{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"我在想这件事"}]}}' + "\n");
+setTimeout(function () {
+  process.stdout.write('{"type":"assistant","message":{"content":[{"type":"text","text":"这是回复"}]}}' + "\n");
+  process.stdout.write('{"type":"result","result":"这是回复"}' + "\n");
+}, 600);
+"#;
+
+    /// **界面契约验收**：生成中的块要经**监听频道**送到前端，字段名与前端
+    /// `ListenerUpdate` 的 progress 分支一致（前端靠 conversation_id 匹配会话、
+    /// 靠 message_id 把气泡挂到具体某一条上）。
+    ///
+    /// 这条链路此前只有 reply.rs 的回调单测，没人验过 orchestrator 是否真的转发了 ——
+    /// 也就是说界面可能"看起来没流式"，而单测全绿。
+    #[tokio::test]
+    async fn progress_chunks_are_forwarded_to_the_listener_channel() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let base = std::env::temp_dir().join("agentmux-e2e-progress");
+        let _ = std::fs::remove_dir_all(&base);
+        let stub_dir = base.join("stub");
+        let work_dir = base.join("project-workdir");
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        std::fs::write(stub_dir.join("event"), EVENT_STUB).unwrap();
+        std::fs::write(stub_dir.join("chat"), CHAT_STUB).unwrap();
+        std::fs::write(stub_dir.join("agentstub"), STREAMING_AGENT_STUB).unwrap();
+        let agent_stub_path = stub_dir.join("agentstub").to_string_lossy().to_string();
+
+        // 频道收到的每条 JSON 按到达顺序记下来，稍后按真实线格式断言。
+        let received: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    sink.lock().unwrap().push(value);
+                }
+            }
+            Ok(())
+        });
+
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let mut orchestrator = Orchestrator::new(storage.clone());
+        orchestrator.set_dws_path(Some(node.clone())).await;
+
+        let settings = ReplySettings {
+            enabled: true,
+            agent_platform: "stub".to_string(),
+            agent_cli_path: Some(node),
+            agent_args: Some(vec![agent_stub_path]),
+            agent_cwd: work_dir.to_string_lossy().to_string(),
+            timeout_ms: 20_000,
+            reply_batch_window_ms: 200,
+            max_chars: 500,
+            ..Default::default()
+        };
+
+        // 改 cwd 前拿锁，直到本测试恢复 cwd 为止（见 CWD_LOCK 的说明）。
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener("proj-P".to_string(), ListenKind::AtMe, settings, Some(channel))
+            .await
+            .expect("应能启动监听");
+
+        // 等台账落终态：说明生成与发送都走完了，块该到的也都到了。
+        for _ in 0..160 {
+            sleep(Duration::from_millis(250)).await;
+            let done = storage
+                .lock()
+                .await
+                .list_events(&EventQuery {
+                    limit: 10,
+                    project_id: Some("proj-P".to_string()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .iter()
+                .any(|row| row.reply_status.is_some());
+            if done {
+                break;
+            }
+        }
+
+        let _ = orchestrator.stop_listener(&id).await;
+        std::env::set_current_dir(previous).unwrap();
+        drop(orchestrator);
+        drop(storage);
+        sleep(Duration::from_millis(200)).await;
+        let _ = std::fs::remove_dir_all(&base);
+
+        let messages = received.lock().unwrap().clone();
+        let progress: Vec<&serde_json::Value> = messages
+            .iter()
+            .filter(|value| value.get("type").and_then(|kind| kind.as_str()) == Some("progress"))
+            .collect();
+
+        assert_eq!(
+            progress.len(),
+            2,
+            "应恰好推两个块（思考 + 正文），实际收到的频道消息: {messages:?}"
+        );
+        // 顺序必须是思考在前 —— 界面靠到达顺序铺气泡。
+        assert_eq!(progress[0]["phase"], "thinking");
+        assert_eq!(progress[0]["text"], "我在想这件事");
+        assert_eq!(progress[1]["phase"], "answer");
+        assert_eq!(progress[1]["text"], "这是回复");
+
+        for value in &progress {
+            assert_eq!(value["type"], "progress", "前端按 type 分流");
+            assert_eq!(value["conversation_id"], "cid-1", "界面按它匹配当前会话");
+            assert_eq!(
+                value["message_id"], "msg-stub-1",
+                "界面按它把气泡挂到具体某一条上（否则新一轮会追加到上一轮尾巴）"
+            );
+        }
+    }
+
     /// 桩 dws 的事件端：**同一会话连发 3 条**，模拟「一次性收到 n 个 @我」。
     const BURST_EVENT_STUB: &str = r#"
 const READY = "[event] ready event_key=user_im_message_receive_at subscribe_id=subId-burst bus_pid=1";
