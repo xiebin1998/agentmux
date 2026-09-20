@@ -17,6 +17,8 @@ interface AppConfig {
   agent_cli_path: string | null;
   agent_cwd: string | null;
   agent_args: string[] | null;
+  /** 权限放行档位："" / "auto" / "no_ask" / "full"；空 = 用 CLI 默认 */
+  permission_mode?: string | null;
   reply_enabled: boolean;
   reply_timeout_ms: number;
   reply_max_chars: number;
@@ -301,6 +303,40 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
             按各项目的上下文预算换算成字符数；设为 0% 表示不自动压缩。
             连续压缩失败 3 次会自动暂停。
           </div>
+        </div>
+      </div>
+
+      <div style={section}>
+        <div style={sectionTitle}>权限放行（全局）</div>
+        <select
+          value={config.permission_mode ?? ""}
+          onChange={(e) => patch({ permission_mode: e.target.value || null })}
+          style={input}
+        >
+          <option value="">跟随 CLI 默认（推荐）</option>
+          <option value="auto">自动批准：由 CLI 判断该不该放行</option>
+          <option value="no_ask">不询问：不弹审批提示</option>
+          <option value="full">完全放行：跳过所有检查</option>
+        </select>
+        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
+          决定 Agent 执行命令、联网这类操作时要不要人工放行。三个 CLI 的写法不一样
+          （Qoder / Claude 用 <code>--permission-mode</code>，Codex 用 <code>-a</code>），
+          系统会按当前平台自动翻译，你不用记。
+          {config.permission_mode === "full" && (
+            <>
+              <br />
+              <strong>完全放行意味着不再有人审查 Agent 要执行什么</strong>：机器人会按
+              任何人在钉钉里发来的消息行动，风险明显变大。只在你清楚后果时用，
+              用到就尽快切回来。
+            </>
+          )}
+          {config.permission_mode === "auto" && (
+            <>
+              <br />
+              注意：这一档要过安全分类器，分类器不可用时相关操作会被整片拦下
+              （日志里会写「分类器暂时不可用」）—— 那时可临时切到「完全放行」。
+            </>
+          )}
         </div>
       </div>
 

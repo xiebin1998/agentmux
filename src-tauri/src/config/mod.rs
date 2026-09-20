@@ -50,6 +50,11 @@ pub struct AppConfig {
     /// 实测合法值：auto/none/low/medium/high/xhigh/max/ultracode；界面只暴露低/中/高。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// 权限放行档位（归一化的 `auto` / `no_ask` / `full`）。空 = 不传、用 CLI 默认。
+    ///
+    /// 三个 CLI 的旗标与大小写都不同，由 `reply::permission_args` 按平台翻译。
+    #[serde(default)]
+    pub permission_mode: Option<String>,
     pub reply_enabled: bool,
     pub reply_timeout_ms: u64,
     pub reply_max_chars: usize,
@@ -88,6 +93,7 @@ impl Default for AppConfig {
             agent_args: None,
             agent_model: None,
             reasoning_effort: None,
+            permission_mode: None,
             reply_enabled: false,
             reply_timeout_ms: 120_000,
             reply_max_chars: 500,
@@ -340,6 +346,7 @@ pub fn reply_settings() -> crate::reply::ReplySettings {
             .filter(|args| !args.is_empty()),
         agent_model: config.agent_model.clone(),
         reasoning_effort: config.reasoning_effort.clone(),
+        permission_mode: config.permission_mode.clone(),
         agent_cwd,
         timeout_ms: config.reply_timeout_ms,
         max_chars: config.reply_max_chars,
@@ -417,6 +424,10 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
             .reasoning_effort
             .clone()
             .filter(|effort| !effort.trim().is_empty()),
+        permission_mode: global
+            .permission_mode
+            .clone()
+            .filter(|level| !level.trim().is_empty()),
         agent_cwd: project.work_dir.clone(),
         timeout_ms: project.reply_timeout_ms,
         max_chars: project.reply_max_chars,

@@ -26,6 +26,9 @@ pub struct ReplySettings {
     /// 实测合法值：`auto / none / low / medium / high / xhigh / max / ultracode`。
     /// 界面只暴露低/中/高 + 默认，其余留给命令行党。
     pub reasoning_effort: Option<String>,
+    /// 权限放行档位。为空 = 完全不传、用 CLI 自己的默认行为。
+    /// 取值是**归一化**的 `auto` / `no_ask` / `full`，由 [`permission_args`] 按平台翻译。
+    pub permission_mode: Option<String>,
     pub agent_cwd: String,
     pub timeout_ms: u64,
     pub max_chars: usize,
@@ -56,6 +59,7 @@ impl Default for ReplySettings {
             agent_args: None,
             agent_model: None,
             reasoning_effort: None,
+            permission_mode: None,
             agent_cwd: String::new(),
             timeout_ms: 120_000,
             max_chars: 500,
@@ -108,6 +112,38 @@ pub fn json_output_args(platform_id: &str) -> Vec<String> {
     }
 }
 
+/// 把归一化的权限档位翻译成**该平台自己的旗标**。
+///
+/// **三个 CLI 各不相同**（2026-09-20 逐个 `--help` 实测）：
+///
+/// | 档位 | Qoder | Claude | Codex |
+/// |---|---|---|---|
+/// | `auto` 自动批准 | `--permission-mode auto` | `--permission-mode auto` | `-a on-request` |
+/// | `no_ask` 不询问 | `--permission-mode dont_ask` | `--permission-mode dontAsk` | `-a never` |
+/// | `full` 完全放行 | `--permission-mode bypass_permissions` | `--permission-mode bypassPermissions` | `--dangerously-bypass-approvals-and-sandbox` |
+///
+/// 连大小写风格都不同（Qoder 是 snake_case、Claude 是 camelCase），而 **Codex 根本没有
+/// `--permission-mode`** —— 它把这件事拆成「审批」与「沙箱」两个正交轴。所以不能一个值通吃。
+///
+/// 平台没适配或档位未知时返回空：**不传**，保持该 CLI 的默认行为，绝不猜。
+pub fn permission_args(platform_id: &str, level: &str) -> Vec<String> {
+    let mode = match (platform_id, level) {
+        ("qoder", "auto") => "auto",
+        ("qoder", "no_ask") => "dont_ask",
+        ("qoder", "full") => "bypass_permissions",
+        ("claude", "auto") => "auto",
+        ("claude", "no_ask") => "dontAsk",
+        ("claude", "full") => "bypassPermissions",
+        ("codex", "auto") => return vec!["-a".to_string(), "on-request".to_string()],
+        ("codex", "no_ask") => return vec!["-a".to_string(), "never".to_string()],
+        ("codex", "full") => {
+            return vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        }
+        _ => return Vec::new(),
+    };
+    vec!["--permission-mode".to_string(), mode.to_string()]
+}
+
 /// 组装调用 Agent CLI 的参数（**不含会话参数**：`--resume` / `--session-id`
 /// 必须留在最末尾，否则会被变长的 `--tools` 当成工具名吃掉，见模块头注释）。
 ///
@@ -133,6 +169,10 @@ pub fn build_cli_args(settings: &ReplySettings) -> Vec<String> {
     if let Some(effort) = non_blank(&settings.reasoning_effort) {
         args.push("--reasoning-effort".to_string());
         args.push(effort.to_string());
+    }
+    // 权限放行：按平台翻译；没设就完全不传，保持 CLI 自己的默认行为。
+    if let Some(level) = non_blank(&settings.permission_mode) {
+        args.extend(permission_args(&settings.agent_platform, level));
     }
 
     args
@@ -972,6 +1012,61 @@ mod tests {
 
         assert!(!args.iter().any(|arg| arg == "--resume"));
         assert!(!args.iter().any(|arg| arg == "--session-id"));
+    }
+
+    /// 权限档位必须**按平台**翻译 —— 三个 CLI 的旗标与大小写都不同（实测）。
+    #[test]
+    fn permission_mode_is_mapped_per_platform() {
+        assert_eq!(
+            permission_args("qoder", "no_ask"),
+            vec!["--permission-mode", "dont_ask"],
+            "qoder 是 snake_case"
+        );
+        assert_eq!(
+            permission_args("claude", "no_ask"),
+            vec!["--permission-mode", "dontAsk"],
+            "claude 是 camelCase"
+        );
+        assert_eq!(
+            permission_args("codex", "no_ask"),
+            vec!["-a", "never"],
+            "codex 根本没有 --permission-mode"
+        );
+        assert_eq!(
+            permission_args("qoder", "full"),
+            vec!["--permission-mode", "bypass_permissions"]
+        );
+        assert_eq!(
+            permission_args("codex", "full"),
+            vec!["--dangerously-bypass-approvals-and-sandbox"]
+        );
+    }
+
+    /// 没设、平台没适配、档位写错 —— 一律**不传**，保持 CLI 默认，绝不猜。
+    #[test]
+    fn unadapted_permission_mode_adds_nothing() {
+        assert!(permission_args("codex", "随便写的").is_empty());
+        assert!(permission_args("newcli", "full").is_empty());
+        assert!(!build_cli_args(&ReplySettings::default())
+            .iter()
+            .any(|arg| arg == "--permission-mode"));
+    }
+
+    #[test]
+    fn permission_mode_reaches_the_cli() {
+        let settings = ReplySettings {
+            agent_platform: "qoder".to_string(),
+            permission_mode: Some("no_ask".to_string()),
+            ..Default::default()
+        };
+
+        let args = build_cli_args(&settings);
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "dont_ask"]),
+            "实际: {args:?}"
+        );
     }
 
     /// 联网检索：**只列进 `--tools` 不够**，实测会被权限层拒（回复「搜索不可用」）。
