@@ -925,7 +925,7 @@ impl Shared {
             let event = event.clone();
             tokio::spawn(async move {
                 shared
-                    .finish_reply(&event, "skipped", Some("该项目未启用自动回复"))
+                    .finish_reply(&event, "skipped", Some("该项目未启用自动回复"), None)
                     .await
             });
         }
@@ -967,7 +967,7 @@ impl Shared {
                 " 畸形或会话为空，跳过",
             )
             .await;
-            self.finish_reply(&event, "skipped", None).await;
+            self.finish_reply(&event, "skipped", None, None).await;
             return;
         }
 
@@ -976,7 +976,7 @@ impl Shared {
                 self.trace(&event.message_id, "⑦ 单条判定", " 发送者是本人，跳过")
                     .await;
                 self.push_log("跳过自己发送的消息").await;
-                self.finish_reply(&event, "skipped", None).await;
+                self.finish_reply(&event, "skipped", None, None).await;
                 return;
             }
         }
@@ -991,7 +991,7 @@ impl Shared {
                 " 未解析到 Agent CLI，无法生成回复",
             )
             .await;
-            self.finish_reply(&event, "failed", Some("未解析到 Agent CLI，无法生成回复"))
+            self.finish_reply(&event, "failed", Some("未解析到 Agent CLI，无法生成回复"), None)
                 .await;
             return;
         }
@@ -1228,7 +1228,7 @@ impl Shared {
         };
         let Some(agent_cli) = reply.agent_cli_path.clone() else {
             for item in &events {
-                self.finish_reply(item, "failed", Some("未解析到 Agent CLI，无法生成回复"))
+                self.finish_reply(item, "failed", Some("未解析到 Agent CLI，无法生成回复"), None)
                     .await;
             }
             return;
@@ -1675,9 +1675,13 @@ impl Shared {
 
     /// 一批消息共用一个结果。必须逐条写台账，否则这批里除第一条外的消息
     /// 会一直停在「没状态」上，界面看起来又变成「收到了但没回复」。
+    ///
+    /// `reply_anchor` 用本批**最后一条**：合并回复在对话流里只该展开成一轮助手输出，
+    /// 挂在每条上会重复显示。落库仍写每条 —— 事件列表要逐条可查。
     async fn finish_batch(&self, events: &[ChatEvent], status: &str, text: Option<&str>) {
+        let anchor = events.last().map(|item| item.message_id.clone());
         for item in events {
-            self.finish_reply(item, status, text).await;
+            self.finish_reply(item, status, text, anchor.as_deref()).await;
         }
     }
 
@@ -1689,10 +1693,16 @@ impl Shared {
         }
     }
 
-    async fn finish_reply(&self, event: &ChatEvent, status: &str, text: Option<&str>) {
+    async fn finish_reply(
+        &self,
+        event: &ChatEvent,
+        status: &str,
+        text: Option<&str>,
+        reply_anchor: Option<&str>,
+    ) {
         if !event.message_id.is_empty() {
             let storage = self.storage.lock().await;
-            if let Err(err) = storage.mark_processed(&event.message_id, status, text) {
+            if let Err(err) = storage.mark_processed(&event.message_id, status, text, reply_anchor) {
                 drop(storage);
                 self.push_log(&format!("回复台账写入失败: {}", err)).await;
                 return;
@@ -3938,6 +3948,17 @@ process.stdin.on("end", function () {
                 "同一批应共用同一条回复"
             );
         }
+
+        // 合并回复在对话流里只该展开成**一轮助手输出**：三条共用同一个锚点，
+        // 且锚点是这批**最后一条**（界面只在那条上画思考/工具/回复，其余标注一句）。
+        assert!(
+            rows.iter()
+                .all(|row| row.reply_anchor.as_deref() == Some("msg-b3")),
+            "一批 3 条应共用锚点 msg-b3，实际: {:?}",
+            rows.iter()
+                .map(|row| (row.message_id.as_str(), row.reply_anchor.as_deref()))
+                .collect::<Vec<_>>()
+        );
 
         // Agent 必须看到全部三条内容，否则合并就是假的。
         let prompt = prompt.expect("桩 Agent 应收到 prompt");

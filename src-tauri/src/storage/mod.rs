@@ -42,6 +42,8 @@ pub struct EventRow {
     pub reasoning: Option<String>,
     /// 本次回复用过的工具（每行一条）；没用工具或还没回过就是 None。
     pub tools: Option<String>,
+    /// 这批回复挂在哪条消息上（合并回复只在该条上展开）；老的单条记录为 None。
+    pub reply_anchor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +185,8 @@ impl Storage {
             "ALTER TABLE events ADD COLUMN reasoning TEXT",
             // 本次回复用过的工具（每行一条，如 `Read · a.rs`）。同样生成后才有。
             "ALTER TABLE events ADD COLUMN tools TEXT",
+            // 这一批回复挂在哪条消息上（一批多条的合并回复只该在最后一条上展开）。
+            "ALTER TABLE events ADD COLUMN reply_anchor TEXT",
             // 「删掉的会话」墓碑：记删除时的最大事件序号。之后又来了新消息
             // （序号更大）会话会自己回来，见 list_conversations。
             "ALTER TABLE conversations ADD COLUMN deleted_seq INTEGER",
@@ -476,7 +480,7 @@ impl Storage {
         let mut sql = String::from(
             "SELECT project_id, message_id, conversation_id, sender, sender_open_dingtalk_id, content,
                     create_time, received_at, listen_kind, malformed, processed, reply_status, reply_text,
-                    reasoning, tools
+                    reasoning, tools, reply_anchor
              FROM events WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -535,6 +539,7 @@ impl Storage {
                 reply_text: row.get(12)?,
                 reasoning: row.get(13)?,
                 tools: row.get(14)?,
+                reply_anchor: row.get(15)?,
             })
         })?;
 
@@ -731,19 +736,26 @@ impl Storage {
         )?)
     }
 
+    /// 写回复台账。
+    ///
+    /// `reply_anchor` = 这批回复该挂在**哪条消息**上：合并回复只该在最后一条上展开，
+    /// 否则对话流里同一段助手输出会重复出现。单条事件传 None（无需再区分）。
     pub fn mark_processed(
         &self,
         message_id: &str,
         status: &str,
         reply_text: Option<&str>,
+        reply_anchor: Option<&str>,
     ) -> Result<()> {
         self.db.execute(
-            "UPDATE events SET processed = TRUE, reply_status = ?1, reply_text = ?2, reply_sent_at = ?3
-             WHERE message_id = ?4",
+            "UPDATE events SET processed = TRUE, reply_status = ?1, reply_text = ?2, reply_sent_at = ?3,
+                    reply_anchor = COALESCE(?4, reply_anchor)
+             WHERE message_id = ?5",
             params![
                 status,
                 reply_text,
                 chrono::Local::now().to_rfc3339(),
+                reply_anchor,
                 message_id,
             ],
         )?;
@@ -1114,6 +1126,51 @@ mod tests {
         // 别串到相邻列：正文与回复正文不能被 reasoning 顶掉。
         assert_eq!(rows[0].content, "@我 看一下");
         assert_eq!(rows[0].reply_text, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 台账写入要能带上「这批回复挂在哪条」的锚点 —— 界面靠它把合并回复
+    /// 只展开成一轮助手输出，而不是在每条消息下面重复三遍。
+    #[test]
+    fn mark_processed_records_the_batch_anchor() {
+        let dir = std::env::temp_dir().join("agentmux-mark-anchor-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir.clone()).unwrap();
+
+        for id in ["msg-a", "msg-b", "msg-c"] {
+            storage.save_event(&sample_event(id, "cid-1", "p1")).unwrap();
+        }
+
+        // 合并回复：每条都写正文（事件列表要逐条可查），但锚点统一指向最后一条。
+        for id in ["msg-a", "msg-b"] {
+            storage
+                .mark_processed(id, "sent", Some("合并后的回复"), Some("msg-b"))
+                .unwrap();
+        }
+        // 单条事件不传锚点：保持 NULL，界面在自身展开。
+        storage
+            .mark_processed("msg-c", "sent", Some("单条回复"), None)
+            .unwrap();
+
+        let rows = storage
+            .list_events(&EventQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let by_id = |id: &str| {
+            rows.iter()
+                .find(|row| row.message_id == id)
+                .unwrap_or_else(|| panic!("缺少 {id}"))
+        };
+        assert_eq!(
+            by_id("msg-a").reply_anchor.as_deref(),
+            Some("msg-b"),
+            "批内非锚点消息也要带上锚点"
+        );
+        assert_eq!(by_id("msg-b").reply_anchor.as_deref(), Some("msg-b"));
+        assert_eq!(by_id("msg-c").reply_anchor, None, "单条不传锚点应为 NULL");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

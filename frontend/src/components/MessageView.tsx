@@ -29,6 +29,8 @@ interface EventRow {
   reasoning: string | null;
   /** 这次用过的工具（每行一条）；没用工具或还没回过就是 null。 */
   tools: string | null;
+  /** 这批回复挂在哪条消息上；null = 单条回复或老记录，直接在自身展开。 */
+  reply_anchor: string | null;
 }
 
 /** conversation_details 命令的返回里，会话窗口头部用得上的部分。 */
@@ -481,13 +483,20 @@ export default function MessageView({
                 streaming != null &&
                 event.reply_status == null &&
                 Date.now() - streaming.updatedAt < LIVE_TIMEOUT_MS;
-              const status = statusText(event, live);
+              const mergedIntoAnchor =
+                event.reply_anchor != null && event.reply_anchor !== event.message_id;
+              // 合并回复只在锚点那条上展开成一轮助手输出；其余批内消息只标注一句，
+              // 否则同一段思考/工具/回复会在对话流里重复出现。
+              const status = mergedIntoAnchor
+                ? { text: "已合进下面那条的回复", color: "var(--text-muted)" }
+                : statusText(event, live);
               // 生成中：思考块用增量文本；生成完：用落库的整段。
-              const thinking = live ? streaming.thinking : event.reasoning;
-              const answer = live ? streaming.answer : event.reply_text;
+              const thinking = mergedIntoAnchor ? null : live ? streaming.thinking : event.reasoning;
+              const answer = mergedIntoAnchor ? null : live ? streaming.answer : event.reply_text;
               const showThinking = thinking != null && thinking !== "";
-              const tools =
-                live && streaming.tools.length > 0
+              const tools = mergedIntoAnchor
+                ? []
+                : live && streaming.tools.length > 0
                   ? streaming.tools
                   : (event.tools ?? "").split("\n").filter((line) => line.trim() !== "");
 
@@ -578,7 +587,7 @@ export default function MessageView({
                     )}
 
                     <div style={{ fontSize: "11px", color: status.color }}>
-                      {event.reply_status === "sent" && event.received_at
+                      {event.reply_status === "sent" && event.received_at && !mergedIntoAnchor
                         ? `${status.text} ${new Date(event.received_at).toLocaleTimeString()}`
                         : status.text}
                     </div>
