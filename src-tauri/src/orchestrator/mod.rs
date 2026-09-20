@@ -174,14 +174,28 @@ impl Orchestrator {
 
     /// 压缩某会话的上下文并落盘为最新一版摘要（A7.1.3 / A7.2.1）。
     /// 压缩要走 Agent，因此需要调用方传入该会话所属项目的回复设置。
+    ///
+    /// 压缩成功后会**重置该会话的 Agent 会话**（见 `reset_reply_session`）——
+    /// 不重置的话压缩只是多存了一份摘要，模型耗时降不下来。
     pub async fn compress_conversation(
         &self,
         settings: ReplySettings,
+        project_id: &str,
         conversation_id: &str,
     ) -> anyhow::Result<crate::storage::Summary> {
         let summary = compress_with(&self.storage, settings, conversation_id).await?;
-        self.push_global_log(&format!("已压缩会话 {} 的上下文", conversation_id))
-            .await;
+        reset_reply_session(
+            &self.storage,
+            project_id,
+            conversation_id,
+            &self.last_context_ratio,
+        )
+        .await;
+        self.push_global_log(&format!(
+            "已压缩会话 {} 的上下文，并换了新会话（摘要承接前情）",
+            conversation_id
+        ))
+        .await;
         Ok(summary)
     }
 
@@ -1239,7 +1253,19 @@ impl Shared {
             self.trace(&event.conversation_id, "⑩ 压缩判定", " → 触发压缩")
                 .await;
             match compress_with(&self.storage, reply.clone(), &event.conversation_id).await {
-                Ok(_) => *self.compress_failures.lock().await = 0,
+                Ok(_) => {
+                    *self.compress_failures.lock().await = 0;
+                    // 压缩完必须换新会话，否则模型耗时降不下来（摘要在提示词里承接前情）。
+                    reset_reply_session(
+                        &self.storage,
+                        &self.project_id,
+                        &event.conversation_id,
+                        &self.last_context_ratio,
+                    )
+                    .await;
+                    self.push_log("已压缩该会话上下文，并换了新会话（摘要承接前情）")
+                        .await;
+                }
                 Err(err) => {
                     let count = {
                         let mut failures = self.compress_failures.lock().await;
@@ -1729,6 +1755,25 @@ async fn compress_with(
         .ok_or_else(|| anyhow::anyhow!("摘要写入后读取失败"))
 }
 
+/// 压缩成功后**重置该会话的 Agent 会话**。
+///
+/// 光存摘要是不够的：摘要是给提示词用的，而**真正拖慢每次调用的是那个被 resume 的
+/// Agent 会话**（实测长到 6.3 万 token、resume 了 3 小时）。不清它，下次回复照样
+/// resume 一大坨历史，耗时一点没降。清掉之后：摘要 + 近期消息保证连贯性，新会话从零起算。
+async fn reset_reply_session(
+    storage: &Arc<Mutex<Storage>>,
+    project_id: &str,
+    conversation_id: &str,
+    last_context_ratio: &Arc<Mutex<HashMap<String, f64>>>,
+) {
+    {
+        let storage = storage.lock().await;
+        let _ = storage.delete_session(project_id, conversation_id);
+    }
+    // 内存里的占比基线也要清：否则下一次判定会拿旧基线**立刻又触发一次压缩**。
+    last_context_ratio.lock().await.remove(conversation_id);
+}
+
 /// 是否该自动压缩。阈值留空 = 该维度不触发（D-59 未定值，不拍脑袋）。
 async fn compression_due_with(
     storage: &Arc<Mutex<Storage>>,
@@ -2167,6 +2212,82 @@ process.stdin.on("end", function () { process.exit(0); });
         assert_eq!(updated, 1, "在跑的监听应被下发");
         assert_eq!(empty, 0, "没有项目时不该有更新");
         assert_eq!(applied, 111, "下发的设置必须覆盖启动时的快照");
+    }
+
+    /// 压缩后必须**换新会话**：不换的话摘要在提示词里、会话还是那一大坨，
+    /// 模型耗时降不下来；而且内存里的旧占比会让下一次判定立刻又触发压缩。
+    #[tokio::test]
+    async fn reset_reply_session_clears_both_db_and_baseline() {
+        let data_dir = std::env::temp_dir().join("agentmux-reset-session-test");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        storage
+            .lock()
+            .await
+            .save_session("p1", "cid-1", "sess-1", "D:/work")
+            .unwrap();
+        storage
+            .lock()
+            .await
+            .save_session("p1", "cid-2", "sess-2", "D:/work")
+            .unwrap();
+
+        let ratio = Arc::new(Mutex::new(HashMap::new()));
+        ratio.lock().await.insert("cid-1".to_string(), 0.75);
+
+        reset_reply_session(&storage, "p1", "cid-1", &ratio).await;
+
+        assert!(
+            storage.lock().await.get_session("p1", "cid-1").unwrap().is_none(),
+            "会话记录必须被清掉，下次才会走新会话"
+        );
+        assert!(
+            ratio.lock().await.get("cid-1").is_none(),
+            "内存占比基线也要清，否则下一次判定会立刻又触发压缩"
+        );
+        assert!(
+            storage.lock().await.get_session("p1", "cid-2").unwrap().is_some(),
+            "别的会话不受影响"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// 自动压缩要**开箱可用**：开关默认开 + 有一个正的占比阈值。
+    /// 三个阈值都为空时 `compression_due_with` 直接返回 false —— 等于没开。
+    #[test]
+    fn auto_compression_defaults_are_usable() {
+        let config = crate::config::AppConfig::default();
+
+        assert!(config.auto_compress, "默认应开启自动压缩");
+        assert!(
+            config.compress_trigger_percent.unwrap_or(0) > 0,
+            "没有阈值的话自动压缩永远不会触发"
+        );
+    }
+
+    #[tokio::test]
+    async fn compression_triggers_above_the_percent_threshold() {
+        let data_dir = std::env::temp_dir().join("agentmux-compress-due-test");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let failures = Arc::new(Mutex::new(0));
+        let reply = ReplySettings {
+            auto_compress: true,
+            compress_trigger_percent: Some(60),
+            ..Default::default()
+        };
+
+        assert!(
+            compression_due_with(&storage, &failures, "cid", &reply, Some(0.70)).await,
+            "占比 70% 超过阈值 60% 应触发"
+        );
+        assert!(
+            !compression_due_with(&storage, &failures, "cid", &reply, Some(0.30)).await,
+            "30% 不该触发"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// 项目设置保存后必须**热更新**到正在跑的监听。

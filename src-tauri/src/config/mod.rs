@@ -100,8 +100,10 @@ impl Default for AppConfig {
             context_enabled: true,
             context_message_limit: 50,
             context_max_chars: 8000,
-            auto_compress: false,
-            compress_trigger_percent: None,
+            auto_compress: true,
+            // 占比阈值：Agent 报过真实占用比例后按它判定。60% 是**可改的初值**，
+            // 界面滑块随时能覆盖；不设值的话自动压缩根本不会触发。
+            compress_trigger_percent: Some(60),
             compress_trigger_turns: None,
             compress_trigger_chars: None,
         }

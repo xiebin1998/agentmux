@@ -563,7 +563,7 @@ pub async fn compress_now(
 
     let orchestrator = state.orchestrator.lock().await;
     orchestrator
-        .compress_conversation(settings, &conversation_id)
+        .compress_conversation(settings, &project_id, &conversation_id)
         .await
         .map_err(|e| e.to_string())
 }

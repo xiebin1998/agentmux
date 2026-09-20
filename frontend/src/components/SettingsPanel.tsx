@@ -267,7 +267,7 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
             onChange={(e) => patch({ auto_compress: e.target.checked })}
             style={{ accentColor: "var(--accent)" }}
           />
-          启用自动压缩（默认关闭）
+          启用自动压缩（压缩后会换新会话，摘要承接前情）
         </label>
 
         <div style={{ opacity: config.auto_compress ? 1 : 0.5 }}>
