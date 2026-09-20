@@ -52,6 +52,11 @@ interface AgentSessionInfo {
   agent_cwd: string;
 }
 
+/** project_runtime_settings 的返回里，这里只需要「我自己是谁」。 */
+interface RuntimeIdentity {
+  self_open_id: string | null;
+}
+
 const KIND_LABEL: Record<string, string> = { group: "群聊", direct: "单聊" };
 
 /** 列表刷新周期。生成中的块走监听频道即时到达，这里只是兜底对齐权威数据。 */
@@ -207,7 +212,7 @@ export default function MessageView({
     const load = async () => {
       setLoading(true);
       try {
-        const [nextEvents, nextDetails] = await Promise.all([
+        const [nextEvents, nextDetails, identity] = await Promise.all([
           invoke<EventRow[]>("list_events", {
             projectId: session.project_id,
             conversationId: session.conversation_id,
@@ -217,9 +222,19 @@ export default function MessageView({
             projectId: session.project_id,
             conversationId: session.conversation_id,
           }).catch(() => null),
+          invoke<RuntimeIdentity>("project_runtime_settings", {
+            projectId: session.project_id,
+          }).catch(() => null),
         ]);
         if (!cancelled) {
-          setEvents([...nextEvents].reverse());
+          const self = identity?.self_open_id ?? null;
+          // 机器人发出去的回复会以「我自己发的消息」回流成一条事件（真实库里 77 条有 19 条是这种）。
+          // 那句话已经作为右侧助手气泡挂在触发它的那条消息上了，再按事件渲染一遍就是左右各显示一次。
+          setEvents(
+            [...nextEvents]
+              .reverse()
+              .filter((event) => self == null || event.sender_open_dingtalk_id !== self),
+          );
           if (nextDetails) setDetails(nextDetails);
         }
       } catch (e) {
