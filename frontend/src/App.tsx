@@ -61,12 +61,14 @@ type ListenerUpdate =
   | { type: "log"; listener_id: string; line: string }
   | { type: "progress"; conversation_id: string; message_id: string; phase: ReplyPhase; text: string };
 
-/** 生成中的块：模型在想 / 在答。CLI 只给块级输出，所以这里是一段段攒起来的。 */
-type ReplyPhase = "thinking" | "answer";
+/** 生成中的块：模型在想 / 在调工具 / 在答。CLI 只给块级输出，所以这里是一段段攒起来的。 */
+type ReplyPhase = "thinking" | "tool" | "answer";
 
 /** 某条消息正在生成时的增量文本。权威正文最终仍以落库事件为准，这里只管观感。 */
 export interface StreamingReply {
   thinking: string;
+  /** 用过的工具，按到达顺序（`Read · a.rs`）。 */
+  tools: string[];
   answer: string;
   /** 最后一次收到块的时刻，用来判断「还在生成」还是「已经卡住/结束」。 */
   updatedAt: number;
@@ -85,14 +87,29 @@ export function appendChunk(
   prev: Record<string, StreamingReply>,
   chunk: { message_id: string; phase: ReplyPhase; text: string },
 ): Record<string, StreamingReply> {
-  const current = prev[chunk.message_id] ?? { thinking: "", answer: "", updatedAt: 0 };
-  const field = chunk.phase === "thinking" ? "thinking" : "answer";
-  const merged = current[field] ? `${current[field]}\n${chunk.text}` : chunk.text;
+  const current = prev[chunk.message_id] ?? {
+    thinking: "",
+    tools: [],
+    answer: "",
+    updatedAt: 0,
+  };
 
   const next: Record<string, StreamingReply> = {
     ...prev,
-    [chunk.message_id]: { ...current, [field]: merged, updatedAt: Date.now() },
+    [chunk.message_id]: { ...current, updatedAt: Date.now() },
   };
+  const entry = next[chunk.message_id];
+
+  if (chunk.phase === "tool") {
+    // 工具调用是列表，不是文本；重复上报同一次调用（模型重试）不必重复显示。
+    if (entry.tools[entry.tools.length - 1] !== chunk.text) {
+      entry.tools = [...entry.tools, chunk.text];
+    }
+  } else if (chunk.phase === "thinking") {
+    entry.thinking = entry.thinking ? `${entry.thinking}\n${chunk.text}` : chunk.text;
+  } else {
+    entry.answer = entry.answer ? `${entry.answer}\n${chunk.text}` : chunk.text;
+  }
 
   const keys = Object.keys(next);
   if (keys.length <= MAX_STREAMING_ENTRIES) {

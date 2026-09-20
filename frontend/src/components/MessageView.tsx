@@ -27,6 +27,8 @@ interface EventRow {
   reply_text: string | null;
   /** 模型的思考过程（生成时存下来的整段）；没开思考或没回报就是 null。 */
   reasoning: string | null;
+  /** 这次用过的工具（每行一条）；没用工具或还没回过就是 null。 */
+  tools: string | null;
 }
 
 /** conversation_details 命令的返回里，会话窗口头部用得上的部分。 */
@@ -484,39 +486,86 @@ export default function MessageView({
               const thinking = live ? streaming.thinking : event.reasoning;
               const answer = live ? streaming.answer : event.reply_text;
               const showThinking = thinking != null && thinking !== "";
+              const tools =
+                live && streaming.tools.length > 0
+                  ? streaming.tools
+                  : (event.tools ?? "").split("\n").filter((line) => line.trim() !== "");
 
               return (
                 <div key={`${event.message_id}-${index}`}>
-                  <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginBottom: "4px" }}>
-                    {event.sender || "(未知发送人)"} ·{" "}
-                    {new Date(event.received_at).toLocaleString()} · {event.listen_kind}
-                    {event.malformed && (
-                      <span style={{ color: "var(--danger)", marginLeft: "6px" }}>畸形事件</span>
-                    )}
-                  </div>
-
-                  <div style={{ ...bubbleBase, backgroundColor: "var(--bg-elevated)", border: "1px solid var(--border)", color: "var(--text-primary)" }}>
-                    {event.content || "(空正文)"}
-                  </div>
-
-                  {showThinking && (
-                    <ThinkingBlock text={thinking} live={live && !answer} />
-                  )}
-
-                  {live && !answer && (
+                  {/* 对方：靠左。放在 flex 列里才会**缩到内容宽** ——
+                      直接给块级 div 加 maxWidth，短消息也会被撑成 78% 宽。 */}
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "flex-start",
+                      gap: "4px",
+                    }}
+                  >
+                    <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                      {event.sender || "(未知发送人)"} ·{" "}
+                      {new Date(event.received_at).toLocaleString()} · {event.listen_kind}
+                      {event.malformed && (
+                        <span style={{ color: "var(--danger)", marginLeft: "6px" }}>畸形事件</span>
+                      )}
+                    </div>
                     <div
                       style={{
-                        fontSize: "11px",
-                        color: "var(--warn)",
-                        marginTop: "4px",
+                        ...bubbleBase,
+                        backgroundColor: "var(--bg-elevated)",
+                        border: "1px solid var(--border)",
+                        color: "var(--text-primary)",
                       }}
                     >
-                      {showThinking ? "正在组织回复…" : "思考中…"}
+                      {event.content || "(空正文)"}
                     </div>
-                  )}
+                  </div>
 
-                  {answer != null && answer !== "" && (
-                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", marginTop: "6px" }}>
+                  {/* 助手侧：思考 → 工具 → 回复 → 状态，全在右边，与「回复」同一列。 */}
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "flex-end",
+                      gap: "6px",
+                      marginTop: "8px",
+                    }}
+                  >
+                    {showThinking && <ThinkingBlock text={thinking} live={live && !answer} />}
+
+                    {tools.length > 0 && (
+                      <div
+                        style={{
+                          maxWidth: "78%",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "2px",
+                          fontSize: "11px",
+                          color: "var(--text-muted)",
+                        }}
+                      >
+                        {tools.map((tool, toolIndex) => (
+                          <div
+                            key={`${tool}-${toolIndex}`}
+                            style={{
+                              fontFamily: "ui-monospace, Consolas, monospace",
+                              wordBreak: "break-all",
+                            }}
+                          >
+                            工具 · {tool}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {live && !answer && (
+                      <div style={{ fontSize: "11px", color: "var(--warn)" }}>
+                        {showThinking || tools.length > 0 ? "正在组织回复…" : "思考中…"}
+                      </div>
+                    )}
+
+                    {answer != null && answer !== "" && (
                       <div
                         style={{
                           ...bubbleBase,
@@ -526,13 +575,13 @@ export default function MessageView({
                       >
                         {live ? <Typewriter text={answer} /> : answer}
                       </div>
-                    </div>
-                  )}
+                    )}
 
-                  <div style={{ fontSize: "11px", color: status.color, marginTop: "4px" }}>
-                    {event.reply_status === "sent" && event.received_at
-                      ? `${status.text} ${new Date(event.received_at).toLocaleTimeString()}`
-                      : status.text}
+                    <div style={{ fontSize: "11px", color: status.color }}>
+                      {event.reply_status === "sent" && event.received_at
+                        ? `${status.text} ${new Date(event.received_at).toLocaleTimeString()}`
+                        : status.text}
+                    </div>
                   </div>
                 </div>
               );
