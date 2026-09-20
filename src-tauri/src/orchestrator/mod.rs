@@ -1068,7 +1068,20 @@ impl Shared {
                         self.push_log(&format!("{source}的附件没能取回")).await;
                     }
                     Ok(fetched) => {
-                        for note in crate::attachments::to_notes(work, &fetched, image_hint) {
+                        // 本批有图片就先确认模型看不看得见：不支持时不能给路径，
+                        // 否则它会对着没读到的图编内容。
+                        let needs_vision = fetched.iter().any(|item| {
+                            crate::attachments::is_image_attachment(&item.rel_path, image_hint)
+                        });
+                        let vision_ok = if needs_vision {
+                            self.vision_supported(reply).await
+                        } else {
+                            true
+                        };
+
+                        for note in
+                            crate::attachments::to_notes(work, &fetched, image_hint, vision_ok)
+                        {
                             match note.rel_path.as_deref() {
                                 Some(path) => {
                                     self.push_log(&format!(
@@ -1097,6 +1110,34 @@ impl Shared {
         }
 
         notes
+    }
+
+    /// 模型看不看得见图：先查缓存，没探过就探一次并写回。
+    ///
+    /// 缓存按「配置的模型」区分（`vision::cache_key`）。**探针期间不持库锁** ——
+    /// 一次探针要几秒到几十秒，持着锁会把事件落盘全堵住。
+    async fn vision_supported(&self, reply: &ReplySettings) -> bool {
+        let model = reply.agent_model.as_deref();
+
+        let known = {
+            let storage = self.storage.lock().await;
+            crate::vision::cached(&storage, model)
+        };
+        if let Some(known) = known {
+            return known;
+        }
+
+        let supported = crate::vision::probe(reply).await;
+        {
+            let storage = self.storage.lock().await;
+            crate::vision::remember(&storage, model, supported);
+        }
+        self.push_log(&format!(
+            "图片能力探针：当前模型{}看图片",
+            if supported { "能" } else { "不能" }
+        ))
+        .await;
+        supported
     }
 
     /// 回复链路：判定 → 拉上下文 → 生成 → 清洗 → 发送 → 记账。

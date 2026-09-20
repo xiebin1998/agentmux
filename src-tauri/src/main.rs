@@ -12,6 +12,7 @@ mod providers;
 mod reply;
 mod resolve;
 mod storage;
+mod vision;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;

@@ -249,22 +249,43 @@ fn extension_of(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 这条取回的附件是不是图片。
+///
+/// 单独暴露给调用方，是因为「模型支不支持图片」要在生成 note **之前**决定：
+/// 得先知道本批有没有图片，才谈得上要不要跑一次能力探针。
+pub fn is_image_attachment(rel_path: &str, image_hint: bool) -> bool {
+    image_hint || IMAGE_EXTENSIONS.contains(&extension_of(&name_of(rel_path)).as_str())
+}
+
 /// 把下载好的附件变成提示词能用的说明。
 ///
 /// 图片与文本类直接给路径（`Read` 能读）；xlsx 由应用侧转成 CSV、给转换后的路径；
 /// 其余二进制与超大文件只给名字加原因 —— 让 Agent 如实说"这个我读不了"，
 /// 而不是对着一个它打不开的文件编内容。
-pub fn to_notes(work_dir: &Path, fetched: &[Fetched], image_hint: bool) -> Vec<AttachmentNote> {
+///
+/// `vision_supported` 为 false 时，**图片一律不给路径**：模型看不见，给了路径只会
+/// 诱发它编内容（实测它拿不到信息时会编）。
+pub fn to_notes(
+    work_dir: &Path,
+    fetched: &[Fetched],
+    image_hint: bool,
+    vision_supported: bool,
+) -> Vec<AttachmentNote> {
     fetched
         .iter()
-        .map(|item| note_for(work_dir, item, image_hint))
+        .map(|item| note_for(work_dir, item, image_hint, vision_supported))
         .collect()
 }
 
-fn note_for(work_dir: &Path, item: &Fetched, image_hint: bool) -> AttachmentNote {
+fn note_for(
+    work_dir: &Path,
+    item: &Fetched,
+    image_hint: bool,
+    vision_supported: bool,
+) -> AttachmentNote {
     let name = name_of(&item.rel_path);
     let extension = extension_of(&name);
-    let is_image = image_hint || IMAGE_EXTENSIONS.contains(&extension.as_str());
+    let is_image = is_image_attachment(&item.rel_path, image_hint);
 
     let skipped = |reason: &str| AttachmentNote {
         name: name.clone(),
@@ -276,6 +297,10 @@ fn note_for(work_dir: &Path, item: &Fetched, image_hint: bool) -> AttachmentNote
 
     if item.size_bytes > MAX_ATTACHMENT_BYTES {
         return skipped("文件超过 8MB，未读取内容");
+    }
+
+    if is_image && !vision_supported {
+        return skipped("当前模型不支持图片，未读取内容");
     }
 
     if is_image || TEXT_EXTENSIONS.contains(&extension.as_str()) {
@@ -531,7 +556,7 @@ mod tests {
             },
         ];
 
-        let notes = to_notes(&work, &fetched, false);
+        let notes = to_notes(&work, &fetched, false, true);
 
         assert_eq!(notes.len(), 2);
         assert!(notes[0].is_image, "png 应识别为图片");
@@ -554,7 +579,7 @@ mod tests {
             size_bytes: 10,
         }];
 
-        let notes = to_notes(&work, &fetched, true);
+        let notes = to_notes(&work, &fetched, true, true);
 
         assert!(notes[0].is_image);
     }
@@ -575,7 +600,7 @@ mod tests {
             rel_path: ".agentmux/attachments/用例.xlsx".into(),
             size_bytes: 4096,
         }];
-        let notes = to_notes(&work, &fetched, false);
+        let notes = to_notes(&work, &fetched, false, true);
 
         assert!(notes[0].converted, "xlsx 应由应用侧转成 CSV");
         assert_eq!(
@@ -605,7 +630,7 @@ mod tests {
             },
         ];
 
-        let notes = to_notes(&work, &fetched, false);
+        let notes = to_notes(&work, &fetched, false, true);
 
         assert!(notes[0].rel_path.is_none(), "超限不给路径");
         assert!(notes[0].reason.as_deref().unwrap().contains("8MB"));
@@ -616,6 +641,38 @@ mod tests {
         );
         // 没有路径也要保留名字：Agent 至少能说清"哪个文件我读不了"
         assert_eq!(notes[1].name, "文档.docx");
+    }
+
+    /// 图片能力探针为"不支持"时，图片**绝不能给路径** —— 模型看不见，
+    /// 给了路径只会诱发它编内容；但文本/表格不受影响。
+    #[test]
+    fn image_note_has_no_path_when_vision_unsupported() {
+        let work = std::env::temp_dir().join("agentmux-note-vision-test");
+        let fetched = vec![
+            Fetched {
+                rel_path: ".agentmux/attachments/截图.png".into(),
+                size_bytes: 1024,
+            },
+            Fetched {
+                rel_path: ".agentmux/attachments/说明.md".into(),
+                size_bytes: 1024,
+            },
+        ];
+
+        let notes = to_notes(&work, &fetched, false, false);
+
+        assert!(notes[0].is_image, "仍要认出这是图片");
+        assert!(notes[0].rel_path.is_none(), "不支持图片时不该给路径");
+        assert!(
+            notes[0].reason.as_deref().unwrap().contains("不支持图片"),
+            "原因要说清是模型不支持，实际 {:?}",
+            notes[0].reason
+        );
+        assert_eq!(
+            notes[1].rel_path.as_deref(),
+            Some(".agentmux/attachments/说明.md"),
+            "非图片不受图片能力影响"
+        );
     }
 
     /// 真实环境：正文里**直接发的图片**也能取回（不是引用）。
