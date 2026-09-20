@@ -200,6 +200,17 @@ pub async fn download_attachment(
 /// 上下文撑爆，转换它也没有意义。
 pub const MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// 正文里是否**直接**带了媒体（不是引用）。返回 `Some(is_image)`；没有则 `None`。
+///
+/// 这类消息的资源同样能取回：**对消息自身**调 `+messages-mget --download-resources`
+/// 即可，dws 会自己解析 mediaId —— 不用我们解析（实测落盘过 111KB 的真 PNG）。
+pub fn inline_media_kind(content: &str) -> Option<bool> {
+    if !content.contains("mediaId=") && !content.contains("fileId=") {
+        return None;
+    }
+    Some(content.contains("[图片消息]"))
+}
+
 /// 写进提示词的一条附件说明。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttachmentNote {
@@ -460,6 +471,22 @@ mod tests {
         assert!(resolve_within(&work, "").is_none(), "空路径必须拒绝");
     }
 
+    /// 正文里**直接发的**媒体（不是引用）—— 实测载荷形如
+    /// `[图片消息](mediaId=@lQLPK…)这个新增的`。
+    #[test]
+    fn detects_inline_media_in_message_content() {
+        assert_eq!(
+            inline_media_kind(
+                "[图片消息](mediaId=@lQLPKdVNvSKACLvNAxrNAjCw-eE_t9KKPG0KgPbB08mCAA)这个新增的，\"15%\" 用哪一个字段？"
+            ),
+            Some(true),
+            "内联图片应被识别，且标记为图片"
+        );
+        assert_eq!(inline_media_kind("[文件消息](fileId=abc)看下"), Some(false));
+        assert_eq!(inline_media_kind("普通文本，没有媒体"), None);
+        assert_eq!(inline_media_kind(""), None);
+    }
+
     /// 现场造一个最小 xlsx（只有一张表、无共享字符串），用于 to_notes 的转换测试。
     fn write_min_xlsx(path: &std::path::Path, rows: &str) {
         use std::io::Write;
@@ -589,6 +616,38 @@ mod tests {
         );
         // 没有路径也要保留名字：Agent 至少能说清"哪个文件我读不了"
         assert_eq!(notes[1].name, "文档.docx");
+    }
+
+    /// 真实环境：正文里**直接发的图片**也能取回（不是引用）。
+    ///
+    /// 用实测过的一条图片消息（2026-09-20 的 id=45，对方发的截图）。默认 `#[ignore]`。
+    ///
+    /// **会连钉钉，可能瞬时失败**：实测出现过一次 1.16s 的快速失败（此前刚连续打过
+    /// 几次 mget，疑似服务端限流/瞬时错误），随后连跑 5 次都通过。失败时重跑一次即可，
+    /// 不要据此判定功能坏了。
+    #[tokio::test]
+    #[ignore]
+    async fn real_inline_image_downloads() {
+        let dws = crate::resolve::resolve_executable("dingtalk")
+            .await
+            .expect("本机应能解析到 dws");
+        let work = std::env::temp_dir().join("agentmux-inline-real");
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).expect("建临时工作目录");
+
+        let fetched = download_attachment(&dws, work.to_str().unwrap(), "msg5CpqfQItPEd0VaZcWbchXQ==")
+            .await
+            .expect("下载调用本身不该失败");
+
+        assert!(!fetched.is_empty(), "应取回那张图，实际 {fetched:?}");
+        let abs = resolve_within(&work, &fetched[0].rel_path).expect("路径应在工作目录内");
+        assert!(abs.is_file(), "图片必须真的落盘: {}", abs.display());
+        assert!(
+            fetched[0].rel_path.to_ascii_lowercase().ends_with(".png"),
+            "应是 PNG，实际 {}",
+            fetched[0].rel_path
+        );
+        assert!(fetched[0].size_bytes > 0);
     }
 
     /// 真实环境：把被引用消息的附件**真的**下到工作目录。

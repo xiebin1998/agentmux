@@ -1046,46 +1046,52 @@ impl Shared {
         }
 
         for event in events {
-            let Some(quoted) = crate::attachments::quoted_from_raw(&event.raw) else {
-                continue;
-            };
-            // 引用纯文字不需要额外取东西：它已经作为上下文进去了。
-            if !quoted.is_file {
-                continue;
+            // 两种来源，各用自己那条消息的 id 取回：
+            //   1) 引用了别人某条消息里的资源（quoted_message）；
+            //   2) 消息正文里**直接**带着媒体（[图片消息](mediaId=…) 这类）。
+            let mut requests: Vec<(String, bool, &str)> = Vec::new();
+            if let Some(quoted) = crate::attachments::quoted_from_raw(&event.raw) {
+                if quoted.is_file {
+                    requests.push((quoted.quoted_message_id.clone(), quoted.is_image, "引用"));
+                }
+            }
+            if let Some(is_image) = crate::attachments::inline_media_kind(&event.content) {
+                requests.push((event.message_id.clone(), is_image, "正文里"));
             }
 
-            match crate::attachments::download_attachment(
-                &self.path,
-                work_dir,
-                &quoted.quoted_message_id,
-            )
-            .await
-            {
-                Ok(fetched) if fetched.is_empty() => {
-                    self.push_log("对方引用了附件，但没能取回文件").await;
-                }
-                Ok(fetched) => {
-                    let work = std::path::Path::new(work_dir);
-                    for note in crate::attachments::to_notes(work, &fetched, quoted.is_image) {
-                        match note.rel_path.as_deref() {
-                            Some(path) => {
-                                self.push_log(&format!("已取回引用附件「{}」到 {}", note.name, path))
-                                    .await;
-                            }
-                            None => {
-                                self.push_log(&format!(
-                                    "引用附件「{}」未读取：{}",
-                                    note.name,
-                                    note.reason.as_deref().unwrap_or("未知原因")
-                                ))
-                                .await;
-                            }
-                        }
-                        notes.push(note);
+            for (message_id, image_hint, source) in requests {
+                let work = std::path::Path::new(work_dir);
+                match crate::attachments::download_attachment(&self.path, work_dir, &message_id)
+                    .await
+                {
+                    Ok(fetched) if fetched.is_empty() => {
+                        self.push_log(&format!("{source}的附件没能取回")).await;
                     }
-                }
-                Err(err) => {
-                    self.push_log(&format!("取回引用附件失败：{err}")).await;
+                    Ok(fetched) => {
+                        for note in crate::attachments::to_notes(work, &fetched, image_hint) {
+                            match note.rel_path.as_deref() {
+                                Some(path) => {
+                                    self.push_log(&format!(
+                                        "已取回{source}附件「{}」到 {}",
+                                        note.name, path
+                                    ))
+                                    .await;
+                                }
+                                None => {
+                                    self.push_log(&format!(
+                                        "{source}附件「{}」未读取：{}",
+                                        note.name,
+                                        note.reason.as_deref().unwrap_or("未知原因")
+                                    ))
+                                    .await;
+                                }
+                            }
+                            notes.push(note);
+                        }
+                    }
+                    Err(err) => {
+                        self.push_log(&format!("取回{source}附件失败：{err}")).await;
+                    }
                 }
             }
         }
