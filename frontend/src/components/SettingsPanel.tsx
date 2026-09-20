@@ -19,6 +19,8 @@ interface AppConfig {
   agent_args: string[] | null;
   /** 权限放行档位："" / "auto" / "no_ask" / "full"；空 = 用 CLI 默认 */
   permission_mode?: string | null;
+  /** 攒批静默窗口（毫秒）；紧挨着发的消息先等这么久再并成一条回复 */
+  reply_batch_window_ms?: number | null;
   reply_enabled: boolean;
   reply_timeout_ms: number;
   reply_max_chars: number;
@@ -337,6 +339,32 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
               （日志里会写「分类器暂时不可用」）—— 那时可临时切到「完全放行」。
             </>
           )}
+        </div>
+      </div>
+
+      <div style={section}>
+        <div style={sectionTitle}>回复节奏（全局）</div>
+        <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px" }}>
+          <span>攒批静默窗口</span>
+          <input
+            type="number"
+            min={0}
+            max={10}
+            step={0.5}
+            value={String((config.reply_batch_window_ms ?? 1000) / 1000)}
+            onChange={(e) => {
+              const seconds = Number(e.target.value);
+              const ms = Number.isFinite(seconds) ? Math.round(seconds * 1000) : 0;
+              patch({ reply_batch_window_ms: Math.max(0, Math.min(10000, ms)) });
+            }}
+            style={{ ...input, width: "90px" }}
+          />
+          <span style={{ color: "var(--text-muted)", fontSize: "11px" }}>秒</span>
+        </label>
+        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
+          收到一条消息后先等这么久，把紧挨着发的几条并成一条回复。
+          <strong>越短越像真人</strong>；处理上一条期间的连发本来就会并进下一条，
+          所以这里不必设长。设 0 = 不等待（代价是「打字分两行」会分成两条回）。
         </div>
       </div>
 

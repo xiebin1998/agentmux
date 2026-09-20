@@ -127,8 +127,6 @@ pub struct Orchestrator {
     reply_batches: Arc<Mutex<HashMap<String, Vec<ChatEvent>>>>,
     /// 已在等窗口的会话，避免同一会话排多个 flush 任务。
     reply_inflight: Arc<std::sync::Mutex<HashSet<String>>>,
-    /// 攒批窗口长度，见 `DEFAULT_REPLY_BATCH_WINDOW`。
-    reply_batch_window: Duration,
     /// 每个会话最近一次生成时 CLI 报的**上下文占用比例**（0~1）。
     /// 自适应压缩的依据：比按字符估算准，因为它是 Agent 自己算的。
     last_context_ratio: Arc<Mutex<HashMap<String, f64>>>,
@@ -137,12 +135,6 @@ pub struct Orchestrator {
     /// 追踪用：每条消息的接收时刻，用来在日志里打「距收到多少毫秒」。
     trace_started: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
-
-/// 攒批静默窗口。
-///
-/// **很短**：它只为合并「打字分两行」这类紧挨着发的消息。处理期间到达的消息靠
-/// 「队列排空」自然合并（见 `flush_reply_batch`），不再依赖一个漫长的窗口。
-const DEFAULT_REPLY_BATCH_WINDOW: Duration = Duration::from_secs(1);
 
 impl Orchestrator {
     pub fn new(storage: Arc<Mutex<Storage>>) -> Self {
@@ -155,17 +147,10 @@ impl Orchestrator {
             reply_lock: Arc::new(Mutex::new(())),
             reply_batches: Arc::new(Mutex::new(HashMap::new())),
             reply_inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            reply_batch_window: DEFAULT_REPLY_BATCH_WINDOW,
             last_context_ratio: Arc::new(Mutex::new(HashMap::new())),
             last_model: Arc::new(Mutex::new(HashMap::new())),
             trace_started: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    /// 缩短攒批窗口：端到端测试不该为生产用的 8 秒窗口白等。
-    #[cfg(test)]
-    pub fn set_reply_batch_window(&mut self, window: Duration) {
-        self.reply_batch_window = window;
     }
 
     pub async fn push_global_log(&self, line: &str) {
@@ -305,7 +290,6 @@ impl Orchestrator {
             reply_lock: self.reply_lock.clone(),
             reply_batches: self.reply_batches.clone(),
             reply_inflight: self.reply_inflight.clone(),
-            reply_batch_window: self.reply_batch_window,
             last_context_ratio: self.last_context_ratio.clone(),
             last_model: self.last_model.clone(),
             trace_started: self.trace_started.clone(),
@@ -493,7 +477,6 @@ struct Shared {
     reply_lock: Arc<Mutex<()>>,
     reply_batches: Arc<Mutex<HashMap<String, Vec<ChatEvent>>>>,
     reply_inflight: Arc<std::sync::Mutex<HashSet<String>>>,
-    reply_batch_window: Duration,
     last_context_ratio: Arc<Mutex<HashMap<String, f64>>>,
     last_model: Arc<Mutex<HashMap<String, String>>>,
     trace_started: Arc<Mutex<HashMap<String, std::time::Instant>>>,
@@ -996,7 +979,7 @@ impl Shared {
                 &format!(
                     " 已有窗口在等，并入当前批（本批已 {} 条），窗口 {}ms",
                     size,
-                    self.reply_batch_window.as_millis()
+                    reply_settings.reply_batch_window_ms
                 ),
             )
             .await;
@@ -1009,7 +992,7 @@ impl Shared {
             &format!(
                 " 开新窗口：本批第 {} 条，等 {}ms 收齐同会话消息",
                 size,
-                self.reply_batch_window.as_millis()
+                reply_settings.reply_batch_window_ms
             ),
         )
         .await;
@@ -1032,7 +1015,10 @@ impl Shared {
         };
 
         // 短静默：只为合并「打字分两行」这类紧挨着发的消息。
-        tokio::time::sleep(self.reply_batch_window).await;
+        // 从**热更新的设置**里读，所以改窗口不用重启监听。上限兜一下防手滑。
+        let window_ms =
+            crate::config::clamp_batch_window_ms(self.reply.lock().await.reply_batch_window_ms);
+        tokio::time::sleep(Duration::from_millis(window_ms)).await;
 
         loop {
             let batch = self
@@ -2214,6 +2200,25 @@ process.stdin.on("end", function () { process.exit(0); });
         assert_eq!(applied, 111, "下发的设置必须覆盖启动时的快照");
     }
 
+    /// 攒批窗口来自**设置**（所以改它不用重启监听），并且超上限会被兜住。
+    #[test]
+    fn batch_window_comes_from_settings_and_is_capped() {
+        use crate::config::{clamp_batch_window_ms, MAX_REPLY_BATCH_WINDOW_MS};
+
+        assert_eq!(
+            ReplySettings::default().reply_batch_window_ms,
+            crate::config::DEFAULT_REPLY_BATCH_WINDOW_MS,
+            "默认值应与配置里的常量一致（flush 会直接读它）"
+        );
+        assert_eq!(clamp_batch_window_ms(0), 0, "0 = 不等待，合法");
+        assert_eq!(clamp_batch_window_ms(1500), 1500);
+        assert_eq!(
+            clamp_batch_window_ms(999_999),
+            MAX_REPLY_BATCH_WINDOW_MS,
+            "超上限要兜住，否则会明显不像真人在回话"
+        );
+    }
+
     /// 压缩后必须**换新会话**：不换的话摘要在提示词里、会话还是那一大坨，
     /// 模型耗时降不下来；而且内存里的旧占比会让下一次判定立刻又触发压缩。
     #[tokio::test]
@@ -2812,9 +2817,7 @@ process.stdout.write("收到 " + process.cwd());
 
         let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
         let mut orchestrator = Orchestrator::new(storage.clone());
-        // 单条消息的场景不必等生产用的 8 秒攒批窗口。
-        orchestrator.set_reply_batch_window(Duration::from_millis(200));
-
+        // 单条消息的场景不必等默认的静默窗口。
         let node_for_agent = node.clone();
         orchestrator.set_dws_path(Some(node)).await;
 
@@ -2826,6 +2829,7 @@ process.stdout.write("收到 " + process.cwd());
             agent_args: Some(vec![agent_stub_path]),
             agent_cwd: work_dir.to_string_lossy().to_string(),
             timeout_ms: 20_000,
+            reply_batch_window_ms: 200,
             max_chars: 500,
             ..Default::default()
         };
@@ -3012,12 +3016,10 @@ process.stdin.on("end", function () {
 
         let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
         let mut orchestrator = Orchestrator::new(storage.clone());
-        // 生产默认是 8 秒，测试里缩短到 800ms：远大于 3 条事件的间隔（150ms），
-        // 又不用白等。
-        orchestrator.set_reply_batch_window(Duration::from_millis(800));
-
+        // 默认是 1 秒，测试里给 800ms：远大于 3 条事件的间隔（150ms），又不用白等。
         let settings = ReplySettings {
             enabled: true,
+            reply_batch_window_ms: 800,
             agent_platform: "stub".to_string(),
             agent_cli_path: Some(node.clone()),
             agent_args: Some(vec![agent_stub_path]),
@@ -3237,10 +3239,9 @@ process.stdout.write(JSON.stringify({
         let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
         let mut orchestrator = Orchestrator::new(storage.clone());
         // 600ms 窗口：两条消息间隔 1500ms，会分成两批，第二轮才能用上第一轮的占比。
-        orchestrator.set_reply_batch_window(Duration::from_millis(600));
-
         let settings = ReplySettings {
             enabled: true,
+            reply_batch_window_ms: 600,
             agent_platform: "stub".to_string(),
             agent_cli_path: Some(node.clone()),
             agent_args: Some(vec![agent_stub_path]),

@@ -29,6 +29,9 @@ pub struct ReplySettings {
     /// 权限放行档位。为空 = 完全不传、用 CLI 自己的默认行为。
     /// 取值是**归一化**的 `auto` / `no_ask` / `full`，由 [`permission_args`] 按平台翻译。
     pub permission_mode: Option<String>,
+    /// 攒批静默窗口（毫秒）。只用来合并「打字分两行」这类紧挨着发的消息；
+    /// 处理期间到达的消息靠队列排空自然合并，不依赖它。0 = 不等待。
+    pub reply_batch_window_ms: u64,
     pub agent_cwd: String,
     pub timeout_ms: u64,
     pub max_chars: usize,
@@ -60,6 +63,7 @@ impl Default for ReplySettings {
             agent_model: None,
             reasoning_effort: None,
             permission_mode: None,
+            reply_batch_window_ms: crate::config::DEFAULT_REPLY_BATCH_WINDOW_MS,
             agent_cwd: String::new(),
             timeout_ms: 120_000,
             max_chars: 500,

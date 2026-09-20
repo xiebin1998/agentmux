@@ -55,6 +55,10 @@ pub struct AppConfig {
     /// 三个 CLI 的旗标与大小写都不同，由 `reply::permission_args` 按平台翻译。
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// 攒批静默窗口（毫秒）。**只用来合并「打字分两行」**：处理期间到达的消息靠
+    /// 队列排空自然合并。0 = 不等待（最像真人，代价是紧挨着发的两行会分两条回）。
+    #[serde(default = "default_reply_batch_window_ms")]
+    pub reply_batch_window_ms: u64,
     pub reply_enabled: bool,
     pub reply_timeout_ms: u64,
     pub reply_max_chars: usize,
@@ -73,6 +77,25 @@ pub struct AppConfig {
 
 fn default_im_platform() -> String {
     "dingtalk".to_string()
+}
+
+/// 攒批静默窗口的默认值（毫秒）。
+///
+/// **很短**：它只为合并「打字分两行」这类紧挨着发的消息。处理期间到达的消息靠
+/// 「队列排空」自然合并（见 `flush_reply_batch`），不再依赖一个漫长的窗口。
+pub const DEFAULT_REPLY_BATCH_WINDOW_MS: u64 = 1000;
+
+/// 攒批窗口的上限：再长就明显不像真人在回话了。
+pub const MAX_REPLY_BATCH_WINDOW_MS: u64 = 10_000;
+
+fn default_reply_batch_window_ms() -> u64 {
+    DEFAULT_REPLY_BATCH_WINDOW_MS
+}
+
+/// 把设置里的攒批窗口收敛到可用范围：0 = 不等待（合法），超过上限按上限算
+/// （再长就明显不像真人在回话了）。
+pub fn clamp_batch_window_ms(value: u64) -> u64 {
+    value.min(MAX_REPLY_BATCH_WINDOW_MS)
 }
 
 fn default_agent_platform() -> String {
@@ -94,6 +117,7 @@ impl Default for AppConfig {
             agent_model: None,
             reasoning_effort: None,
             permission_mode: None,
+            reply_batch_window_ms: DEFAULT_REPLY_BATCH_WINDOW_MS,
             reply_enabled: false,
             reply_timeout_ms: 120_000,
             reply_max_chars: 500,
@@ -349,6 +373,7 @@ pub fn reply_settings() -> crate::reply::ReplySettings {
         agent_model: config.agent_model.clone(),
         reasoning_effort: config.reasoning_effort.clone(),
         permission_mode: config.permission_mode.clone(),
+        reply_batch_window_ms: config.reply_batch_window_ms,
         agent_cwd,
         timeout_ms: config.reply_timeout_ms,
         max_chars: config.reply_max_chars,
@@ -430,6 +455,7 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
             .permission_mode
             .clone()
             .filter(|level| !level.trim().is_empty()),
+        reply_batch_window_ms: clamp_batch_window_ms(global.reply_batch_window_ms),
         agent_cwd: project.work_dir.clone(),
         timeout_ms: project.reply_timeout_ms,
         max_chars: project.reply_max_chars,
