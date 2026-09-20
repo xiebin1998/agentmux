@@ -1636,6 +1636,28 @@ impl Shared {
                     .await;
                 }
 
+                // 用过的工具同样落库：回复发出去之后，也要能回答"它到底怎么做的"。
+                if let Some(tools) = raw
+                    .tools
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    let storage = self.storage.lock().await;
+                    for item in &events {
+                        if !item.message_id.is_empty() {
+                            let _ = storage.set_event_tools(&item.message_id, tools);
+                        }
+                    }
+                    drop(storage);
+                    self.trace(
+                        &event.conversation_id,
+                        "⑰ 台账",
+                        &format!(" 已存下工具调用（{} 条）", tools.lines().count()),
+                    )
+                    .await;
+                }
+
                 self.forget_trace(&events).await;
             }
             Err(err) => {
@@ -3054,10 +3076,11 @@ process.stdout.write("收到 " + process.cwd());
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 桩 Agent：先吐思考块，停一下再吐正文块与 result —— 模拟真实 CLI 的
-    /// stream-json（块级到达，思考在前、正文在后）。
+    /// 桩 Agent：先吐思考块，再吐一个工具调用，停一下再吐正文块与 result ——
+    /// 模拟真实 CLI 的 stream-json（块级到达，思考 → 工具 → 正文）。
     const STREAMING_AGENT_STUB: &str = r#"
 process.stdout.write('{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"我在想这件事"}]}}' + "\n");
+process.stdout.write('{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.rs"}}]}}' + "\n");
 setTimeout(function () {
   process.stdout.write('{"type":"assistant","message":{"content":[{"type":"text","text":"这是回复"}]}}' + "\n");
   process.stdout.write('{"type":"result","result":"这是回复"}' + "\n");
@@ -3163,14 +3186,16 @@ setTimeout(function () {
 
         assert_eq!(
             progress.len(),
-            2,
-            "应恰好推两个块（思考 + 正文），实际收到的频道消息: {messages:?}"
+            3,
+            "应恰好推三个块（思考 + 工具 + 正文），实际收到的频道消息: {messages:?}"
         );
-        // 顺序必须是思考在前 —— 界面靠到达顺序铺气泡。
+        // 顺序必须是思考 → 工具 → 正文 —— 界面靠到达顺序铺行。
         assert_eq!(progress[0]["phase"], "thinking");
         assert_eq!(progress[0]["text"], "我在想这件事");
-        assert_eq!(progress[1]["phase"], "answer");
-        assert_eq!(progress[1]["text"], "这是回复");
+        assert_eq!(progress[1]["phase"], "tool");
+        assert_eq!(progress[1]["text"], "Read · a.rs", "工具要压成一行人能读的摘要");
+        assert_eq!(progress[2]["phase"], "answer");
+        assert_eq!(progress[2]["text"], "这是回复");
 
         for value in &progress {
             assert_eq!(value["type"], "progress", "前端按 type 分流");
@@ -3181,6 +3206,304 @@ setTimeout(function () {
             );
         }
     }
+
+    /// **真实 CLI 的验收**（默认 `#[ignore]`：真的调一次模型，耗时且产生用量）。
+    ///
+    /// 上面那条转发测试喂的是**手写** NDJSON，只能证明"管道通"。这条要证明
+    /// **真实 qodercli 的输出**（`--thinking adaptive` 下的 stream-json）也能被解析成
+    /// 思考块与正文块推出去 —— 否则"流式"只是在桩数据上成立。
+    ///
+    /// 跑法：`cargo test -- --ignored real_cli_streams_progress_blocks --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn real_cli_streams_progress_blocks() {
+        let Some(bin) = crate::resolve::resolve_executable("qoder").await else {
+            eprintln!("跳过：没有找到 qodercli");
+            return;
+        };
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let base = std::env::temp_dir().join("agentmux-e2e-real-progress");
+        let _ = std::fs::remove_dir_all(&base);
+        let stub_dir = base.join("stub");
+        let work_dir = base.join("project-workdir");
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        std::fs::write(stub_dir.join("event"), EVENT_STUB).unwrap();
+        std::fs::write(stub_dir.join("chat"), CHAT_STUB).unwrap();
+
+        let received: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    sink.lock().unwrap().push(value);
+                }
+            }
+            Ok(())
+        });
+
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let mut orchestrator = Orchestrator::new(storage.clone());
+        orchestrator.set_dws_path(Some(node)).await;
+
+        // 真实 CLI：用默认参数（含 `--thinking adaptive`），cwd 是项目工作目录。
+        let settings = ReplySettings {
+            enabled: true,
+            agent_platform: "qoder".to_string(),
+            agent_cli_path: Some(bin),
+            agent_args: None,
+            agent_cwd: work_dir.to_string_lossy().to_string(),
+            timeout_ms: 180_000,
+            reply_batch_window_ms: 200,
+            max_chars: 800,
+            ..Default::default()
+        };
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener("proj-R".to_string(), ListenKind::AtMe, settings, Some(channel))
+            .await
+            .expect("应能启动监听");
+
+        let mut rows = Vec::new();
+        for _ in 0..400 {
+            sleep(Duration::from_millis(250)).await;
+            rows = storage
+                .lock()
+                .await
+                .list_events(&EventQuery {
+                    limit: 10,
+                    project_id: Some("proj-R".to_string()),
+                    ..Default::default()
+                })
+                .unwrap();
+            if rows.iter().any(|row| row.reply_status.is_some()) {
+                break;
+            }
+        }
+
+        let _ = orchestrator.stop_listener(&id).await;
+        std::env::set_current_dir(previous).unwrap();
+        drop(orchestrator);
+        drop(storage);
+        sleep(Duration::from_millis(200)).await;
+        let _ = std::fs::remove_dir_all(&base);
+
+        let messages = received.lock().unwrap().clone();
+        let progress: Vec<&serde_json::Value> = messages
+            .iter()
+            .filter(|value| value.get("type").and_then(|kind| kind.as_str()) == Some("progress"))
+            .collect();
+
+        // 失败时把收到的原始消息打出来（加 --nocapture 可见），好判断是 CLI 没吐块还是解析漏了。
+        if progress.is_empty() {
+            eprintln!("---- 频道收到的消息（没有任何 progress）----\n{messages:#?}");
+        }
+
+        let thinking: Vec<String> = progress
+            .iter()
+            .filter(|value| value["phase"] == "thinking")
+            .map(|value| value["text"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let answers: Vec<String> = progress
+            .iter()
+            .filter(|value| value["phase"] == "answer")
+            .map(|value| value["text"].as_str().unwrap_or_default().to_string())
+            .collect();
+
+        assert!(
+            thinking.iter().any(|text| !text.trim().is_empty()),
+            "真实 CLI（--thinking adaptive）应产出非空思考块，实际 progress: {progress:#?}"
+        );
+        assert!(
+            answers.iter().any(|text| !text.trim().is_empty()),
+            "真实 CLI 应产出非空正文块，实际 progress: {progress:#?}"
+        );
+        // 思考要先于正文到达（工具调用可能夹在中间，所以不比 progress[0]）。
+        let first_thinking = progress
+            .iter()
+            .position(|value| value["phase"] == "thinking");
+        let first_answer = progress.iter().position(|value| value["phase"] == "answer");
+        assert!(
+            matches!((first_thinking, first_answer), (Some(think), Some(answer)) if think < answer),
+            "思考块应先于正文块到达，实际顺序: {:?}",
+            progress
+                .iter()
+                .map(|value| value["phase"].clone())
+                .collect::<Vec<_>>()
+        );
+
+        // 推出去的正文要与最终台账一致（落库的是清洗+可能截断后的正文，
+        // 所以只断言首行包含关系，避免被 Sources 剥除/截断误伤）。
+        let reply = rows
+            .first()
+            .and_then(|row| row.reply_text.clone())
+            .unwrap_or_default();
+        let joined_answer = answers.join("\n");
+        let first_line = joined_answer
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take(20)
+            .collect::<String>();
+        assert!(
+            !first_line.is_empty() && reply.contains(&first_line),
+            "流式正文应与台账一致；首行 {first_line:?} 不在台账里: {reply:?}"
+        );
+    }
+
+    /// **真实 CLI 的工具调用验收**（默认 `#[ignore]`：真的调一次模型）。
+    ///
+    /// 前面的工具块测试喂的是手写 NDJSON。这条让真实 qodercli **必须去读一个文件**
+    /// 才能回答，于是必须产生 `tool_use` —— 证明真实 CLI 的工具调用能被抽出摘要、
+    /// 推给界面，并落库（回复发出去之后仍能看到它怎么做的）。
+    ///
+    /// 跑法：`cargo test -- --ignored real_cli_reports_tool_calls --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn real_cli_reports_tool_calls() {
+        let Some(bin) = crate::resolve::resolve_executable("qoder").await else {
+            eprintln!("跳过：没有找到 qodercli");
+            return;
+        };
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let base = std::env::temp_dir().join("agentmux-e2e-real-tools");
+        let _ = std::fs::remove_dir_all(&base);
+        let stub_dir = base.join("stub");
+        let work_dir = base.join("project-workdir");
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+        // 校验码放在文件里：模型不 Read 就答不出来。
+        std::fs::write(work_dir.join("probe-note.txt"), "校验码：7391-4821\n").unwrap();
+
+        std::fs::write(stub_dir.join("event"), EVENT_STUB_ASK_FILE).unwrap();
+        std::fs::write(stub_dir.join("chat"), CHAT_STUB).unwrap();
+
+        let received: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    sink.lock().unwrap().push(value);
+                }
+            }
+            Ok(())
+        });
+
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir.clone()).unwrap()));
+        let mut orchestrator = Orchestrator::new(storage.clone());
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let settings = ReplySettings {
+            enabled: true,
+            agent_platform: "qoder".to_string(),
+            agent_cli_path: Some(bin),
+            agent_args: None,
+            agent_cwd: work_dir.to_string_lossy().to_string(),
+            timeout_ms: 180_000,
+            reply_batch_window_ms: 200,
+            max_chars: 800,
+            ..Default::default()
+        };
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener("proj-T".to_string(), ListenKind::AtMe, settings, Some(channel))
+            .await
+            .expect("应能启动监听");
+
+        let mut rows = Vec::new();
+        for _ in 0..400 {
+            sleep(Duration::from_millis(250)).await;
+            rows = storage
+                .lock()
+                .await
+                .list_events(&EventQuery {
+                    limit: 10,
+                    project_id: Some("proj-T".to_string()),
+                    ..Default::default()
+                })
+                .unwrap();
+            if rows.iter().any(|row| row.reply_status.is_some()) {
+                break;
+            }
+        }
+
+        let _ = orchestrator.stop_listener(&id).await;
+        std::env::set_current_dir(previous).unwrap();
+        drop(orchestrator);
+        drop(storage);
+        sleep(Duration::from_millis(200)).await;
+        let _ = std::fs::remove_dir_all(&base);
+
+        let messages = received.lock().unwrap().clone();
+        let tools: Vec<String> = messages
+            .iter()
+            .filter(|value| {
+                value.get("type").and_then(|kind| kind.as_str()) == Some("progress")
+                    && value["phase"] == "tool"
+            })
+            .map(|value| value["text"].as_str().unwrap_or_default().to_string())
+            .collect();
+
+        if tools.is_empty() {
+            eprintln!("---- 频道收到的消息（没有任何 tool 块）----\n{messages:#?}");
+        }
+        assert!(
+            tools.iter().any(|text| text.contains("Read") && text.contains("probe-note.txt")),
+            "真实 CLI 读文件的调用应被抽出成 `Read · …probe-note.txt`，实际: {tools:?}"
+        );
+
+        // 落库：回复发出去之后，界面上仍要能看到它怎么做的。
+        let stored = rows
+            .first()
+            .and_then(|row| row.tools.clone())
+            .unwrap_or_default();
+        assert!(
+            stored.contains("probe-note.txt"),
+            "工具调用要落到事件上，实际: {stored:?}"
+        );
+    }
+
+    /// 桩 dws 的事件端：**要求模型去读文件**才答得出来（用来逼出真实 tool_use）。
+    const EVENT_STUB_ASK_FILE: &str = r#"
+const READY = "[event] ready event_key=user_im_message_receive_at subscribe_id=subId-tools bus_pid=1";
+const EVT = JSON.stringify({
+  type: "user_im_message_receive_at",
+  subscribe_id: "subId-tools",
+  message_id: "msg-tools-1",
+  conversation_id: "cid-tools",
+  sender: "张三",
+  sender_open_dingtalk_id: "open-1",
+  content: "@我 用 Read 工具打开当前目录下的 probe-note.txt，然后只回答文件里那串校验码，不要解释",
+  create_time: "2026-09-20 18:00:00"
+});
+process.stderr.write(READY + "\n");
+setTimeout(function () { process.stdout.write(EVT + "\n"); }, 200);
+process.stdin.resume();
+process.stdin.on("end", function () { process.exit(0); });
+"#;
 
     /// 桩 dws 的事件端：**同一会话连发 3 条**，模拟「一次性收到 n 个 @我」。
     const BURST_EVENT_STUB: &str = r#"

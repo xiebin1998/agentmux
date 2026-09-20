@@ -40,6 +40,8 @@ pub struct EventRow {
     pub reply_text: Option<String>,
     /// 本次回复的模型思考过程；没思考或还没回过就是 None。
     pub reasoning: Option<String>,
+    /// 本次回复用过的工具（每行一条）；没用工具或还没回过就是 None。
+    pub tools: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,6 +181,8 @@ impl Storage {
             "ALTER TABLE events ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
             // 本次回复的模型思考过程（stream-json 的 thinking 块）。生成后才有，故可空。
             "ALTER TABLE events ADD COLUMN reasoning TEXT",
+            // 本次回复用过的工具（每行一条，如 `Read · a.rs`）。同样生成后才有。
+            "ALTER TABLE events ADD COLUMN tools TEXT",
             // 「删掉的会话」墓碑：记删除时的最大事件序号。之后又来了新消息
             // （序号更大）会话会自己回来，见 list_conversations。
             "ALTER TABLE conversations ADD COLUMN deleted_seq INTEGER",
@@ -472,7 +476,7 @@ impl Storage {
         let mut sql = String::from(
             "SELECT project_id, message_id, conversation_id, sender, sender_open_dingtalk_id, content,
                     create_time, received_at, listen_kind, malformed, processed, reply_status, reply_text,
-                    reasoning
+                    reasoning, tools
              FROM events WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -530,6 +534,7 @@ impl Storage {
                 reply_status: row.get(11)?,
                 reply_text: row.get(12)?,
                 reasoning: row.get(13)?,
+                tools: row.get(14)?,
             })
         })?;
 
@@ -753,6 +758,16 @@ impl Storage {
         self.db.execute(
             "UPDATE events SET reasoning = ?1 WHERE message_id = ?2",
             params![reasoning, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// 把本次生成用过的工具写到事件上。与 `set_event_reasoning` 同理：
+    /// 一批事件共享同一次生成，每条都写一份。
+    pub fn set_event_tools(&self, message_id: &str, tools: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE events SET tools = ?1 WHERE message_id = ?2",
+            params![tools, message_id],
         )?;
         Ok(())
     }
@@ -1076,6 +1091,9 @@ mod tests {
         storage
             .set_event_reasoning("msg-think-1", "先算 17×20 再补 17×3")
             .unwrap();
+        storage
+            .set_event_tools("msg-think-1", "Read · a.rs\nWebSearch · 天气")
+            .unwrap();
 
         let rows = storage
             .list_events(&EventQuery {
@@ -1087,6 +1105,11 @@ mod tests {
             rows[0].reasoning.as_deref(),
             Some("先算 17×20 再补 17×3"),
             "思考过程必须能原样读回（列下标错位会静默变 None）"
+        );
+        assert_eq!(
+            rows[0].tools.as_deref(),
+            Some("Read · a.rs\nWebSearch · 天气"),
+            "工具调用同样要能原样读回"
         );
         // 别串到相邻列：正文与回复正文不能被 reasoning 顶掉。
         assert_eq!(rows[0].content, "@我 看一下");

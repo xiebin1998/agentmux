@@ -342,15 +342,19 @@ pub struct Generation {
     /// 模型的思考过程（stream-json 里 `assistant` 事件的 `thinking` 内容块）。
     /// 没有就是 None —— 界面据此不渲染空块。
     pub reasoning: Option<String>,
+    /// 这次用过的工具（`Read · a.rs` / `WebSearch · 天气`，每行一个）。
+    /// 与 `reasoning` 一样存库：回复发出去后，界面上仍要能看到它怎么做的。
+    pub tools: Option<String>,
 }
 
-/// 生成过程中一个块的阶段：模型在想，还是在答。
+/// 生成过程中一个块的阶段：模型在想、在调工具，还是在答。
 ///
-/// 序列化给前端用（`"thinking"` / `"answer"`），前端据此决定放进哪个气泡。
+/// 序列化给前端用（`"thinking"` / `"tool"` / `"answer"`），前端据此决定放在哪一行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplyPhase {
     Thinking,
+    Tool,
     Answer,
 }
 
@@ -358,14 +362,48 @@ pub enum ReplyPhase {
 /// `tokio::spawn` 任务里，每读到一行就调一次。
 pub type ProgressFn = Arc<dyn Fn(ReplyPhase, &str) + Send + Sync>;
 
+/// 工具调用摘要里优先展示的入参键，越靠前越像"这次到底在干什么"。
+const TOOL_ARG_KEYS: &[&str] = &[
+    "file_path",
+    "path",
+    "pattern",
+    "query",
+    "command",
+    "url",
+    "skill",
+    "description",
+    "prompt",
+];
+
+/// 把一次工具调用压成一行人能读的摘要：`Read · src/reply.rs`。
+///
+/// 取**第一个**能用的入参键就够了：工具名 + 关键入参已经能说明它在干什么，
+/// 全量参数会把界面刷屏（也可能很长）。
+fn tool_summary(name: &str, input: Option<&serde_json::Value>) -> String {
+    let Some(input) = input.and_then(|value| value.as_object()) else {
+        return name.to_string();
+    };
+    for key in TOOL_ARG_KEYS {
+        let Some(value) = input.get(*key).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        if value.is_empty() {
+            continue;
+        }
+        return format!("{name} · {}", truncate(&value, 120));
+    }
+    name.to_string()
+}
+
 /// 从一行 NDJSON 里抽出所有可展示的内容块。
 ///
 /// stream-json 的 `assistant` 事件形如
 /// `{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"…"},…]}}`。
 /// 一行可能带多个块，所以返回 `Vec` 而不是单个。
 ///
-/// **只认 `thinking` 与 `text`**：`tool_use` 之类不展示；`result` 事件里没有
-/// `message.content`，自然抽不出块 —— 它的正文由 `parse_generation` 兜底，
+/// 认三种块：`thinking`（在想）、`tool_use`（在调工具）、`text`（在答）。
+/// `tool_result` 与 `result` 不产生块 —— 结果的正文由 `parse_generation` 兜底，
 /// 否则界面上会把最终答案显示两遍。
 pub fn progress_chunks_from_line(line: &str) -> Vec<(ReplyPhase, String)> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -384,6 +422,16 @@ pub fn progress_chunks_from_line(line: &str) -> Vec<(ReplyPhase, String)> {
         let (phase, text) = match block.get("type").and_then(|kind| kind.as_str()) {
             Some("thinking") => (ReplyPhase::Thinking, block.get("thinking")),
             Some("text") => (ReplyPhase::Answer, block.get("text")),
+            Some("tool_use") => {
+                let Some(name) = block.get("name").and_then(|name| name.as_str()) else {
+                    continue;
+                };
+                chunks.push((
+                    ReplyPhase::Tool,
+                    tool_summary(name, block.get("input")),
+                ));
+                continue;
+            }
             _ => continue,
         };
         let Some(text) = text.and_then(|text| text.as_str()) else {
@@ -454,6 +502,33 @@ pub fn parse_generation(stdout: &str) -> Generation {
         context_usage_ratio,
         num_turns,
         reasoning: collect_thinking(stdout),
+        tools: collect_tools(stdout),
+    }
+}
+
+/// 把 NDJSON 里所有 `tool_use` 块按顺序拼成多行（每行一条工具调用）。
+///
+/// 与思考一样是整段到达；重复的相邻调用（模型重试同一件事）去重，
+/// 免得界面上出现一长串一模一样的行。
+fn collect_tools(stdout: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    for line in stdout.lines() {
+        for (phase, text) in progress_chunks_from_line(line) {
+            if phase != ReplyPhase::Tool {
+                continue;
+            }
+            if parts.last() == Some(&text) {
+                continue;
+            }
+            parts.push(text);
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
     }
 }
 
@@ -1127,6 +1202,59 @@ mod tests {
         assert_eq!(generation.context_usage_ratio, Some(0.01));
     }
 
+    /// 工具调用要能抽出来，并压成一行人能读的摘要 —— 用户要看到"它到底怎么做的"。
+    #[test]
+    fn extracts_tool_calls_with_a_readable_summary() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/reply.rs"}},{"type":"tool_use","id":"t2","name":"WebSearch","input":{"query":"南沙   天气"}},{"type":"tool_use","id":"t3","name":"Task"}]}}"#;
+
+        assert_eq!(
+            progress_chunks_from_line(line),
+            vec![
+                (ReplyPhase::Tool, "Read · src/reply.rs".to_string()),
+                (ReplyPhase::Tool, "WebSearch · 南沙 天气".to_string()),
+                // 没有可展示的入参就只留工具名，不要拼出 `Task · ` 这种尾巴。
+                (ReplyPhase::Tool, "Task".to_string()),
+            ]
+        );
+    }
+
+    /// 入参存在但值是空的（或只有空白）时，同样只留工具名。
+    #[test]
+    fn tool_summary_skips_blank_arguments() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Grep","input":{"file_path":"   ","pattern":"ok"}}]}}"#;
+
+        assert_eq!(
+            progress_chunks_from_line(line),
+            vec![(ReplyPhase::Tool, "Grep · ok".to_string())],
+            "空的 file_path 要跳过，接着看下一个键"
+        );
+    }
+
+    /// 思考与工具要能同时落库（界面上"想过什么 + 用过什么"都要有）。
+    #[test]
+    fn parses_thinking_and_tools_from_one_stream() {
+        let stdout = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"先看看文件\"}]}}\n\
+{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"a.rs\"}}]}}\n\
+{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"a.rs\"}}]}}\n\
+{\"type\":\"result\",\"result\":\"好\"}";
+
+        let generation = parse_generation(stdout);
+
+        assert_eq!(generation.reasoning.as_deref(), Some("先看看文件"));
+        assert_eq!(
+            generation.tools.as_deref(),
+            Some("Read · a.rs"),
+            "相邻重复的调用要去重，免得界面上一串一样的行"
+        );
+    }
+
+    /// 没用工具时 `tools` 是 None（界面据此不渲染工具区）。
+    #[test]
+    fn no_tool_use_means_no_tools() {
+        let generation = parse_generation(REAL_STREAM_JSON);
+        assert_eq!(generation.tools, None);
+    }
+
     /// 逐行抽块：这是「边读边推」的核心。真实的 `REAL_STREAM_JSON` 逐行喂进去，
     /// 期望得到 thinking 先、text 后；噪声行与 result 行不产生块（否则界面会
     /// 把 CLI 的错误提示或最终结果当成正文再显示一遍）。
@@ -1167,12 +1295,23 @@ mod tests {
         );
     }
 
-    /// 空块（模型想了但内容为空）不该产生推送，避免界面出现空气泡。
+    /// 空块（模型想了但内容为空）不该产生推送，避免界面出现空气泡；
+    /// 同一行里的工具调用仍要照常上报（它自己也带信息）。
     #[test]
     fn progress_skips_empty_blocks() {
-        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"   \"},{\"type\":\"tool_use\",\"name\":\"Read\"}]}}";
+        let mixed = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"   \"},{\"type\":\"tool_use\",\"name\":\"Read\"}]}}";
+        assert_eq!(
+            progress_chunks_from_line(mixed),
+            vec![(ReplyPhase::Tool, "Read".to_string())],
+            "空的 thinking 要跳过，工具调用要留下"
+        );
 
-        assert!(progress_chunks_from_line(line).is_empty());
+        let only_blank_thinking = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"   \"}]}}";
+        assert!(progress_chunks_from_line(only_blank_thinking).is_empty());
+
+        // 工具块缺 name 也抽不出东西（宁可漏一行，不要渲染半截）。
+        let nameless_tool = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"input\":{\"file_path\":\"a.rs\"}}]}}";
+        assert!(progress_chunks_from_line(nameless_tool).is_empty());
     }
 
     /// 多个 thinking 块要按顺序拼起来（模型可能分多段想）。
