@@ -126,7 +126,7 @@ pub struct Orchestrator {
     /// 「@我」和「单聊」两路监听同时看到，各自攒批会重复回复。
     reply_batches: Arc<Mutex<HashMap<String, Vec<ChatEvent>>>>,
     /// 已在等窗口的会话，避免同一会话排多个 flush 任务。
-    reply_inflight: Arc<Mutex<HashSet<String>>>,
+    reply_inflight: Arc<std::sync::Mutex<HashSet<String>>>,
     /// 攒批窗口长度，见 `DEFAULT_REPLY_BATCH_WINDOW`。
     reply_batch_window: Duration,
     /// 每个会话最近一次生成时 CLI 报的**上下文占用比例**（0~1）。
@@ -138,9 +138,11 @@ pub struct Orchestrator {
     trace_started: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
 
-/// 攒批窗口：收到第一条后等这么久，把期间到达的同会话消息并成一次回复。
-/// 太短收不齐（对方连着打字），太长显得反应慢。
-const DEFAULT_REPLY_BATCH_WINDOW: Duration = Duration::from_secs(8);
+/// 攒批静默窗口。
+///
+/// **很短**：它只为合并「打字分两行」这类紧挨着发的消息。处理期间到达的消息靠
+/// 「队列排空」自然合并（见 `flush_reply_batch`），不再依赖一个漫长的窗口。
+const DEFAULT_REPLY_BATCH_WINDOW: Duration = Duration::from_secs(1);
 
 impl Orchestrator {
     pub fn new(storage: Arc<Mutex<Storage>>) -> Self {
@@ -152,7 +154,7 @@ impl Orchestrator {
             dws_path: Arc::new(Mutex::new(None)),
             reply_lock: Arc::new(Mutex::new(())),
             reply_batches: Arc::new(Mutex::new(HashMap::new())),
-            reply_inflight: Arc::new(Mutex::new(HashSet::new())),
+            reply_inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
             reply_batch_window: DEFAULT_REPLY_BATCH_WINDOW,
             last_context_ratio: Arc::new(Mutex::new(HashMap::new())),
             last_model: Arc::new(Mutex::new(HashMap::new())),
@@ -476,7 +478,7 @@ struct Shared {
     reply: Arc<Mutex<ReplySettings>>,
     reply_lock: Arc<Mutex<()>>,
     reply_batches: Arc<Mutex<HashMap<String, Vec<ChatEvent>>>>,
-    reply_inflight: Arc<Mutex<HashSet<String>>>,
+    reply_inflight: Arc<std::sync::Mutex<HashSet<String>>>,
     reply_batch_window: Duration,
     last_context_ratio: Arc<Mutex<HashMap<String, f64>>>,
     last_model: Arc<Mutex<HashMap<String, String>>>,
@@ -484,6 +486,24 @@ struct Shared {
     compress_failures: Arc<Mutex<u32>>,
     /// 连续畸形事件计数：仅在连续出现时提示（D-40）。
     malformed_streak: Arc<Mutex<u32>>,
+}
+
+/// 摘「该会话正在处理」标记的 RAII 守卫。
+///
+/// 用 `std::sync::Mutex` 而不是 tokio 的：`Drop` 里不能 await，而 `try_lock` 可能失败。
+/// 标记一旦留在表里，那个会话就**再也不会回消息**（`schedule_reply` 里也有同样的告警），
+/// 所以这里必须保证「无论如何都会摘掉」。
+struct InflightGuard {
+    inflight: Arc<std::sync::Mutex<HashSet<String>>>,
+    conversation: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.inflight.lock() {
+            set.remove(&self.conversation);
+        }
+    }
 }
 
 impl Shared {
@@ -948,7 +968,7 @@ impl Shared {
             // 注意 HashSet::insert 返回 true 表示「新插入」——含义容易记反，
             // 记反的后果是第一条消息就被当成「已有窗口」，flush 永远不排，
             // 表现为「收到了但永远不回复」。
-            let mut inflight = self.reply_inflight.lock().await;
+            let mut inflight = self.reply_inflight.lock().unwrap();
             let first_in_window = inflight.insert(conversation.clone());
             let size = bucket.len();
             (size, first_in_window)
@@ -984,50 +1004,60 @@ impl Shared {
         tokio::spawn(async move { shared.flush_reply_batch(&conversation).await });
     }
 
-    /// 等一个静默窗口，把这一批消息合成一条回复发出去。
+    /// 把这一批消息合成一条回复发出去；**处理期间到达的消息立即接着处理**。
+    ///
+    /// 以前是「先等满一个静默窗口再处理」—— 每条首消息都白等整个窗口；而且处理**前**就把
+    /// inflight 标记摘掉，导致处理期间新到的消息要**重新排一个完整窗口**，又白等一次。
+    /// 现在只等一个很短的静默窗口（合并「打字分两行」），处理期间到达的消息收进队列，
+    /// 处理完立刻接着答 —— 生成本身就要好几秒，那个时长足够把连发收齐了。
     async fn flush_reply_batch(&self, conversation: &str) {
+        // 标记用 RAII 守住：处理过程万一 panic 也必须摘掉，否则这个会话再也不会回消息。
+        let _inflight = InflightGuard {
+            inflight: self.reply_inflight.clone(),
+            conversation: conversation.to_string(),
+        };
+
+        // 短静默：只为合并「打字分两行」这类紧挨着发的消息。
         tokio::time::sleep(self.reply_batch_window).await;
 
-        let batch = self
-            .reply_batches
-            .lock()
-            .await
-            .remove(conversation)
-            .unwrap_or_default();
+        loop {
+            let batch = self
+                .reply_batches
+                .lock()
+                .await
+                .remove(conversation)
+                .unwrap_or_default();
+            if batch.is_empty() {
+                break;
+            }
 
-        // 先摘标记再处理：处理期间新到的消息会自己排下一次窗口，
-        // 不会卡在「有标记但没人处理」而永远不回。
-        self.reply_inflight.lock().await.remove(conversation);
+            if batch.len() > 1 {
+                self.push_log(&format!(
+                    "收到 {} 条消息，合并成一条回复（会话 {}）",
+                    batch.len(),
+                    conversation
+                ))
+                .await;
+            }
 
-        if batch.is_empty() {
-            return;
-        }
-
-        if batch.len() > 1 {
-            self.push_log(&format!(
-                "收到 {} 条消息，合并成一条回复（会话 {}）",
-                batch.len(),
-                conversation
-            ))
+            self.trace(
+                conversation,
+                "⑨ 出批",
+                &format!(
+                    " 本批 {} 条（message_id: {}）",
+                    batch.len(),
+                    batch
+                        .iter()
+                        .map(|item| item.message_id.chars().take(12).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
             .await;
+
+            self.reply_to_batch(batch).await;
+            // 不在这里再等静默窗口：这些消息是在生成期间到的，早到齐了。
         }
-
-        self.trace(
-            conversation,
-            "⑨ 出批",
-            &format!(
-                " 窗口结束，本批 {} 条（message_id: {}）",
-                batch.len(),
-                batch
-                    .iter()
-                    .map(|item| item.message_id.chars().take(12).collect::<String>())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        )
-        .await;
-
-        self.reply_to_batch(batch).await;
     }
 
     /// 把本批消息里引用的附件取回来，变成要写进提示词的说明。
