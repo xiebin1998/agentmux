@@ -431,6 +431,25 @@ pub async fn update_project(
     Ok(())
 }
 
+/// 全局设置（模型、思考强度等）改完后，把新设置**重新解析并下发**到在跑的监听。
+///
+/// 不这么做的话，改动只落在 `settings.json` 里，在跑的监听还用启动时的快照 ——
+/// 界面写着「下一条消息生效」其实是假的（得重启监听才生效）。返回被更新的监听数。
+pub async fn push_settings_to_running_listeners(state: &crate::AppState) -> usize {
+    let orchestrator = state.orchestrator.lock().await;
+
+    match ProjectStore::new(crate::config::data_dir()).and_then(|store| store.list()) {
+        Ok(projects) => orchestrator.push_project_settings(&projects).await,
+        Err(err) => {
+            // 写进「监听日志」而不是 stderr：GUI 下 stderr 没人看得见。
+            orchestrator
+                .push_global_log(&format!("全局设置未能下发到在跑的监听：{err}"))
+                .await;
+            0
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn delete_project(id: String) -> Result<(), String> {
     let data_dir = crate::config::data_dir();

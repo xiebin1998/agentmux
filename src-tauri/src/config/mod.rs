@@ -262,8 +262,15 @@ pub async fn get_config() -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
-pub async fn set_config(config: AppConfig) -> Result<(), String> {
-    save_config(&config).map_err(|e| e.to_string())
+pub async fn set_config(
+    state: tauri::State<'_, crate::AppState>,
+    config: AppConfig,
+) -> Result<(), String> {
+    save_config(&config).map_err(|e| e.to_string())?;
+    // 全局设置里有回复链路要用的项（模型、压缩策略等）：保存后必须下发到在跑的
+    // 监听，否则改完不重启监听不生效。
+    crate::project::push_settings_to_running_listeners(&state).await;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]

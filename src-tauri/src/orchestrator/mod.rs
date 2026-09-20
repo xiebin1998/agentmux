@@ -319,6 +319,25 @@ impl Orchestrator {
         updated
     }
 
+    /// 把一批项目**重新解析**出的生效设置下发到各自在跑的监听。
+    ///
+    /// 全局设置（模型、思考强度、压缩策略等）改完后必须调它 —— 否则改动只落在
+    /// `settings.json` 里，在跑的监听还用启动时的快照，界面写的「下一条消息生效」
+    /// 就是假的。返回被更新的监听数（0 = 这些项目当前都没有在跑的监听）。
+    pub async fn push_project_settings(&self, projects: &[crate::project::Project]) -> usize {
+        let mut updated = 0;
+        for project in projects {
+            let mut settings = crate::config::reply_settings_for_project(project);
+            // 与启动监听同一条解析路径：开关开着但还没解析出 CLI 时补一次。
+            if settings.enabled && settings.agent_cli_path.is_none() {
+                settings.agent_cli_path =
+                    crate::resolve::resolve_executable(&settings.agent_platform).await;
+            }
+            updated += self.apply_project_settings(&project.id, settings).await;
+        }
+        updated
+    }
+
     pub async fn stop_listener(&self, id: &str) -> anyhow::Result<String> {
         let (stdin, pid, stop_requested) = {
             let listeners = self.listeners.lock().await;
@@ -2002,6 +2021,76 @@ setTimeout(function () { process.stdout.write(evt("late") + "\n"); }, 1500);
 process.stdin.resume();
 process.stdin.on("end", function () { process.exit(0); });
 "#;
+
+    /// 改完设置后必须**重新解析并下发**到所有在跑的监听，而不是只认启动时的快照。
+    ///
+    /// 以前只有「保存该项目」才下发，改全局设置（模型 / 思考强度等）只写进
+    /// `settings.json`，在跑的监听还用旧快照 —— 界面写着「下一条消息生效」其实是假的。
+    #[tokio::test]
+    async fn push_project_settings_refreshes_running_listener() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let stub_dir = std::env::temp_dir().join("agentmux-push-settings-stub");
+        let _ = std::fs::remove_dir_all(&stub_dir);
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::write(stub_dir.join("event"), STUB).unwrap();
+
+        let data_dir = std::env::temp_dir().join("agentmux-push-settings-data");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let storage = Arc::new(Mutex::new(Storage::new(data_dir).unwrap()));
+        let orchestrator = Orchestrator::new(storage);
+        // 指到桩脚本：否则会真的起 dws 订阅（抢真实事件、脏环境）。
+        orchestrator.set_dws_path(Some(node)).await;
+
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&stub_dir).unwrap();
+
+        let id = orchestrator
+            .start_listener(
+                "p-push".to_string(),
+                ListenKind::AtMe,
+                ReplySettings::default(),
+                None,
+            )
+            .await
+            .expect("应能启动监听");
+
+        // 快照里是默认值；下发一份「改过」的设置，必须覆盖掉快照。
+        let mut project = crate::project::Project::new(
+            "下发测试".to_string(),
+            stub_dir.to_string_lossy().to_string(),
+            "agent.exe".to_string(),
+            "dws.exe".to_string(),
+            "dingtalk".to_string(),
+            "qoder".to_string(),
+        );
+        project.reply_max_chars = 111;
+        // Project::new 会生成随机 uuid；必须与启动监听时用的 project_id 对齐，
+        // 否则下发时匹配不上（这里正是要验证「按 project_id 命中在跑的监听」）。
+        project.id = "p-push".to_string();
+
+        let updated = orchestrator
+            .push_project_settings(std::slice::from_ref(&project))
+            .await;
+        let empty = orchestrator.push_project_settings(&[]).await;
+
+        let applied = {
+            let listeners = orchestrator.listeners.lock().await;
+            let task = listeners.get(&id).expect("监听应在表里");
+            let max_chars = task.reply.lock().await.max_chars;
+            max_chars
+        };
+        let _ = orchestrator.stop_listener(&id).await;
+        std::env::set_current_dir(previous).unwrap();
+
+        assert_eq!(updated, 1, "在跑的监听应被下发");
+        assert_eq!(empty, 0, "没有项目时不该有更新");
+        assert_eq!(applied, 111, "下发的设置必须覆盖启动时的快照");
+    }
 
     /// 项目设置保存后必须**热更新**到正在跑的监听。
     ///

@@ -164,7 +164,6 @@ pub async fn set_agent_model(
     state: State<'_, AppState>,
     model: String,
 ) -> Result<Option<String>, String> {
-    let _ = state;
     let trimmed = model.trim().to_string();
     let mut config = crate::config::load_config().unwrap_or_default();
     config.agent_model = if trimmed.is_empty() {
@@ -173,6 +172,8 @@ pub async fn set_agent_model(
         Some(trimmed)
     };
     crate::config::save_config(&config).map_err(|e| e.to_string())?;
+    // 保存即热更新到在跑的监听，别让界面那句「下一条消息生效」变成空话。
+    crate::project::push_settings_to_running_listeners(&state).await;
     Ok(config.agent_model)
 }
 
