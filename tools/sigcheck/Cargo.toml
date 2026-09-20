@@ -1,0 +1,12 @@
+[package]
+name = "sigcheck"
+version = "0.0.0"
+edition = "2021"
+# 不是应用的一部分：只给 CI / 本地做「安装包与签名是否对得上」的自检。
+# 用 minisign-verify 与应用运行时**同一套库**，避免自己造一套校验逻辑。
+publish = false
+
+[dependencies]
+minisign-verify = "0.2.5"
+base64 = "0.22"
+serde_json = "1"

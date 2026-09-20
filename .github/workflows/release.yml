@@ -134,8 +134,62 @@ jobs:
             3. 在左侧项目行内点「@我」或「单聊」启动监听；一个项目最多两路
             4. 「事件与回复」可按项目与会话筛选，「监听日志」按项目筛选
 
-            本版修复：**「启用自动回复」勾了不生效**。创建项目时该设置会被静默丢弃、
-            编辑保存后又要重启监听才生效，两处都已修——现在保存即热更新到正在运行的监听。
+            本次变更见提交记录：https://github.com/${{ github.repository }}/commits/${{ github.event.inputs.tag || github.ref_name }}
           # 直接发布（非草稿），安装包作为 Release 资产对外可见
           releaseDraft: false
           prerelease: false
+
+      # ---- 验签自检 ----
+      # 应用内「立即更新」只有在**线上那个文件与它的 .sig 配对**时才能装。签名由 bundler 产出、
+      # 由 tauri-action 上传，中间任何一环错位（历史上有过）都只有用户点更新时才暴露。
+      # 这里提前到构建期：先验本地产物（签名本身是否正确），再把线上资产下回来验一遍。
+      - name: 验签自检（本地产物）
+        shell: bash
+        run: |
+          set -e
+          found=0
+          while IFS= read -r sig; do
+            found=1
+            cargo run --quiet -p sigcheck -- src-tauri/tauri.conf.json "${sig%.sig}" "${sig}" \
+              || { echo "::error::本地产物与签名就不配对 —— 签名本身有问题，先别修上传（看这条日志）"; exit 1; }
+          done < <(find . -path '*/release/bundle/*' -name '*.sig' -not -path './frontend/*' | sort)
+          if [ "$found" -eq 0 ]; then
+            echo "::error::没找到 bundle 里的 .sig，签名自检等于没做（检查 createUpdaterArtifacts 与路径）"
+            exit 1
+          fi
+
+      - name: 验签自检（线上资产，不配对就用本地产物覆盖重传）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          base="https://github.com/${{ github.repository }}/releases/download/${tag}"
+          tmp="$(mktemp -d)"
+          repaired=0
+          while IFS= read -r sig; do
+            artifact="${sig%.sig}"
+            name="$(basename "$artifact")"
+            curl -fsSL --retry 3 -o "$tmp/$name" "$base/$name"
+            curl -fsSL --retry 3 -o "$tmp/$name.sig" "$base/$name.sig"
+            if cargo run --quiet -p sigcheck -- src-tauri/tauri.conf.json "$tmp/$name.sig" "$tmp/$name"; then
+              continue
+            fi
+            echo "::warning::线上 ${name} 与签名不配对 —— 用本地已验证的产物覆盖重传"
+            gh release upload "$tag" "$artifact" "$sig" --clobber
+            repaired=$((repaired + 1))
+          done < <(find . -path '*/release/bundle/*' -name '*.sig' -not -path './frontend/*' | sort)
+
+          if [ "$repaired" -gt 0 ]; then
+            echo "重传了 ${repaired} 个资产，复核一遍："
+            while IFS= read -r sig; do
+              name="$(basename "${sig%.sig}")"
+              curl -fsSL --retry 3 -o "$tmp/$name" "$base/$name"
+              curl -fsSL --retry 3 -o "$tmp/$name.sig" "$base/$name.sig"
+              cargo run --quiet -p sigcheck -- src-tauri/tauri.conf.json "$tmp/$name.sig" "$tmp/$name"
+            done < <(find . -path '*/release/bundle/*' -name '*.sig' -not -path './frontend/*' | sort)
+            echo "::notice::已修复 ${repaired} 个不配对的资产，线上安装包现在与应用内更新的验签一致"
+          else
+            echo "线上资产与签名全部配对"
+          fi
