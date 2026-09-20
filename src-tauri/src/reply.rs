@@ -334,8 +334,26 @@ pub fn parse_generation(stdout: &str) -> Generation {
     }
 }
 
+/// 剥掉 CLI 附加的检索来源块。
+///
+/// 模型用了联网检索时，CLI 会在结果末尾加上
+/// `Sources: - [标题](url) - [标题](url) …`。那是**来源元数据**，不是回复正文 ——
+/// 直接发给对方既不像真人、也带着一屏链接。只在「其后确实是链接列表」（出现 `](`）
+/// 时才截，免得误伤正文里正常写到的 "Sources"。
+fn strip_sources_block(text: &str) -> &str {
+    let Some(at) = text.rfind("Sources:") else {
+        return text;
+    };
+    if !text[at..].contains("](") {
+        return text;
+    }
+    text[..at].trim_end()
+}
+
 /// 剔除 @ 提及（`@` 及其后连续非空白字符）、压平空白、按字符截断。
 pub fn sanitize_reply(raw: &str, max_chars: usize) -> String {
+    let raw = strip_sources_block(raw);
+
     let mut without_mentions = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
 
@@ -757,6 +775,30 @@ mod tests {
     fn sanitize_strips_mentions_and_collapses_whitespace() {
         assert_eq!(sanitize_reply("@谢斌(谢斌) 你好   世界\n第二行", 500), "你好 世界 第二行");
         assert_eq!(sanitize_reply("@a@b 结果", 500), "结果");
+    }
+
+    /// 真实场景（2026-09-20 实测）：模型用了联网检索后，CLI 会在结果末尾附一段
+    /// `Sources: - [标题](url) …`。那是**检索来源元数据**，不是给人看的回复 ——
+    /// 却被原样当消息发给了对方（库里 `reply_text` 里就有）。必须剥掉。
+    #[test]
+    fn strips_search_sources_block() {
+        let raw = "抱歉，我这边暂时查不到南沙明天的具体天气，你可以看下手机天气APP Sources: - [南沙天气预报 - 中国天气网](https://www.weather.com.cn/weather/101280112.shtml) - [南沙天气 - 广州市气象局](http://www.tqyb.com.cn/nansha/)";
+
+        let cleaned = sanitize_reply(raw, 500);
+
+        assert!(!cleaned.contains("Sources"), "来源块必须剥掉，实际: {cleaned}");
+        assert!(!cleaned.contains("http"), "不该把链接留下，实际: {cleaned}");
+        assert!(
+            cleaned.contains("查不到南沙明天的具体天气"),
+            "正文必须保留，实际: {cleaned}"
+        );
+    }
+
+    /// 只是行文里提到 Sources、后面没有链接列表时**逐字不动**，防误伤。
+    #[test]
+    fn keeps_reply_that_merely_mentions_sources() {
+        let raw = "你说的 Sources 我不清楚";
+        assert_eq!(sanitize_reply(raw, 500), raw);
     }
 
     #[test]
