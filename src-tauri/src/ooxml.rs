@@ -84,7 +84,7 @@ fn first_sheet_rel_id(xml: &str) -> Option<String> {
                 for attr in event.attributes().flatten() {
                     // `r:id` 的 local name 是 `id`；同元素上的 `sheetId` 不会撞名。
                     if attr.key.local_name().as_ref() == "id" {
-                        let value = attr.unescape_value().unwrap_or_default();
+                        let value = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap_or_default();
                         if !value.trim().is_empty() {
                             return Some(value.trim().to_string());
                         }
@@ -109,7 +109,7 @@ fn relationship_target(xml: &str, rel_id: &str) -> Option<String> {
                 let mut id = None;
                 let mut target = None;
                 for attr in event.attributes().flatten() {
-                    let value = attr.unescape_value().unwrap_or_default().to_string();
+                    let value = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap_or_default().to_string();
                     match attr.key.local_name().as_ref() {
                         "Id" => id = Some(value),
                         "Target" => target = Some(value),
@@ -222,10 +222,10 @@ fn parse_rows(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
                         match attr.key.local_name().as_ref() {
                             // `r="B7"` 给出行内列位置，缺列时靠它补齐，空单元格才不串位
                             "r" => {
-                                column = column_index(&attr.unescape_value().unwrap_or_default())
+                                column = column_index(&attr.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap_or_default())
                             }
                             "t" => {
-                                cell_type = attr.unescape_value().unwrap_or_default().to_string()
+                                cell_type = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap_or_default().to_string()
                             }
                             _ => {}
                         }

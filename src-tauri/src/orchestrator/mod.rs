@@ -1011,6 +1011,69 @@ impl Shared {
         self.reply_to_batch(batch).await;
     }
 
+    /// 把本批消息里引用的附件取回来，变成要写进提示词的说明。
+    ///
+    /// **取不到不阻塞回复**：只在日志里留一行原因，照常生成 —— 附件是锦上添花，
+    /// 不该因为它失败就让对方一条回应都收不到。
+    async fn collect_attachments(
+        &self,
+        events: &[ChatEvent],
+        reply: &ReplySettings,
+    ) -> Vec<crate::attachments::AttachmentNote> {
+        let mut notes = Vec::new();
+        let work_dir = reply.agent_cwd.trim();
+        if work_dir.is_empty() {
+            return notes;
+        }
+
+        for event in events {
+            let Some(quoted) = crate::attachments::quoted_from_raw(&event.raw) else {
+                continue;
+            };
+            // 引用纯文字不需要额外取东西：它已经作为上下文进去了。
+            if !quoted.is_file {
+                continue;
+            }
+
+            match crate::attachments::download_attachment(
+                &self.path,
+                work_dir,
+                &quoted.quoted_message_id,
+            )
+            .await
+            {
+                Ok(fetched) if fetched.is_empty() => {
+                    self.push_log("对方引用了附件，但没能取回文件").await;
+                }
+                Ok(fetched) => {
+                    let work = std::path::Path::new(work_dir);
+                    for note in crate::attachments::to_notes(work, &fetched, quoted.is_image) {
+                        match note.rel_path.as_deref() {
+                            Some(path) => {
+                                self.push_log(&format!("已取回引用附件「{}」到 {}", note.name, path))
+                                    .await;
+                            }
+                            None => {
+                                self.push_log(&format!(
+                                    "引用附件「{}」未读取：{}",
+                                    note.name,
+                                    note.reason.as_deref().unwrap_or("未知原因")
+                                ))
+                                .await;
+                            }
+                        }
+                        notes.push(note);
+                    }
+                }
+                Err(err) => {
+                    self.push_log(&format!("取回引用附件失败：{err}")).await;
+                }
+            }
+        }
+
+        notes
+    }
+
     /// 回复链路：判定 → 拉上下文 → 生成 → 清洗 → 发送 → 记账。
     async fn reply_to_batch(&self, events: Vec<ChatEvent>) {
         // 本项目当前的回复设置（项目设置保存后会热更新）。
@@ -1133,6 +1196,10 @@ impl Shared {
         // 这一批里对方说的所有内容：多条并成一条回复时都要交给 Agent 看。
         let contents: Vec<String> = events.iter().map(|item| item.content.clone()).collect();
 
+        // 引用来的附件由应用侧取回、落进工作目录；提示词里只给相对路径，
+        // 内容让 Agent 自己按需 Read（表格可能很大，全塞进来会撑爆上下文）。
+        let attachments = self.collect_attachments(&events, &reply).await;
+
         let prompt = match self
             .storage
             .lock()
@@ -1141,15 +1208,20 @@ impl Shared {
             .ok()
             .flatten()
         {
-            Some(summary) => crate::reply::build_prompt_for_batch(
+            Some(summary) => crate::reply::build_prompt_for_batch_with_attachments(
                 &contents,
                 Some(&summary.content),
                 &context,
                 reply.context_enabled,
+                &attachments,
             ),
-            None => {
-                crate::reply::build_prompt_for_batch(&contents, None, &context, reply.context_enabled)
-            }
+            None => crate::reply::build_prompt_for_batch_with_attachments(
+                &contents,
+                None,
+                &context,
+                reply.context_enabled,
+                &attachments,
+            ),
         };
 
         // 会话按 (项目, conversation_id) 建档：首次 --session-id，之后 --resume。
@@ -1234,6 +1306,17 @@ impl Shared {
 
         // 必须在 save_session 之后：首次回复时是那一步才建出这一行，而落库是 UPDATE。
         self.record_runtime(&event.conversation_id, &raw).await;
+
+        // 弱校验：把附件路径给了 Agent，它却只跑了 1 轮 —— 说明它压根没去 Read，
+        // 那它对附件内容的任何说法都是编的（实测这个模型拿不到内容时会编）。
+        // **只记日志、不拦回复**：num_turns 的语义是实测归纳的（读文件=3、纯问答=1），
+        // 拿它做硬判定太脆。
+        if !attachments.is_empty() && raw.num_turns == Some(1) {
+            self.push_log(
+                "注意：这次给了引用附件却没有读取（num_turns=1），回复里若提到附件内容多半是编的",
+            )
+            .await;
+        }
 
         let mut text = crate::reply::sanitize_reply(&raw.text, reply.max_chars);
         if text.is_empty() {
