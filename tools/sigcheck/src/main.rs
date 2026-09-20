@@ -1,21 +1,43 @@
-//! 校验 Tauri 更新包的签名是否**真的**覆盖了那个安装包。
+//! 校验 / 生成 Tauri 更新包的签名。
 //!
 //! 为什么需要它：应用内「立即更新」在验签失败时才报错，而那时候版本已经发出去了。
 //! 这个工具把同一件事提前到构建期做完 —— 用 `minisign-verify`（应用运行时同一套库）
-//! 校验 `xxx.exe` 与 `xxx.exe.sig` 是否配对。
+//! 校验 `xxx.exe` 与 `xxx.exe.sig` 是否配对；不配对时用 `minisign` 直接重签。
 //!
 //! 用法：
 //!   sigcheck <tauri.conf.json 或 .key.pub> <安装包.sig> <安装包>      校单个
 //!   sigcheck <tauri.conf.json 或 .key.pub> <目录>                校目录下所有 *.sig
+//!   sigcheck sign <安装包>...                                   重签（密钥走环境变量）
 //!
-//! 失败时退出码非 0，并打印每一对的结论，便于 CI 直接拦下来。
+//! 重签读环境变量，与 tauri CLI 同名（密钥不落命令行，免得进进程列表/日志）：
+//!   TAURI_SIGNING_PRIVATE_KEY           私钥文件原文的 base64
+//!   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  口令（私钥没设口令就不用给）
+//!
+//! 失败时退出码非 0，便于 CI 直接拦下来。
 
 use base64::Engine;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(String::as_str) == Some("sign") {
+        let artifacts: Vec<PathBuf> = args[1..].iter().map(PathBuf::from).collect();
+        if artifacts.is_empty() {
+            eprintln!("用法: sigcheck sign <安装包>...");
+            return ExitCode::from(2);
+        }
+        return match resign(&artifacts) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("✗ 重签失败：{err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let (pub_source, pairs) = match args.len() {
         3 => (args[0].clone(), vec![(PathBuf::from(&args[1]), PathBuf::from(&args[2]))]),
         2 => {
@@ -25,6 +47,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("用法: sigcheck <conf 或 .key.pub> <安装包.sig> <安装包>");
             eprintln!("      sigcheck <conf 或 .key.pub> <目录>");
+            eprintln!("      sigcheck sign <安装包>...");
             return ExitCode::from(2);
         }
     };
@@ -96,6 +119,54 @@ fn main() -> ExitCode {
         println!("\n全部通过");
         ExitCode::SUCCESS
     }
+}
+
+/// 用同一把密钥给最终产物重签，写出 `<安装包>.sig`。
+///
+/// 为什么要自己签：bundler 落在产物旁边的 `.sig` 实测与线上那个文件不配对
+/// （v0.2.3/v0.2.4 皆然），应用内更新必然验签失败。这里对着**最终产物**签，签完
+/// 立刻由调用方用 `minisign-verify` 复核，保证发布出去的签名覆盖的就是发出去的文件。
+fn resign(artifacts: &[PathBuf]) -> Result<(), String> {
+    let key_b64 = std::env::var("TAURI_SIGNING_PRIVATE_KEY")
+        .map_err(|_| "没有 TAURI_SIGNING_PRIVATE_KEY 环境变量".to_string())?;
+    let password = std::env::var("TAURI_SIGNING_PRIVATE_KEY_PASSWORD").ok();
+
+    // 与 tauri CLI 一致：环境变量里放的是私钥**文件原文的 base64**
+    let key_text = String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(key_b64.trim())
+            .map_err(|e| format!("私钥不是合法 base64：{e}"))?,
+    )
+    .map_err(|e| format!("私钥内容不是 UTF-8：{e}"))?;
+
+    let secret_key = minisign::SecretKeyBox::from_string(&key_text)
+        .map_err(|e| format!("私钥格式不对：{e:?}"))?
+        .into_secret_key(password)
+        .map_err(|e| format!("私钥解不开（口令错？）：{e:?}"))?;
+
+    for artifact in artifacts {
+        let name = artifact
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("artifact")
+            .to_string();
+        let data = std::fs::read(artifact).map_err(|e| format!("读不到 {}：{e}", artifact.display()))?;
+        let signature_box = minisign::sign(
+            None,
+            &secret_key,
+            Cursor::new(data),
+            Some(&format!("file:{name}")),
+            Some("signature from agentmux release job"),
+        )
+        .map_err(|e| format!("签名失败：{e:?}"))?;
+
+        // `.sig` 资产与 latest.json 的 signature 字段都是「签名文件原文的 base64」
+        let content = base64::engine::general_purpose::STANDARD.encode(signature_box.to_string());
+        let sig_path = PathBuf::from(format!("{}.sig", artifact.display()));
+        std::fs::write(&sig_path, &content).map_err(|e| format!("写不到 {}：{e}", sig_path.display()))?;
+        println!("已重签 {name}（签名 {} 字节）", content.len());
+    }
+    Ok(())
 }
 
 /// 目录下每一对 `xxx.sig` / `xxx`。**递归找**：bundle 里 nsis 与 msi 是并列子目录。

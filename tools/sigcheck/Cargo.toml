@@ -8,5 +8,8 @@ publish = false
 
 [dependencies]
 minisign-verify = "0.2.5"
+# 只用来在发布时给最终产物重签：CI 里没有 `cargo tauri` 子命令（tauri-action 用的是它自己的 CLI），
+# 所以签名这一步不能依赖外部 CLI。用的就是 tauri-cli 自己那套库。
+minisign = "0.7.3"
 base64 = "0.22"
 serde_json = "1"
