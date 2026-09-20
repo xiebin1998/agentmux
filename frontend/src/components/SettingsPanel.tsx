@@ -21,6 +21,8 @@ interface AppConfig {
   permission_mode?: string | null;
   /** 攒批静默窗口（毫秒）；紧挨着发的消息先等这么久再并成一条回复 */
   reply_batch_window_ms?: number | null;
+  /** 是否让模型输出思考过程 */
+  thinking_enabled?: boolean | null;
   reply_enabled: boolean;
   reply_timeout_ms: number;
   reply_max_chars: number;
@@ -365,6 +367,29 @@ export default function SettingsPanel({ project, onClose }: SettingsPanelProps) 
           收到一条消息后先等这么久，把紧挨着发的几条并成一条回复。
           <strong>越短越像真人</strong>；处理上一条期间的连发本来就会并进下一条，
           所以这里不必设长。设 0 = 不等待（代价是「打字分两行」会分成两条回）。
+        </div>
+
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            fontSize: "13px",
+            marginTop: "12px",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={config.thinking_enabled ?? true}
+            onChange={(e) => patch({ thinking_enabled: e.target.checked })}
+            style={{ accentColor: "var(--accent)" }}
+          />
+          让模型输出思考过程
+        </label>
+        <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "4px" }}>
+          开着才能在「事件与回复」里点开某条消息看到它的思考过程。
+          <strong>关掉看不到思考，但每条回复更快</strong>。
+          注意思考是<strong>整段出现</strong>的，不是逐字流式（CLI 没有逐字输出能力）。
         </div>
       </div>
 

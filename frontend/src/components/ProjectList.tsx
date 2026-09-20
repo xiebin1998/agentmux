@@ -150,10 +150,35 @@ export default function ProjectList({
                         [project.id]: !isCollapsed,
                       }))
                     }
-                    style={{ ...iconButton, color: "var(--text-secondary)" }}
+                    style={{
+                      ...iconButton,
+                      color: "var(--text-secondary)",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      lineHeight: 0,
+                    }}
                     title={isCollapsed ? "展开会话" : "收起会话"}
                   >
-                    {isCollapsed ? "▶" : "▼"}
+                    {/* 内联 SVG 而不是 ▶/▼ 文本字形：字形粗细随字体/缩放变化，很丑 */}
+                    <svg
+                      width="13"
+                      height="13"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                      style={{
+                        display: "block",
+                        transform: isCollapsed ? "rotate(-90deg)" : "rotate(0deg)",
+                        transition: "transform .15s ease",
+                      }}
+                    >
+                      <polyline points="6 9 12 15 18 9" />
+                    </svg>
                   </button>
                   <span
                     style={{ flex: 1, color: "var(--text-primary)", fontSize: "13px" }}

@@ -50,6 +50,9 @@ pub struct AppConfig {
     /// 实测合法值：auto/none/low/medium/high/xhigh/max/ultracode；界面只暴露低/中/高。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// 是否让模型输出思考过程。开了才能在界面上看到思考，代价是每条回复更慢。
+    #[serde(default = "default_true")]
+    pub thinking_enabled: bool,
     /// 权限放行档位（归一化的 `auto` / `no_ask` / `full`）。空 = 不传、用 CLI 默认。
     ///
     /// 三个 CLI 的旗标与大小写都不同，由 `reply::permission_args` 按平台翻译。
@@ -92,6 +95,11 @@ fn default_reply_batch_window_ms() -> u64 {
     DEFAULT_REPLY_BATCH_WINDOW_MS
 }
 
+/// serde 默认值 `true` —— 新设置项默认开启时用它，别写错成 false。
+fn default_true() -> bool {
+    true
+}
+
 /// 把设置里的攒批窗口收敛到可用范围：0 = 不等待（合法），超过上限按上限算
 /// （再长就明显不像真人在回话了）。
 pub fn clamp_batch_window_ms(value: u64) -> u64 {
@@ -116,6 +124,7 @@ impl Default for AppConfig {
             agent_args: None,
             agent_model: None,
             reasoning_effort: None,
+            thinking_enabled: true,
             permission_mode: None,
             reply_batch_window_ms: DEFAULT_REPLY_BATCH_WINDOW_MS,
             reply_enabled: false,
@@ -372,6 +381,7 @@ pub fn reply_settings() -> crate::reply::ReplySettings {
             .filter(|args| !args.is_empty()),
         agent_model: config.agent_model.clone(),
         reasoning_effort: config.reasoning_effort.clone(),
+        thinking_enabled: config.thinking_enabled,
         permission_mode: config.permission_mode.clone(),
         reply_batch_window_ms: config.reply_batch_window_ms,
         agent_cwd,
@@ -451,6 +461,7 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
             .reasoning_effort
             .clone()
             .filter(|effort| !effort.trim().is_empty()),
+        thinking_enabled: global.thinking_enabled,
         permission_mode: global
             .permission_mode
             .clone()

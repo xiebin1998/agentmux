@@ -1553,6 +1553,29 @@ impl Shared {
                 self.finish_batch(&events, "sent", Some(&text)).await;
                 self.trace(&event.conversation_id, "⑰ 台账", " 已标记 sent（批次内每条都写）")
                     .await;
+
+                // 思考过程落到这一批的每条事件上（它们共享同一次生成），界面上点开可查。
+                if let Some(reasoning) = raw
+                    .reasoning
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    let storage = self.storage.lock().await;
+                    for item in &events {
+                        if !item.message_id.is_empty() {
+                            let _ = storage.set_event_reasoning(&item.message_id, reasoning);
+                        }
+                    }
+                    drop(storage);
+                    self.trace(
+                        &event.conversation_id,
+                        "⑰ 台账",
+                        &format!(" 已存下思考过程（{} 字）", reasoning.chars().count()),
+                    )
+                    .await;
+                }
+
                 self.forget_trace(&events).await;
             }
             Err(err) => {

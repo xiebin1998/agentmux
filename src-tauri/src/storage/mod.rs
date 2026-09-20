@@ -38,6 +38,8 @@ pub struct EventRow {
     pub processed: bool,
     pub reply_status: Option<String>,
     pub reply_text: Option<String>,
+    /// 本次回复的模型思考过程；没思考或还没回过就是 None。
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,6 +177,8 @@ impl Storage {
             "ALTER TABLE events ADD COLUMN malformed INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE events ADD COLUMN raw TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE events ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
+            // 本次回复的模型思考过程（stream-json 的 thinking 块）。生成后才有，故可空。
+            "ALTER TABLE events ADD COLUMN reasoning TEXT",
             // 「删掉的会话」墓碑：记删除时的最大事件序号。之后又来了新消息
             // （序号更大）会话会自己回来，见 list_conversations。
             "ALTER TABLE conversations ADD COLUMN deleted_seq INTEGER",
@@ -467,7 +471,8 @@ impl Storage {
     pub fn list_events(&self, query: &EventQuery) -> Result<Vec<EventRow>> {
         let mut sql = String::from(
             "SELECT project_id, message_id, conversation_id, sender, sender_open_dingtalk_id, content,
-                    create_time, received_at, listen_kind, malformed, processed, reply_status, reply_text
+                    create_time, received_at, listen_kind, malformed, processed, reply_status, reply_text,
+                    reasoning
              FROM events WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -524,6 +529,7 @@ impl Storage {
                 processed: row.get::<_, i32>(10)? != 0,
                 reply_status: row.get(11)?,
                 reply_text: row.get(12)?,
+                reasoning: row.get(13)?,
             })
         })?;
 
@@ -735,6 +741,18 @@ impl Storage {
                 chrono::Local::now().to_rfc3339(),
                 message_id,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// 把本次生成的思考过程写到事件上。
+    ///
+    /// 思考是**每次生成**的产物，而一批可能含多条事件 —— 它们共享同一次生成，
+    /// 所以每条都写一份，界面上点开哪条都看得到。
+    pub fn set_event_reasoning(&self, message_id: &str, reasoning: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE events SET reasoning = ?1 WHERE message_id = ?2",
+            params![reasoning, message_id],
         )?;
         Ok(())
     }

@@ -26,6 +26,11 @@ pub struct ReplySettings {
     /// 实测合法值：`auto / none / low / medium / high / xhigh / max / ultracode`。
     /// 界面只暴露低/中/高 + 默认，其余留给命令行党。
     pub reasoning_effort: Option<String>,
+    /// 是否让模型输出思考过程（`--thinking adaptive`）。
+    ///
+    /// 开了才能把思考存下来、在界面上看到；代价是**每条回复更慢**（实测一节思考几秒），
+    /// 所以给开关。实测 `--thinking enabled` 还要求配 `--thinking-budget`，故用 adaptive。
+    pub thinking_enabled: bool,
     /// 权限放行档位。为空 = 完全不传、用 CLI 自己的默认行为。
     /// 取值是**归一化**的 `auto` / `no_ask` / `full`，由 [`permission_args`] 按平台翻译。
     pub permission_mode: Option<String>,
@@ -62,6 +67,7 @@ impl Default for ReplySettings {
             agent_args: None,
             agent_model: None,
             reasoning_effort: None,
+            thinking_enabled: true,
             permission_mode: None,
             reply_batch_window_ms: crate::config::DEFAULT_REPLY_BATCH_WINDOW_MS,
             agent_cwd: String::new(),
@@ -106,11 +112,15 @@ pub fn default_agent_args(platform_id: &str) -> Vec<String> {
 /// 让 CLI 用 JSON 输出结果的参数。
 ///
 /// 只有拿到 JSON 才能读到**模型名**与 `context_usage_ratio`（CLI 自己算好的
-/// 上下文占用比例），压缩判定才能不靠估算。实测 qodercli 支持 `-o json`。
+/// 上下文占用比例），压缩判定才能不靠估算。
+///
+/// qoder 用 **stream-json**（NDJSON）而不是 `json`：实测只有流式输出里才带
+/// `assistant` 的 `thinking` 内容块，也就是「模型的思考过程」；最终答案仍在
+/// 最后那条 `result` 事件里，解析照旧。
 /// 未实测的平台不猜：返回空，解析侧会退化成「把输出当纯文本」的老行为。
 pub fn json_output_args(platform_id: &str) -> Vec<String> {
     match platform_id {
-        "qoder" => vec!["-o".to_string(), "json".to_string()],
+        "qoder" => vec!["-o".to_string(), "stream-json".to_string()],
         "claude" => vec!["--output-format".to_string(), "json".to_string()],
         _ => Vec::new(),
     }
@@ -173,6 +183,12 @@ pub fn build_cli_args(settings: &ReplySettings) -> Vec<String> {
     if let Some(effort) = non_blank(&settings.reasoning_effort) {
         args.push("--reasoning-effort".to_string());
         args.push(effort.to_string());
+    }
+    // 思考过程：开了才会出现在 stream-json 的 thinking 块里，界面上才看得到。
+    // `enabled` 还要求配 `--thinking-budget`（实测会直接报错），所以用 adaptive。
+    if settings.thinking_enabled && settings.agent_platform == "qoder" {
+        args.push("--thinking".to_string());
+        args.push("adaptive".to_string());
     }
     // 权限放行：按平台翻译；没设就完全不传，保持 CLI 自己的默认行为。
     if let Some(level) = non_blank(&settings.permission_mode) {
@@ -317,6 +333,9 @@ pub struct Generation {
     /// 读一张图片的调用 num_turns=3，纯问答是 1）。用来做一个弱校验：把附件路径
     /// 给了 Agent 却是 1 轮，说明它压根没去读 —— 那它对附件内容的任何说法都是编的。
     pub num_turns: Option<u32>,
+    /// 模型的思考过程（stream-json 里 `assistant` 事件的 `thinking` 内容块）。
+    /// 没有就是 None —— 界面据此不渲染空块。
+    pub reasoning: Option<String>,
 }
 
 /// 解析 CLI 的输出。**必须容忍噪声**：实测 qodercli 的 stdout 第一行是
@@ -375,6 +394,46 @@ pub fn parse_generation(stdout: &str) -> Generation {
         model,
         context_usage_ratio,
         num_turns,
+        reasoning: collect_thinking(stdout),
+    }
+}
+
+/// 把 NDJSON 里所有 `assistant` 事件的 `thinking` 内容块按顺序拼起来。
+///
+/// stream-json 是**块级**推送（实测没有逐 token 的开关），所以思考是整段到达的。
+/// 非 NDJSON 的旧输出会自然返回 None。
+fn collect_thinking(stdout: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let Some(blocks) = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_array())
+        else {
+            continue;
+        };
+
+        for block in blocks {
+            if block.get("type").and_then(|kind| kind.as_str()) != Some("thinking") {
+                continue;
+            }
+            if let Some(text) = block.get("thinking").and_then(|text| text.as_str()) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
     }
 }
 
@@ -934,6 +993,80 @@ mod tests {
         assert!(!prompt.contains("对方还引用了附件"), "没附件就不该出现附件段");
     }
 
+    /// 真实的 `-o stream-json` 输出（2026-09-20 实测，NDJSON）。
+    /// 只保留了与本功能相关的行：开头的非 JSON 噪声、system 事件、thinking 块、
+    /// text 块、以及最后的 result 事件。
+    const REAL_STREAM_JSON: &str = r#"1 error loading agent configs. Use /agents to see details.
+{"type":"system","subtype":"init","qodercli_version":"1.1.58","cwd":"C:\\temp","tools":["Agent"]}
+{"type":"system","subtype":"hook_started","hook_name":"session-start"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Simple mental math."}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"17 × 23，可以拆成 17 × 20 + 17 × 3 = 340 + 51 = **391**。"}]}}
+{"type":"result","subtype":"success","duration_ms":3041,"is_error":false,"num_turns":1,"result":"17 × 23，可以拆成 17 × 20 + 17 × 3 = 340 + 51 = **391**。","usage":{"context_usage_ratio":0.11432},"modelUsage":{"bailian/qwen3.7-plus-cp":{}}}
+"#;
+
+    /// stream-json 是 NDJSON：正文在 `result` 事件里，思考在 `assistant` 的 thinking 块里。
+    #[test]
+    fn parses_thinking_and_result_from_stream_json() {
+        let generation = parse_generation(REAL_STREAM_JSON);
+
+        assert_eq!(
+            generation.text,
+            "17 × 23，可以拆成 17 × 20 + 17 × 3 = 340 + 51 = **391**。"
+        );
+        assert_eq!(generation.reasoning.as_deref(), Some("Simple mental math."));
+        assert_eq!(generation.num_turns, Some(1));
+        assert_eq!(generation.model.as_deref(), Some("bailian/qwen3.7-plus-cp"));
+        assert_eq!(generation.context_usage_ratio, Some(0.11432));
+    }
+
+    /// 没有思考块时 `reasoning` 必须是 None —— 界面据此不渲染空块。
+    #[test]
+    fn no_thinking_block_means_no_reasoning() {
+        let stdout = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"在的\"}]}}\n{\"type\":\"result\",\"result\":\"在的\"}";
+
+        let generation = parse_generation(stdout);
+
+        assert_eq!(generation.text, "在的");
+        assert_eq!(generation.reasoning, None);
+    }
+
+    /// 回归：旧的单行 `-o json` 输出仍要能解析（别把兼容分支写坏）。
+    #[test]
+    fn legacy_single_json_still_parses() {
+        let stdout = "1 error loading agent configs. Use /agents to see details.\n{\"type\":\"result\",\"result\":\"在的\",\"num_turns\":1,\"modelUsage\":{\"m\":{}},\"usage\":{\"context_usage_ratio\":0.01}}";
+
+        let generation = parse_generation(stdout);
+
+        assert_eq!(generation.text, "在的");
+        assert_eq!(generation.reasoning, None);
+        assert_eq!(generation.context_usage_ratio, Some(0.01));
+    }
+
+    /// 多个 thinking 块要按顺序拼起来（模型可能分多段想）。
+    #[test]
+    fn joins_multiple_thinking_blocks_in_order() {
+        let stdout = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"第一段\"}]}}\n{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"第二段\"}]}}\n{\"type\":\"result\",\"result\":\"好\"}";
+
+        let generation = parse_generation(stdout);
+
+        assert_eq!(generation.reasoning.as_deref(), Some("第一段\n第二段"));
+    }
+
+    /// qoder 平台改用 stream-json：只有它能带回思考块（实测 `-o json` 不给）。
+    #[test]
+    fn qoder_uses_stream_json_output() {
+        assert_eq!(
+            json_output_args("qoder"),
+            vec!["-o", "stream-json"],
+            "要拿思考过程就得走流式输出"
+        );
+        assert_eq!(
+            json_output_args("claude"),
+            vec!["--output-format", "json"],
+            "其它平台未实测其流式行为，不要猜"
+        );
+    }
+
     /// `num_turns` 是「它到底读没读附件」的弱校验依据：不调工具=1、调工具=3。
     #[test]
     fn parse_generation_reads_num_turns() {
@@ -1016,6 +1149,40 @@ mod tests {
 
         assert!(!args.iter().any(|arg| arg == "--resume"));
         assert!(!args.iter().any(|arg| arg == "--session-id"));
+    }
+
+    /// 思考默认开；关掉就不该带该参数（关了也就看不到思考过程）。
+    #[test]
+    fn thinking_flag_follows_the_setting() {
+        let enabled = build_cli_args(&ReplySettings {
+            thinking_enabled: true,
+            ..Default::default()
+        });
+        assert!(
+            enabled.windows(2).any(|pair| pair == ["--thinking", "adaptive"]),
+            "开启时应带 --thinking adaptive，实际: {enabled:?}"
+        );
+
+        let disabled = build_cli_args(&ReplySettings {
+            thinking_enabled: false,
+            ..Default::default()
+        });
+        assert!(
+            !disabled.iter().any(|arg| arg == "--thinking"),
+            "关掉就不该传，实际: {disabled:?}"
+        );
+    }
+
+    /// 只给 qoder 传 —— 其它 CLI 的思考旗标没实测，不猜。
+    #[test]
+    fn thinking_flag_is_qoder_only() {
+        let args = build_cli_args(&ReplySettings {
+            agent_platform: "claude".to_string(),
+            thinking_enabled: true,
+            ..Default::default()
+        });
+
+        assert!(!args.iter().any(|arg| arg == "--thinking"), "实际: {args:?}");
     }
 
     /// 权限档位必须**按平台**翻译 —— 三个 CLI 的旗标与大小写都不同（实测）。
