@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
@@ -9,9 +9,21 @@ import ProjectDialog from "./components/ProjectDialog";
 import EventLog from "./components/EventLog";
 import ListenerLogs from "./components/ListenerLogs";
 import OverviewView from "./components/OverviewView";
+import OverlayPanel from "./components/OverlayPanel";
 import SettingsPanel from "./components/SettingsPanel";
 import { ThemeToggle } from "./theme";
 import type { Project, Session } from "./types";
+
+/** 顶栏次要按钮（运行总览 / 全部事件）。 */
+const headerButton: CSSProperties = {
+  padding: "6px 12px",
+  backgroundColor: "transparent",
+  color: "var(--text-secondary)",
+  border: "1px solid var(--border)",
+  borderRadius: "4px",
+  cursor: "pointer",
+  fontSize: "13px",
+};
 
 type ListenKind = "at-me" | "all-direct";
 
@@ -108,14 +120,6 @@ type UpdateProgress =
   | { phase: "installing" }
   | { phase: "failed"; message: string };
 
-type View = "overview" | "events" | "logs";
-
-const VIEWS: { view: View; label: string }[] = [
-  { view: "overview", label: "运行总览" },
-  { view: "events", label: "事件与回复" },
-  { view: "logs", label: "监听日志" },
-];
-
 function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({});
@@ -128,7 +132,11 @@ function App() {
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
   const [showProjectDialog, setShowProjectDialog] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [view, setView] = useState<View>("overview");
+  /** 运行总览 / 全部事件从顶栏开，不再占中间那列。 */
+  const [showOverview, setShowOverview] = useState(false);
+  const [showEvents, setShowEvents] = useState(false);
+  /** 监听日志降为底部抽屉，默认收起。 */
+  const [logsOpen, setLogsOpen] = useState(false);
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
   /** 正在生成的块，按 message_id 归位（监听频道的 progress 分支往里追加）。 */
@@ -426,6 +434,12 @@ function App() {
         </span>
 
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "8px" }}>
+          <button onClick={() => setShowOverview(true)} style={headerButton}>
+            运行总览
+          </button>
+          <button onClick={() => setShowEvents(true)} style={headerButton}>
+            全部事件
+          </button>
           <ThemeToggle />
           <button
             onClick={() => setShowSettings(true)}
@@ -546,46 +560,7 @@ function App() {
             overflow: "hidden",
           }}
         >
-          <div
-            style={{
-              display: "flex",
-              gap: "4px",
-              padding: "6px 12px",
-              borderBottom: "1px solid var(--border)",
-              backgroundColor: "var(--bg-sidebar)",
-            }}
-          >
-            {VIEWS.map(({ view: option, label }) => {
-              const active = !selectedSession && view === option;
-              return (
-                <button
-                  key={option}
-                  onClick={() => {
-                    setSelectedSession(null);
-                    setView(option);
-                  }}
-                  style={{
-                    padding: "4px 10px",
-                    fontSize: "12px",
-                    border: "none",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                    backgroundColor: active ? "var(--bg-active)" : "transparent",
-                    color: active ? "var(--text-primary)" : "var(--text-secondary)",
-                  }}
-                >
-                  {label}
-                </button>
-              );
-            })}
-            {selectedSession && (
-              <span style={{ marginLeft: "auto", fontSize: "11px", color: "var(--text-muted)" }}>
-                正在查看会话，点上方任一视图可返回
-              </span>
-            )}
-          </div>
-
-          <div style={{ flex: 1, overflow: "hidden" }}>
+          <div style={{ flex: 1, overflow: "hidden", minHeight: 0 }}>
             {selectedSession ? (
               <MessageView
                 session={selectedSession}
@@ -596,21 +571,85 @@ function App() {
                   await loadSessions(await loadProjects());
                   return `已同步 ${count} 个会话的名称与类型`;
                 }}
+                onDeleteSession={() => handleDeleteConversation(selectedSession)}
               />
-            ) : view === "overview" ? (
-              <OverviewView projects={projects} />
-            ) : view === "events" ? (
-              <EventLog refreshToken={refreshToken} projects={projects} />
             ) : (
-              <ListenerLogs projects={projects} />
+              <div
+                style={{
+                  height: "100%",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "6px",
+                  color: "var(--text-muted)",
+                  fontSize: "13px",
+                }}
+              >
+                <div>从左侧选一个会话，这里会显示「对方消息 → 思考 → 回复」</div>
+                <div style={{ fontSize: "12px" }}>
+                  跨项目的记录在顶栏「全部事件」里查
+                </div>
+              </div>
             )}
           </div>
         </div>
 
-        {selectedSession && selectedProject && (
-          <ContextPanel session={selectedSession} project={selectedProject} />
+        <ContextPanel
+          session={selectedSession}
+          project={selectedProject}
+          projects={projects}
+          onOpenSettings={() => setShowSettings(true)}
+        />
+      </div>
+
+      <div
+        style={{
+          flexShrink: 0,
+          borderTop: "1px solid var(--border)",
+          backgroundColor: "var(--bg-sidebar)",
+        }}
+      >
+        <button
+          onClick={() => setLogsOpen((open) => !open)}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            width: "100%",
+            padding: "6px 16px",
+            fontSize: "12px",
+            textAlign: "left",
+            backgroundColor: "transparent",
+            color: "var(--text-secondary)",
+            border: "none",
+            cursor: "pointer",
+          }}
+        >
+          <span>{logsOpen ? "▾" : "▸"}</span>
+          <span>监听日志</span>
+          <span style={{ color: "var(--text-muted)" }}>
+            {logsOpen ? "（点标题收起）" : "（点这里展开）"}
+          </span>
+        </button>
+        {logsOpen && (
+          <div style={{ height: "240px", borderTop: "1px solid var(--border)" }}>
+            <ListenerLogs projects={projects} />
+          </div>
         )}
       </div>
+
+      {showOverview && (
+        <OverlayPanel title="运行总览" onClose={() => setShowOverview(false)}>
+          <OverviewView projects={projects} />
+        </OverlayPanel>
+      )}
+
+      {showEvents && (
+        <OverlayPanel title="全部事件与回复" onClose={() => setShowEvents(false)}>
+          <EventLog refreshToken={refreshToken} projects={projects} />
+        </OverlayPanel>
+      )}
 
       {showSettings && (
         <SettingsPanel project={selectedProject} onClose={() => setShowSettings(false)} />

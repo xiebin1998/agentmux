@@ -1,6 +1,5 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import CompressionSection from "./CompressionSection";
 
 interface Session {
   id: string;
@@ -10,20 +9,9 @@ interface Session {
   created_at: string;
 }
 
-interface Project {
+interface ProjectOption {
   id: string;
   name: string;
-  work_dir: string;
-  agent_cli_path: string;
-  dingtalk_cli_path: string;
-  agent_platform?: string;
-  im_platform?: string;
-  reply_enabled: boolean;
-  reply_timeout_ms: number;
-  reply_max_chars: number;
-  context_enabled: boolean;
-  context_message_limit: number;
-  context_max_chars: number;
 }
 
 interface Stats {
@@ -35,89 +23,70 @@ interface Stats {
   conversations: number;
 }
 
-interface ContextPanelProps {
-  session: Session;
-  project: Project | null;
-}
-
-const KIND_LABEL: Record<string, string> = { group: "群聊", direct: "单聊" };
-
-/** conversation_details 命令的返回：会话名/类型 + 上下文用量 + 当前模型。 */
+/** conversation_details 命令的返回里，右列用得上的部分。 */
 interface ConversationDetails {
-  conversation_id: string;
-  name: string;
-  kind: string;
-  /** 回复时最多带多少条历史消息（agentmux 自己的裁剪，不是模型上下文） */
-  context_message_limit: number;
-  /** Agent 最近一次回报的真实占用比例（0~1）；没跑过为 null */
-  context_usage_ratio: number | null;
-  /** 模型的上下文窗口（token）；非 qoder 平台没有这个概念，为 null */
-  context_window_tokens: number | null;
-  /** 窗口来源：session = 从 Agent 会话文件读到；default = 兜底默认值；none = 不适用 */
-  context_window_source: "session" | "default" | "none";
-  /** 已用 token（≈ 占比 × 窗口）；占比或窗口缺一为 null */
-  context_used_tokens: number | null;
-  compress_trigger_percent: number | null;
-  /** Agent 最近一次实际用的模型 */
   model: string | null;
-  /** 配置里显式指定的模型；空 = 用 CLI 默认 */
   model_override: string | null;
-  /** 配置里显式指定的思考强度；空 = 用 CLI 默认 */
   reasoning_effort_override: string | null;
-}
-
-/** 思考强度的界面档位：值传给后端，中文名给人看。 */
-const EFFORT_LABELS: Record<string, string> = {
-  low: "低",
-  medium: "中",
-  high: "高",
-};
-
-/** token 数按 k 显示：200000 → "200k"，64801 → "64.8k"。 */
-function formatTokens(value: number) {
-  if (value < 1000) return String(value);
-  return `${(value / 1000).toFixed(1).replace(/\.0$/, "")}k`;
-}
-
-interface AgentSessionInfo {
-  conversation_id: string;
-  agent_session_id: string;
-  agent_cwd: string;
 }
 
 type ListenerState = "stopped" | "starting" | "running" | "backing_off" | "abandoned";
 
 interface ListenerStatus {
   id: string;
+  project_id: string;
   kind: string;
   state: ListenerState;
   ready: boolean;
-  subscribe_id: string | null;
-  bus_pid: number | null;
   attempts: number;
   last_error: string | null;
-  cli_path: string | null;
-  dropped_before_ready: number;
+}
+
+const KIND_LABEL: Record<string, string> = { group: "群聊", direct: "单聊" };
+
+const EFFORT_LABELS: Record<string, string> = {
+  low: "低",
+  medium: "中",
+  high: "高",
+};
+
+interface ContextPanelProps {
+  /** 选中会话时右列才有模型/思考强度（它们读的是当前会话的覆盖值）。 */
+  session: Session | null;
+  project: ProjectOption | null;
+  projects: ProjectOption[];
+  onOpenSettings: () => void;
 }
 
 const sectionTitle: CSSProperties = {
   fontSize: "11px",
   fontWeight: 600,
   color: "var(--text-secondary)",
-  textTransform: "uppercase",
-  marginBottom: "12px",
+  marginBottom: "10px",
 };
 
 const rowStyle: CSSProperties = {
   display: "flex",
   justifyContent: "space-between",
-  gap: "12px",
+  gap: "10px",
   fontSize: "12px",
 };
 
-function stateLabel(status: ListenerStatus | undefined) {
-  if (!status) return { text: "未启动", color: "var(--text-muted)" };
-  if (status.state === "running" && status.ready) return { text: "监听中", color: "var(--success)" };
+const selectStyle: CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  padding: "4px 6px",
+  fontSize: "12px",
+  backgroundColor: "var(--bg-app)",
+  color: "var(--text-primary)",
+  border: "1px solid var(--border)",
+  borderRadius: "4px",
+};
+
+function stateLabel(status: ListenerStatus) {
+  if (status.state === "running" && status.ready) {
+    return { text: "监听中", color: "var(--success)" };
+  }
   switch (status.state) {
     case "starting":
       return { text: "启动中", color: "var(--warn)" };
@@ -132,93 +101,24 @@ function stateLabel(status: ListenerStatus | undefined) {
   }
 }
 
-export default function ContextPanel({ session, project }: ContextPanelProps) {
+/**
+ * 右列：运行信息。
+ *
+ * 只放**别处没有的**东西 —— 监听状态、运行统计，以及选中会话时的模型/思考强度。
+ * 项目配置、回复配置、会话操作都不在这里：项目弹窗与会话窗口的「⋯」已经有入口，
+ * 两处编辑同一份设置只会让人搞不清改了哪个。
+ */
+export default function ContextPanel({
+  session,
+  project,
+  projects,
+  onOpenSettings,
+}: ContextPanelProps) {
   const [stats, setStats] = useState<Stats | null>(null);
   const [listeners, setListeners] = useState<ListenerStatus[]>([]);
-  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
-  const [agentSession, setAgentSession] = useState<AgentSessionInfo | null>(null);
   const [details, setDetails] = useState<ConversationDetails | null>(null);
   const [models, setModels] = useState<string[]>([]);
-  const [modelNotice, setModelNotice] = useState<string | null>(null);
-  const [effortNotice, setEffortNotice] = useState<string | null>(null);
-
-  // 会话窗口要显示的上下文用量与当前模型；跟着会话切换刷新。
-  useEffect(() => {
-    if (!project) return;
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const next = await invoke<ConversationDetails>("conversation_details", {
-          projectId: project.id,
-          conversationId: session.conversation_id,
-        });
-        if (!cancelled) setDetails(next);
-      } catch (e) {
-        console.error("Failed to load conversation details:", e);
-      }
-    };
-    load();
-    // 上下文占比/模型都是「最近一次生成」的快照，回复后要跟着变，所以轮询。
-    const timer = setInterval(load, 3000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [project, session.conversation_id]);
-
-  useEffect(() => {
-    if (!project) return;
-    let cancelled = false;
-    // 可选模型列表来自 CLI，启动/切会话时拉一次即可，不轮询。
-    invoke<string[]>("list_agent_models", { projectId: project.id })
-      .then((list) => {
-        if (!cancelled) setModels(list);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [project]);
-
-  const handlePickModel = async (model: string) => {
-    try {
-      await invoke("set_agent_model", { model });
-      setModelNotice(
-        model ? `已切换到 ${model}（下一条消息生效）` : "已恢复用 CLI 默认模型（下一条消息生效）",
-      );
-    } catch (e) {
-      setModelNotice(`切换失败：${e}`);
-    }
-  };
-
-  const handlePickEffort = async (level: string) => {
-    try {
-      await invoke("set_reasoning_effort", { level });
-      setEffortNotice(
-        level
-          ? `已切到「${EFFORT_LABELS[level] ?? level}」（下一条消息生效）`
-          : "已恢复 CLI 默认强度（下一条消息生效）",
-      );
-    } catch (e) {
-      setEffortNotice(`切换失败：${e}`);
-    }
-  };
-
-  useEffect(() => {
-    if (!project) return;
-    let cancelled = false;
-    invoke<AgentSessionInfo | null>("conversation_session", {
-      projectId: project.id,
-      conversationId: session.conversation_id,
-    })
-      .then((result) => {
-        if (!cancelled) setAgentSession(result);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [project, session.conversation_id, sessionNotice]);
+  const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -233,7 +133,7 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
           setListeners(nextListeners);
         }
       } catch (e) {
-        console.error("Failed to load panel data:", e);
+        console.error("Failed to load run info:", e);
       }
     };
     load();
@@ -242,14 +142,83 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [session.id]);
+  }, []);
 
-  if (!project) return null;
+  useEffect(() => {
+    if (!project || !session) {
+      setDetails(null);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const next = await invoke<ConversationDetails>("conversation_details", {
+          projectId: project.id,
+          conversationId: session.conversation_id,
+        });
+        if (!cancelled) setDetails(next);
+      } catch (e) {
+        console.error("Failed to load conversation details:", e);
+      }
+    };
+    load();
+    // 当前模型/占比都是「最近一次生成」的快照，回复后要跟着变。
+    const timer = setInterval(load, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [project, session]);
+
+  useEffect(() => {
+    if (!project) {
+      setModels([]);
+      return;
+    }
+    let cancelled = false;
+    // 可选模型列表来自 CLI，切项目时拉一次即可，不轮询。
+    invoke<string[]>("list_agent_models", { projectId: project.id })
+      .then((list) => {
+        if (!cancelled) setModels(list);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [project]);
+
+  const nameOf = (projectId: string) =>
+    projects.find((item) => item.id === projectId)?.name ?? "未归属项目";
+
+  // 终态监听不占版面：它已经在左侧项目行里显示成「未启动」了。
+  const live = listeners.filter(
+    (item) => !(item.state === "stopped" || item.state === "abandoned"),
+  );
+
+  const pickModel = async (model: string) => {
+    try {
+      await invoke("set_agent_model", { model });
+      setNotice(model ? `已切到 ${model}，下一条消息生效` : "已恢复 CLI 默认模型");
+    } catch (e) {
+      setNotice(`切换失败：${e}`);
+    }
+  };
+
+  const pickEffort = async (level: string) => {
+    try {
+      await invoke("set_reasoning_effort", { level });
+      setNotice(
+        level ? `已切到「${EFFORT_LABELS[level] ?? level}」，下一条消息生效` : "已恢复 CLI 默认强度",
+      );
+    } catch (e) {
+      setNotice(`切换失败：${e}`);
+    }
+  };
 
   return (
     <div
       style={{
-        width: "320px",
+        width: "260px",
         backgroundColor: "var(--bg-sidebar)",
         borderLeft: "1px solid var(--border)",
         display: "flex",
@@ -257,12 +226,54 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
         overflow: "auto",
       }}
     >
-      <div style={{ padding: "16px", borderBottom: "1px solid var(--border)" }}>
+      <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border)" }}>
+        <div style={sectionTitle}>监听状态</div>
+        {live.length === 0 ? (
+          <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+            没有在跑的监听
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+            {live.map((listener) => {
+              const label = stateLabel(listener);
+              return (
+                <div key={listener.id} style={{ fontSize: "12px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: "8px" }}>
+                    <span
+                      style={{
+                        color: "var(--text-secondary)",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {nameOf(listener.project_id)} · {KIND_LABEL[listener.kind] ?? listener.kind}
+                    </span>
+                    <span style={{ color: label.color, whiteSpace: "nowrap" }}>{label.text}</span>
+                  </div>
+                  {listener.last_error && (
+                    <div style={{ color: "var(--danger)", fontSize: "11px", marginTop: "2px" }}>
+                      {listener.last_error}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border)" }}>
         <div style={sectionTitle}>运行统计</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
           <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>累计事件</span>
-            <span style={{ color: "var(--text-primary)" }}>{stats?.total_events ?? "—"}</span>
+            <span style={{ color: "var(--text-secondary)" }}>事件</span>
+            <span style={{ color: "var(--text-primary)" }}>
+              {stats?.total_events ?? "—"}
+              {stats?.malformed_events ? (
+                <span style={{ color: "var(--warn)" }}> · 畸形 {stats.malformed_events}</span>
+              ) : null}
+            </span>
           </div>
           <div style={rowStyle}>
             <span style={{ color: "var(--text-secondary)" }}>已回复</span>
@@ -274,234 +285,21 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
               {stats?.failed_replies ?? "—"}
             </span>
           </div>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>畸形事件</span>
-            <span
-              style={{ color: stats?.malformed_events ? "var(--warn)" : "var(--text-primary)" }}
-            >
-              {stats?.malformed_events ?? "—"}
-            </span>
-          </div>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>会话数</span>
-            <span style={{ color: "var(--text-primary)" }}>{stats?.conversations ?? "—"}</span>
-          </div>
         </div>
       </div>
 
-      <div style={{ padding: "16px", borderBottom: "1px solid var(--border)" }}>
-        <div style={sectionTitle}>监听状态</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-          {listeners.length === 0 ? (
-            <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>尚未启动监听</div>
-          ) : (
-            listeners.map((listener) => {
-              const label = stateLabel(listener);
-              return (
-                <div key={listener.id} style={{ fontSize: "12px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <span style={{ color: "var(--text-secondary)" }}>{listener.kind}</span>
-                    <span style={{ color: label.color }}>{label.text}</span>
-                  </div>
-                  <div style={{ color: "var(--text-muted)", fontSize: "11px", marginTop: "2px" }}>
-                    {listener.subscribe_id ?? "无订阅 id"} · bus_pid {listener.bus_pid ?? "—"}
-                  </div>
-                  {listener.last_error && (
-                    <div style={{ color: "var(--danger)", fontSize: "11px", marginTop: "2px" }}>
-                      {listener.last_error}
-                    </div>
-                  )}
-                </div>
-              );
-            })
-          )}
-        </div>
-      </div>
-
-      <div style={{ padding: "16px", borderBottom: "1px solid var(--border)" }}>
-        <div style={sectionTitle}>项目配置</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "10px", fontSize: "12px" }}>
-          <div>
-            <div style={{ color: "var(--text-secondary)", marginBottom: "4px" }}>工作目录</div>
-            <div style={{ color: "var(--text-primary)", wordBreak: "break-all" }}>
-              {project.work_dir}
-            </div>
+      {project && session && (
+        <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border)" }}>
+          <div style={sectionTitle}>模型</div>
+          <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "8px" }}>
+            当前：{details?.model ?? "回复过一次后由 Agent 回报"}
           </div>
-          <div>
-            <div style={{ color: "var(--text-secondary)", marginBottom: "4px" }}>
-              Agent CLI（{project.agent_platform ?? "—"}）
-            </div>
-            <div
-              style={{
-                color: "var(--text-primary)",
-                wordBreak: "break-all",
-                fontSize: "11px",
-                fontFamily: "ui-monospace, Consolas, monospace",
-              }}
-            >
-              {project.agent_cli_path}
-            </div>
-          </div>
-          <div>
-            <div style={{ color: "var(--text-secondary)", marginBottom: "4px" }}>
-              IM CLI（{project.im_platform ?? "—"}）
-            </div>
-            <div
-              style={{
-                color: "var(--text-primary)",
-                wordBreak: "break-all",
-                fontSize: "11px",
-                fontFamily: "ui-monospace, Consolas, monospace",
-              }}
-            >
-              {project.dingtalk_cli_path}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ padding: "16px", borderBottom: "1px solid var(--border)" }}>
-        <div style={sectionTitle}>回复配置</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>自动回复</span>
-            <span
-              style={{ color: project.reply_enabled ? "var(--success)" : "var(--text-muted)" }}
-            >
-              {project.reply_enabled ? "已启用" : "已禁用"}
-            </span>
-          </div>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>生成超时</span>
-            <span style={{ color: "var(--text-primary)" }}>
-              {project.reply_timeout_ms / 1000}s
-            </span>
-          </div>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>字数上限</span>
-            <span style={{ color: "var(--text-primary)" }}>{project.reply_max_chars} 字符</span>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ padding: "16px" }}>
-        <div style={sectionTitle}>上下文</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>随消息带的历史</span>
-            <span style={{ color: "var(--text-primary)" }}>
-              {project.context_message_limit} 条
-            </span>
-          </div>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>状态</span>
-            <span
-              style={{ color: project.context_enabled ? "var(--success)" : "var(--text-muted)" }}
-            >
-              {project.context_enabled ? "已启用" : "已禁用"}
-            </span>
-          </div>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>会话大小</span>
-            <span style={{ color: "var(--text-primary)" }}>
-              {details?.context_used_tokens != null ? (
-                <>
-                  ≈ {formatTokens(details.context_used_tokens)} tokens
-                  {details.context_window_tokens != null && (
-                    <> / {formatTokens(details.context_window_tokens)}</>
-                  )}
-                </>
-              ) : (
-                "—"
-              )}
-              {details?.context_window_source === "default" && (
-                <span style={{ color: "var(--text-muted)" }}>（默认）</span>
-              )}
-            </span>
-          </div>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>实际占用</span>
-            <span
-              style={{
-                color:
-                  details?.context_usage_ratio != null &&
-                  details.compress_trigger_percent != null &&
-                  details.context_usage_ratio * 100 >= details.compress_trigger_percent
-                    ? "var(--warn)"
-                    : "var(--text-primary)",
-              }}
-            >
-              {details?.context_usage_ratio != null
-                ? `${(details.context_usage_ratio * 100).toFixed(2)}%`
-                : "暂无（回复过一次后由 Agent 回报）"}
-            </span>
-          </div>
-          {details?.context_usage_ratio != null && (
-            <div
-              style={{
-                height: "6px",
-                borderRadius: "3px",
-                backgroundColor: "var(--bg-active)",
-                overflow: "hidden",
-              }}
-              title={`压缩阈值 ${details.compress_trigger_percent ?? "未设"}%`}
-            >
-              <div
-                style={{
-                  height: "100%",
-                  width: `${Math.min(100, details.context_usage_ratio * 100).toFixed(1)}%`,
-                  backgroundColor:
-                    details.compress_trigger_percent != null &&
-                    details.context_usage_ratio * 100 >= details.compress_trigger_percent
-                      ? "var(--warn)"
-                      : "var(--accent)",
-                }}
-              />
-            </div>
-          )}
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>压缩阈值</span>
-            <span style={{ color: "var(--text-muted)" }}>
-              {details?.compress_trigger_percent != null
-                ? `用到 ${details.compress_trigger_percent}% 时压缩`
-                : "未设置"}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ padding: "16px", borderBottom: "1px solid var(--border)" }}>
-        <div style={sectionTitle}>模型</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>当前使用</span>
-            <span
-              style={{
-                color: "var(--text-primary)",
-                wordBreak: "break-all",
-                textAlign: "right",
-              }}
-            >
-              {details?.model ?? "暂无（回复过一次后由 Agent 回报）"}
-            </span>
-          </div>
-          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-            <span style={{ fontSize: "12px", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-              切换为
-            </span>
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
             <select
               value={details?.model_override ?? ""}
-              onChange={(e) => handlePickModel(e.target.value)}
-              style={{
-                flex: 1,
-                minWidth: 0,
-                padding: "4px 6px",
-                fontSize: "12px",
-                backgroundColor: "var(--bg-app)",
-                color: "var(--text-primary)",
-                border: "1px solid var(--border)",
-                borderRadius: "4px",
-              }}
+              onChange={(e) => pickModel(e.target.value)}
+              style={selectStyle}
+              title="模型"
             >
               <option value="">CLI 默认模型</option>
               {models.map((model) => (
@@ -510,95 +308,34 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
                 </option>
               ))}
             </select>
-          </div>
-          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-            <span style={{ fontSize: "12px", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-              思考强度
-            </span>
             <select
               value={details?.reasoning_effort_override ?? ""}
-              onChange={(e) => handlePickEffort(e.target.value)}
-              style={{
-                flex: 1,
-                minWidth: 0,
-                padding: "4px 6px",
-                fontSize: "12px",
-                backgroundColor: "var(--bg-app)",
-                color: "var(--text-primary)",
-                border: "1px solid var(--border)",
-                borderRadius: "4px",
-              }}
+              onChange={(e) => pickEffort(e.target.value)}
+              style={selectStyle}
+              title="思考强度（越高越慢）"
             >
-              <option value="">CLI 默认</option>
+              <option value="">思考强度：CLI 默认</option>
               {Object.entries(EFFORT_LABELS).map(([value, label]) => (
                 <option key={value} value={value}>
-                  {label}
+                  思考强度：{label}
                 </option>
               ))}
             </select>
           </div>
-          <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-            {models.length === 0
-              ? "读不到可选模型列表（该 CLI 不支持 --list-models），可只用默认模型"
-              : "模型与思考强度写进全局设置，下一条消息生效；重启监听不需要；强度越高越慢"}
-            {modelNotice ? ` · ${modelNotice}` : ""}
-            {effortNotice ? ` · ${effortNotice}` : ""}
-          </div>
+          {notice && (
+            <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginTop: "6px" }}>
+              {notice}
+            </div>
+          )}
         </div>
-      </div>
-      <CompressionSection
-        projectId={project.id}
-        conversationId={session.conversation_id}
-      />
+      )}
 
-      <div style={{ padding: "16px", borderTop: "1px solid var(--border)" }}>
-        <div style={sectionTitle}>会话</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginBottom: "10px" }}>
-          <div style={rowStyle}>
-            <span style={{ color: "var(--text-secondary)" }}>类型</span>
-            <span
-              style={{
-                color:
-                  details?.kind === "group"
-                    ? "var(--accent)"
-                    : details?.kind === "direct"
-                      ? "var(--success)"
-                      : "var(--text-muted)",
-              }}
-            >
-              {KIND_LABEL[details?.kind ?? ""] ?? "未知（尚未同步）"}
-            </span>
-          </div>
-          <div style={{ ...rowStyle, alignItems: "flex-start" }}>
-            <span style={{ color: "var(--text-secondary)" }}>名称</span>
-            <span
-              style={{
-                color: details?.name ? "var(--text-primary)" : "var(--text-muted)",
-                textAlign: "right",
-                wordBreak: "break-all",
-              }}
-            >
-              {details?.name || session.name}
-            </span>
-          </div>
-        </div>
+      <div style={{ padding: "14px 16px", marginTop: "auto" }}>
         <button
-          onClick={async () => {
-            try {
-              const count = await invoke<number>("refresh_conversation_meta");
-              const next = await invoke<ConversationDetails>("conversation_details", {
-                projectId: project.id,
-                conversationId: session.conversation_id,
-              });
-              setDetails(next);
-              setSessionNotice(`已同步 ${count} 个会话的名称与类型`);
-            } catch (e) {
-              setSessionNotice(`同步失败：${e}`);
-            }
-          }}
+          onClick={onOpenSettings}
           style={{
-            marginBottom: "10px",
-            padding: "4px 10px",
+            width: "100%",
+            padding: "6px 10px",
             fontSize: "12px",
             backgroundColor: "transparent",
             color: "var(--text-secondary)",
@@ -607,87 +344,8 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
             cursor: "pointer",
           }}
         >
-          刷新会话信息（群名/单聊名）
+          更多设置…
         </button>
-        <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "10px" }}>
-          Agent 会话状态：首次回复时按 conversation_id 建档，之后按会话续接。
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginBottom: "10px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px" }}>
-            <span style={{ color: "var(--text-secondary)" }}>状态</span>
-            <span style={{ color: agentSession ? "var(--success)" : "var(--text-muted)" }}>
-              {agentSession ? "已建档" : "未建档（下一条消息会新建）"}
-            </span>
-          </div>
-          {agentSession && (
-            <>
-              <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
-                Agent 会话 id
-                <div
-                  style={{
-                    fontFamily: "ui-monospace, Consolas, monospace",
-                    color: "var(--text-primary)",
-                    wordBreak: "break-all",
-                  }}
-                >
-                  {agentSession.agent_session_id}
-                </div>
-              </div>
-              <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
-                建档工作目录
-                <div
-                  style={{
-                    fontFamily: "ui-monospace, Consolas, monospace",
-                    color: "var(--text-primary)",
-                    wordBreak: "break-all",
-                  }}
-                >
-                  {agentSession.agent_cwd}
-                </div>
-              </div>
-            </>
-          )}
-        </div>
-        <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "10px" }}>
-          作废该会话的 Agent 记录：下一条消息将重新建档并开新会话，
-          历史事件与回复记录不受影响。
-        </div>
-        <button
-          onClick={async () => {
-            if (
-              !confirm(
-                "作废该会话的 Agent 会话记录？下一条消息会重新建档（历史事件不受影响）。",
-              )
-            ) {
-              return;
-            }
-            try {
-              await invoke("reset_conversation", {
-                projectId: project.id,
-                conversationId: session.conversation_id,
-              });
-              setSessionNotice("已作废，下一条消息将重建会话");
-            } catch (e) {
-              setSessionNotice("作废失败：" + String(e));
-            }
-          }}
-          style={{
-            padding: "5px 12px",
-            fontSize: "12px",
-            backgroundColor: "transparent",
-            color: "var(--danger)",
-            border: "1px solid var(--border)",
-            borderRadius: "4px",
-            cursor: "pointer",
-          }}
-        >
-          作废并重建会话
-        </button>
-        {sessionNotice && (
-          <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginTop: "8px" }}>
-            {sessionNotice}
-          </div>
-        )}
       </div>
     </div>
   );

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Typewriter from "./Typewriter";
+import CompressionSection from "./CompressionSection";
 import type { StreamingReply } from "../App";
 
 interface Session {
@@ -40,6 +41,13 @@ interface ConversationDetails {
   model: string | null;
 }
 
+/** conversation_session 命令的返回：这个会话在 Agent 侧的建档情况。 */
+interface AgentSessionInfo {
+  conversation_id: string;
+  agent_session_id: string;
+  agent_cwd: string;
+}
+
 const KIND_LABEL: Record<string, string> = { group: "群聊", direct: "单聊" };
 
 /** 列表刷新周期。生成中的块走监听频道即时到达，这里只是兜底对齐权威数据。 */
@@ -54,6 +62,7 @@ interface MessageViewProps {
   streamingByMessage: Record<string, StreamingReply>;
   /** 会话窗口头部的「⋯」里要用的操作，由 App 提供。 */
   onRefreshMeta: () => Promise<string>;
+  onDeleteSession: () => void;
 }
 
 /** token 数按 k 显示：200000 → "200k"，64801 → "64.8k"。 */
@@ -125,6 +134,27 @@ function ThinkingBlock({
   );
 }
 
+/** 「⋯」菜单里的一行操作。 */
+const menuAction: CSSProperties = {
+  padding: "5px 10px",
+  fontSize: "12px",
+  textAlign: "left",
+  backgroundColor: "transparent",
+  color: "var(--text-secondary)",
+  border: "1px solid var(--border)",
+  borderRadius: "4px",
+  cursor: "pointer",
+};
+
+/** 会话 id / 建档目录这类要能整段选中复制的值。 */
+const monoStyle: CSSProperties = {
+  marginTop: "2px",
+  fontFamily: "ui-monospace, Consolas, monospace",
+  color: "var(--text-primary)",
+  wordBreak: "break-all",
+  userSelect: "all",
+};
+
 const bubbleBase: CSSProperties = {
   maxWidth: "78%",
   padding: "8px 12px",
@@ -151,11 +181,20 @@ function statusText(event: EventRow, live: boolean) {
   }
 }
 
-export default function MessageView({ session, streamingByMessage, onRefreshMeta }: MessageViewProps) {
+export default function MessageView({
+  session,
+  streamingByMessage,
+  onRefreshMeta,
+  onDeleteSession,
+}: MessageViewProps) {
   const [events, setEvents] = useState<EventRow[]>([]);
   const [details, setDetails] = useState<ConversationDetails | null>(null);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [agentSession, setAgentSession] = useState<AgentSessionInfo | null>(null);
+  /** 作废会话后要重取建档信息。 */
+  const [metaVersion, setMetaVersion] = useState(0);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -197,6 +236,22 @@ export default function MessageView({ session, streamingByMessage, onRefreshMeta
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [events.length]);
+
+  // Agent 侧的建档情况只在「⋯」里看，不轮询：它只在回复或作废时变。
+  useEffect(() => {
+    let cancelled = false;
+    invoke<AgentSessionInfo | null>("conversation_session", {
+      projectId: session.project_id,
+      conversationId: session.conversation_id,
+    })
+      .then((result) => {
+        if (!cancelled) setAgentSession(result);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [session.project_id, session.conversation_id, metaVersion]);
 
   const ratio = details?.context_usage_ratio ?? null;
   const trigger = details?.compress_trigger_percent ?? null;
@@ -272,28 +327,134 @@ export default function MessageView({ session, streamingByMessage, onRefreshMeta
           )}
         </div>
 
-        <button
-          onClick={async () => {
-            try {
-              setNotice(await onRefreshMeta());
-            } catch (e) {
-              setNotice(`同步失败：${e}`);
-            }
-          }}
-          style={{
-            padding: "2px 8px",
-            fontSize: "11px",
-            color: "var(--text-secondary)",
-            backgroundColor: "transparent",
-            border: "1px solid var(--border)",
-            borderRadius: "4px",
-            cursor: "pointer",
-            whiteSpace: "nowrap",
-          }}
-          title="重新拉取群名/单聊名与类型"
-        >
-          刷新会话信息
-        </button>
+        <div style={{ position: "relative" }}>
+          <button
+            onClick={() => setMenuOpen((open) => !open)}
+            style={{
+              padding: "2px 8px",
+              fontSize: "13px",
+              lineHeight: 1,
+              color: "var(--text-secondary)",
+              backgroundColor: menuOpen ? "var(--bg-active)" : "transparent",
+              border: "1px solid var(--border)",
+              borderRadius: "4px",
+              cursor: "pointer",
+            }}
+            title="更多会话操作"
+          >
+            ⋯
+          </button>
+
+          {menuOpen && (
+            <div
+              style={{
+                position: "absolute",
+                top: "calc(100% + 6px)",
+                right: 0,
+                zIndex: 20,
+                width: "320px",
+                maxHeight: "70vh",
+                overflow: "auto",
+                padding: "12px",
+                backgroundColor: "var(--bg-sidebar)",
+                border: "1px solid var(--border)",
+                borderRadius: "6px",
+                boxShadow: "0 8px 24px rgba(0,0,0,.28)",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "4px",
+                  marginBottom: "10px",
+                  fontSize: "12px",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ color: "var(--text-secondary)" }}>Agent 会话</span>
+                  <span style={{ color: agentSession ? "var(--success)" : "var(--text-muted)" }}>
+                    {agentSession ? "已建档" : "未建档（下一条消息会新建）"}
+                  </span>
+                </div>
+                {agentSession && (
+                  <>
+                    <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                      会话 id
+                      <div style={monoStyle}>{agentSession.agent_session_id}</div>
+                    </div>
+                    <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                      建档工作目录
+                      <div style={monoStyle}>{agentSession.agent_cwd}</div>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  paddingBottom: "10px",
+                  borderBottom: "1px solid var(--border)",
+                }}
+              >
+                <button
+                  onClick={async () => {
+                    try {
+                      setNotice(await onRefreshMeta());
+                    } catch (e) {
+                      setNotice(`同步失败：${e}`);
+                    }
+                  }}
+                  style={menuAction}
+                >
+                  刷新会话信息（群名/单聊名）
+                </button>
+                <button
+                  onClick={async () => {
+                    if (
+                      !confirm(
+                        "作废该会话的 Agent 会话记录？下一条消息会重新建档（历史事件不受影响）。",
+                      )
+                    ) {
+                      return;
+                    }
+                    try {
+                      await invoke("reset_conversation", {
+                        projectId: session.project_id,
+                        conversationId: session.conversation_id,
+                      });
+                      setNotice("已作废，下一条消息将重建会话");
+                      setMetaVersion((version) => version + 1);
+                    } catch (e) {
+                      setNotice(`作废失败：${e}`);
+                    }
+                  }}
+                  style={menuAction}
+                >
+                  作废并重建 Agent 会话
+                </button>
+                <button
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onDeleteSession();
+                  }}
+                  style={{ ...menuAction, color: "var(--danger)" }}
+                >
+                  删除会话
+                </button>
+              </div>
+
+              <CompressionSection
+                projectId={session.project_id}
+                conversationId={session.conversation_id}
+              />
+            </div>
+          )}
+        </div>
+
         {notice && (
           <span style={{ fontSize: "11px", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
             {notice}
