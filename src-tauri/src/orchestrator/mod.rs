@@ -71,6 +71,19 @@ pub enum ListenerUpdate {
     Status { status: ListenerStatus },
     Event { event: ChatEvent },
     Log { listener_id: String, line: String },
+    /// 生成过程中到达的一个内容块（模型在想 / 在答）。
+    ///
+    /// 界面靠它在会话窗口里做"边想边出"。这是**观感**用的增量，权威正文最终
+    /// 仍以落库的事件为准 —— 所以丢一块也不影响正确性，只影响动画。
+    ///
+    /// 带 `message_id` 是为了让界面**精确挂到某一条**上：一个会话可能连着来好几轮，
+    /// 只给 conversation_id 的话，新一轮的块会追加到上一轮的文本尾巴上。
+    Progress {
+        conversation_id: String,
+        message_id: String,
+        phase: crate::reply::ReplyPhase,
+        text: String,
+    },
 }
 
 struct ListenerTask {
@@ -1402,7 +1415,16 @@ impl Shared {
         )
         .await;
 
-        let raw = match crate::reply::generate(&settings, &prompt, Some(&session_id), resume).await
+        // 边生成边把块推给界面：会话窗口据此做"边想边出"的观感。
+        // 没有 channel（如摘要生成、后台无界面）就纯跑，行为不变。
+        let anchor_message_id = events
+            .last()
+            .map(|item| item.message_id.clone())
+            .unwrap_or_default();
+        let on_progress = self.progress_sender(&event.conversation_id, &anchor_message_id);
+
+        let raw = match crate::reply::generate(&settings, &prompt, Some(&session_id), resume, on_progress)
+            .await
         {
             Ok(raw) => raw,
             Err(err) => {
@@ -1505,7 +1527,10 @@ impl Shared {
 
             let fresh_id = uuid::Uuid::new_v4().to_string();
             let retry_started = std::time::Instant::now();
-            match crate::reply::generate(&settings, &prompt, Some(&fresh_id), false).await {
+            let retry_progress = self.progress_sender(&event.conversation_id, &anchor_message_id);
+            match crate::reply::generate(&settings, &prompt, Some(&fresh_id), false, retry_progress)
+                .await
+            {
                 Ok(fresh_raw) => {
                     let fresh_text = crate::reply::sanitize_reply(&fresh_raw.text, reply.max_chars);
                     if fresh_text.is_empty() {
@@ -1696,6 +1721,26 @@ impl Shared {
         }
     }
 
+    /// 构造「把生成中的块推到界面」的回调。没有 channel 就返回 None（后台纯跑）。
+    /// `message_id` 用本批**最后一条**：那是用户刚发的那条，也是界面该挂气泡的位置。
+    fn progress_sender(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Option<crate::reply::ProgressFn> {
+        let channel = self.channel.clone()?;
+        let conversation_id = conversation_id.to_string();
+        let message_id = message_id.to_string();
+        Some(Arc::new(move |phase, text: &str| {
+            let _ = channel.send(ListenerUpdate::Progress {
+                conversation_id: conversation_id.clone(),
+                message_id: message_id.clone(),
+                phase,
+                text: text.to_string(),
+            });
+        }))
+    }
+
     async fn push_log(&self, line: &str) {
         push_log_line(&self.logs, &self.project_id, &self.kind.to_string(), line).await;
         if let Some(channel) = &self.channel {
@@ -1785,7 +1830,8 @@ async fn compress_with(
 
     let prompt = crate::reply::build_summary_prompt(&rows);
     // 摘要走独立会话，避免污染回复所用的 Agent 会话。
-    let raw = crate::reply::generate(&settings, &prompt, None, false).await?;
+    // 不推进度：它是「压缩」的中间产物，混进会话窗口会和回复气泡混淆。
+    let raw = crate::reply::generate(&settings, &prompt, None, false, None).await?;
     let content = crate::reply::sanitize_reply(&raw.text, 4000);
     if content.is_empty() {
         anyhow::bail!("生成的摘要为空");

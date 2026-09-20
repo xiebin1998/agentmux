@@ -8,6 +8,7 @@
 
 use std::io::BufRead;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -343,6 +344,59 @@ pub struct Generation {
     pub reasoning: Option<String>,
 }
 
+/// 生成过程中一个块的阶段：模型在想，还是在答。
+///
+/// 序列化给前端用（`"thinking"` / `"answer"`），前端据此决定放进哪个气泡。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyPhase {
+    Thinking,
+    Answer,
+}
+
+/// 生成过程中的进度回调。**必须 `Send + Sync + 'static`**：它会被搬进读管道的
+/// `tokio::spawn` 任务里，每读到一行就调一次。
+pub type ProgressFn = Arc<dyn Fn(ReplyPhase, &str) + Send + Sync>;
+
+/// 从一行 NDJSON 里抽出所有可展示的内容块。
+///
+/// stream-json 的 `assistant` 事件形如
+/// `{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"…"},…]}}`。
+/// 一行可能带多个块，所以返回 `Vec` 而不是单个。
+///
+/// **只认 `thinking` 与 `text`**：`tool_use` 之类不展示；`result` 事件里没有
+/// `message.content`，自然抽不出块 —— 它的正文由 `parse_generation` 兜底，
+/// 否则界面上会把最终答案显示两遍。
+pub fn progress_chunks_from_line(line: &str) -> Vec<(ReplyPhase, String)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return Vec::new();
+    };
+    let Some(blocks) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut chunks = Vec::new();
+    for block in blocks {
+        let (phase, text) = match block.get("type").and_then(|kind| kind.as_str()) {
+            Some("thinking") => (ReplyPhase::Thinking, block.get("thinking")),
+            Some("text") => (ReplyPhase::Answer, block.get("text")),
+            _ => continue,
+        };
+        let Some(text) = text.and_then(|text| text.as_str()) else {
+            continue;
+        };
+        let text = text.trim();
+        if !text.is_empty() {
+            chunks.push((phase, text.to_string()));
+        }
+    }
+    chunks
+}
+
 /// 解析 CLI 的输出。**必须容忍噪声**：实测 qodercli 的 stdout 第一行是
 /// `1 error loading agent configs. Use /agents to see details.`，真正的 JSON 在后面。
 /// 解析不出来就退回「整段当正文」，保证不支持的平台照旧能用。
@@ -411,26 +465,9 @@ fn collect_thinking(stdout: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
     for line in stdout.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            continue;
-        };
-        let Some(blocks) = value
-            .get("message")
-            .and_then(|message| message.get("content"))
-            .and_then(|content| content.as_array())
-        else {
-            continue;
-        };
-
-        for block in blocks {
-            if block.get("type").and_then(|kind| kind.as_str()) != Some("thinking") {
-                continue;
-            }
-            if let Some(text) = block.get("thinking").and_then(|text| text.as_str()) {
-                let text = text.trim();
-                if !text.is_empty() {
-                    parts.push(text.to_string());
-                }
+        for (phase, text) in progress_chunks_from_line(line) {
+            if phase == ReplyPhase::Thinking {
+                parts.push(text);
             }
         }
     }
@@ -704,11 +741,16 @@ pub fn context_lines(
 }
 
 /// 调 Agent CLI 生成回复。
+///
+/// `on_progress` 非空时**边读边回调**：每读到一行 NDJSON 就抽出内容块推给调用方
+/// （界面据此做"边想边出"的观感）。CLI 实测只给**块级**输出、没有逐 token 的开关，
+/// 所以这是数据能到达的最细粒度，不是逐字。
 pub async fn generate(
     settings: &ReplySettings,
     prompt: &str,
     session_id: Option<&str>,
     resume: bool,
+    on_progress: Option<ProgressFn>,
 ) -> anyhow::Result<Generation> {
     let bin = settings
         .agent_cli_path
@@ -755,7 +797,7 @@ pub async fn generate(
     // 并发读干管，避免子进程输出把管道缓冲写满后卡死。
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_task = tokio::spawn(async move { read_pipe(stdout_pipe).await });
+    let stdout_task = tokio::spawn(async move { read_pipe_lines(stdout_pipe, on_progress).await });
     let stderr_task = tokio::spawn(async move { read_pipe(stderr_pipe).await });
 
     let status = match tokio::time::timeout(Duration::from_millis(settings.timeout_ms), child.wait())
@@ -804,6 +846,44 @@ where
     let mut buffer = String::new();
     let _ = pipe.read_to_string(&mut buffer).await;
     buffer
+}
+
+/// 逐行读 stdout：读到一行就抽块回调，同时把全文攒起来交给 `parse_generation`。
+///
+/// 攒全文是必须的 —— 回调只用于"边到边"显示，**权威结果仍以最终解析为准**，
+/// 这样即使某行的块没被推出去（行没以换行结尾就超时被杀），正文也不丢。
+async fn read_pipe_lines<R>(pipe: Option<R>, on_progress: Option<ProgressFn>) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let Some(pipe) = pipe else {
+        return String::new();
+    };
+
+    let mut reader = BufReader::new(pipe);
+    let mut whole = String::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            // 非 UTF-8 或读失败：保住已读到的部分，别把整轮回复丢掉。
+            Err(_) => break,
+        }
+        whole.push_str(&line);
+
+        if let Some(on_progress) = &on_progress {
+            for (phase, text) in progress_chunks_from_line(&line) {
+                on_progress(phase, &text);
+            }
+        }
+    }
+
+    whole
 }
 
 /// 用 dws 把回复发回原会话。uuid 取原 message_id，保证幂等。
@@ -1045,6 +1125,54 @@ mod tests {
         assert_eq!(generation.text, "在的");
         assert_eq!(generation.reasoning, None);
         assert_eq!(generation.context_usage_ratio, Some(0.01));
+    }
+
+    /// 逐行抽块：这是「边读边推」的核心。真实的 `REAL_STREAM_JSON` 逐行喂进去，
+    /// 期望得到 thinking 先、text 后；噪声行与 result 行不产生块（否则界面会
+    /// 把 CLI 的错误提示或最终结果当成正文再显示一遍）。
+    #[test]
+    fn extracts_progress_chunks_from_stream_json_lines() {
+        let chunks: Vec<(ReplyPhase, String)> = REAL_STREAM_JSON
+            .lines()
+            .flat_map(progress_chunks_from_line)
+            .collect();
+
+        assert_eq!(
+            chunks,
+            vec![
+                (
+                    ReplyPhase::Thinking,
+                    "Simple mental math.".to_string()
+                ),
+                (
+                    ReplyPhase::Answer,
+                    "17 × 23，可以拆成 17 × 20 + 17 × 3 = 340 + 51 = **391**。".to_string()
+                ),
+            ],
+            "应当只抽出 thinking 与 text 两个块，且顺序不乱"
+        );
+    }
+
+    /// 一行里带多个块时要全部返回（不能只取第一个，否则会丢内容）。
+    #[test]
+    fn progress_returns_every_block_in_one_line() {
+        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"想\"},{\"type\":\"text\",\"text\":\"答\"}]}}";
+
+        assert_eq!(
+            progress_chunks_from_line(line),
+            vec![
+                (ReplyPhase::Thinking, "想".to_string()),
+                (ReplyPhase::Answer, "答".to_string()),
+            ]
+        );
+    }
+
+    /// 空块（模型想了但内容为空）不该产生推送，避免界面出现空气泡。
+    #[test]
+    fn progress_skips_empty_blocks() {
+        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"   \"},{\"type\":\"tool_use\",\"name\":\"Read\"}]}}";
+
+        assert!(progress_chunks_from_line(line).is_empty());
     }
 
     /// 多个 thinking 块要按顺序拼起来（模型可能分多段想）。
@@ -1551,6 +1679,82 @@ mod tests {
         None
     }
 
+    /// **核心验收**：块必须在子进程**还没退出**时就回调出来。
+    ///
+    /// 否则「边想边出」就是假的 —— 那只是等进程结束后一次性解析再显示。
+    /// 这里的桩先立刻吐一行 thinking，停 3 秒再吐 text 与 result 并退出：
+    /// 第一个块要是等到退出才有，耗时必然 ≥ 2500ms，断言就抓得住。
+    #[tokio::test]
+    async fn progress_chunks_arrive_before_the_process_exits() {
+        let Some(node) = node_exe() else {
+            eprintln!("跳过：环境里没有 node");
+            return;
+        };
+
+        let script = r#"
+const thinking = '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"先想"}]}}';
+const text = '{"type":"assistant","message":{"content":[{"type":"text","text":"答案"}]}}';
+const result = '{"type":"result","result":"答案"}';
+process.stdout.write(thinking + "\n");
+setTimeout(() => {
+  process.stdout.write(text + "\n");
+  process.stdout.write(result + "\n");
+}, 3000);
+"#;
+
+        let settings = ReplySettings {
+            agent_platform: "stub".to_string(),
+            agent_cli_path: Some(node),
+            agent_args: Some(vec!["-e".to_string(), script.to_string()]),
+            agent_cwd: String::new(),
+            timeout_ms: 30_000,
+            ..Default::default()
+        };
+
+        let seen: Arc<std::sync::Mutex<Vec<(ReplyPhase, String, std::time::Instant)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let on_progress: ProgressFn = Arc::new(move |phase, text| {
+            if let Ok(mut list) = recorder.lock() {
+                list.push((phase, text.to_string(), std::time::Instant::now()));
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let generation = generate(&settings, "忽略这段 prompt", None, false, Some(on_progress))
+            .await
+            .expect("桩生成应成功");
+        let total = started.elapsed();
+
+        assert_eq!(generation.text, "答案", "权威正文仍要能解析出来");
+
+        let chunks = seen.lock().unwrap().clone();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|(phase, text, _)| (*phase, text.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ReplyPhase::Thinking, "先想".to_string()),
+                (ReplyPhase::Answer, "答案".to_string()),
+            ],
+            "两个块都要回调，顺序为 thinking 先、answer 后"
+        );
+
+        let first_at = chunks[0].2.duration_since(started);
+        assert!(
+            total >= Duration::from_millis(2500),
+            "桩要停 3 秒才退出，总耗时却只有 {:?}",
+            total
+        );
+        assert!(
+            first_at < Duration::from_millis(2000),
+            "第一个块必须早于进程退出就到达，实际 {:?}（总耗时 {:?}）",
+            first_at,
+            total
+        );
+    }
+
     /// 实测过的坑：宿主自己的 SDK 环境变量不能泄漏给 Agent 子进程。
     #[tokio::test]
     async fn generate_does_not_leak_sdk_entrypoint_env() {
@@ -1573,7 +1777,7 @@ mod tests {
             ..Default::default()
         };
 
-        let output = generate(&settings, "忽略这段 prompt", None, false)
+        let output = generate(&settings, "忽略这段 prompt", None, false, None)
             .await
             .expect("stub 生成应成功");
 
@@ -1603,7 +1807,7 @@ mod tests {
             ..Default::default()
         };
 
-        let output = generate(&settings, "只回答两个字：收到", Some(&session_id), false)
+        let output = generate(&settings, "只回答两个字：收到", Some(&session_id), false, None)
             .await
             .expect("真实 qodercli 应能非交互生成");
 

@@ -75,7 +75,8 @@ pub async fn probe(settings: &ReplySettings) -> bool {
 不要任何解释、不要复述问题。"
     );
 
-    match crate::reply::generate(&probe_settings, &prompt, None, false).await {
+    // 探针是一次内部校验，不推进度、不进会话窗口。
+    match crate::reply::generate(&probe_settings, &prompt, None, false, None).await {
         Ok(generation) => generation.text.contains(PROBE_CODE),
         Err(_) => false,
     }
