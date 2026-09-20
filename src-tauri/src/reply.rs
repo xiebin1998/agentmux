@@ -21,6 +21,11 @@ pub struct ReplySettings {
     pub agent_args: Option<Vec<String>>,
     /// 模型覆盖（`-m <model>`）。为空 = 用 CLI 自己的默认模型。
     pub agent_model: Option<String>,
+    /// 思考强度覆盖（`--reasoning-effort <level>`）。为空 = 用 CLI 默认。
+    ///
+    /// 实测合法值：`auto / none / low / medium / high / xhigh / max / ultracode`。
+    /// 界面只暴露低/中/高 + 默认，其余留给命令行党。
+    pub reasoning_effort: Option<String>,
     pub agent_cwd: String,
     pub timeout_ms: u64,
     pub max_chars: usize,
@@ -50,6 +55,7 @@ impl Default for ReplySettings {
             agent_cli_path: None,
             agent_args: None,
             agent_model: None,
+            reasoning_effort: None,
             agent_cwd: String::new(),
             timeout_ms: 120_000,
             max_chars: 500,
@@ -94,6 +100,44 @@ pub fn json_output_args(platform_id: &str) -> Vec<String> {
         "claude" => vec!["--output-format".to_string(), "json".to_string()],
         _ => Vec::new(),
     }
+}
+
+/// 组装调用 Agent CLI 的参数（**不含会话参数**：`--resume` / `--session-id`
+/// 必须留在最末尾，否则会被变长的 `--tools` 当成工具名吃掉，见模块头注释）。
+///
+/// 单独成函数是为了能单测：以前 `-m` 是内联在 `generate` 里的，只有真起进程
+/// 才能验证，导致「模型/思考强度到底传没传」只能靠肉眼。
+pub fn build_cli_args(settings: &ReplySettings) -> Vec<String> {
+    // 用户显式覆盖了参数就整个不动它：强行追加可能和用户自己的输出格式冲突。
+    let mut args = match settings.agent_args.as_ref() {
+        Some(overridden) if !overridden.is_empty() => return overridden.clone(),
+        _ => {
+            let mut args = default_agent_args(&settings.agent_platform);
+            args.extend(json_output_args(&settings.agent_platform));
+            args
+        }
+    };
+
+    // 模型用 `-m <name>` 指定；实测 qodercli 支持（--model / -m）。
+    if let Some(model) = non_blank(&settings.agent_model) {
+        args.push("-m".to_string());
+        args.push(model.to_string());
+    }
+    // 思考强度；取值实测为 auto/none/low/medium/high/xhigh/max/ultracode。
+    if let Some(effort) = non_blank(&settings.reasoning_effort) {
+        args.push("--reasoning-effort".to_string());
+        args.push(effort.to_string());
+    }
+
+    args
+}
+
+/// 取出**去掉空白后非空**的值；空串 / 全空白都视为「没设」。
+fn non_blank(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
 }
 
 /// qoder 会话默认的上下文窗口（token）。读不到会话文件时用它兜底。
@@ -537,25 +581,7 @@ pub async fn generate(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("未配置 Agent CLI 路径"))?;
 
-    // 用户显式覆盖了参数就不动它：强行追加可能和用户自己的输出格式冲突。
-    let mut args = match settings.agent_args.as_ref() {
-        Some(overridden) if !overridden.is_empty() => overridden.clone(),
-        _ => {
-            let mut args = default_agent_args(&settings.agent_platform);
-            args.extend(json_output_args(&settings.agent_platform));
-            args
-        }
-    };
-    // 模型用 `-m <name>` 指定；实测 qodercli 支持（--model / -m）。
-    if let Some(model) = settings
-        .agent_model
-        .as_ref()
-        .map(|model| model.trim())
-        .filter(|model| !model.is_empty())
-    {
-        args.push("-m".to_string());
-        args.push(model.to_string());
-    }
+    let mut args = build_cli_args(settings);
     // 会话参数必须追加在末尾，理由见模块头注释。
     if let Some(session_id) = session_id {
         args.push(if resume { "--resume" } else { "--session-id" }.to_string());
@@ -823,6 +849,79 @@ mod tests {
         assert_eq!(parse_generation(with_tool).num_turns, Some(3));
         assert_eq!(parse_generation(without_tool).num_turns, Some(1));
         assert_eq!(parse_generation("纯文本输出").num_turns, None);
+    }
+
+    #[test]
+    fn reasoning_effort_is_passed_to_the_cli() {
+        let settings = ReplySettings {
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+
+        let args = build_cli_args(&settings);
+
+        assert!(
+            args.windows(2).any(|pair| pair == ["--reasoning-effort", "high"]),
+            "思考强度必须传给 CLI，实际: {args:?}"
+        );
+    }
+
+    #[test]
+    fn no_reasoning_effort_means_no_flag() {
+        let args = build_cli_args(&ReplySettings::default());
+
+        assert!(
+            !args.iter().any(|arg| arg == "--reasoning-effort"),
+            "没设就不该出现该参数（保持现状），实际: {args:?}"
+        );
+    }
+
+    #[test]
+    fn blank_reasoning_effort_is_treated_as_unset() {
+        let settings = ReplySettings {
+            reasoning_effort: Some("   ".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!build_cli_args(&settings)
+            .iter()
+            .any(|arg| arg == "--reasoning-effort"));
+    }
+
+    #[test]
+    fn model_and_reasoning_effort_are_both_appended() {
+        let settings = ReplySettings {
+            agent_model: Some("Qwen3.8-Max".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            ..Default::default()
+        };
+
+        let args = build_cli_args(&settings);
+
+        assert!(args.windows(2).any(|pair| pair == ["-m", "Qwen3.8-Max"]));
+        assert!(args.windows(2).any(|pair| pair == ["--reasoning-effort", "low"]));
+    }
+
+    /// 用户显式覆盖了 `agent_args` 就整个不动它（含模型与思考强度）—— 这是既有约定。
+    #[test]
+    fn explicit_agent_args_override_wins() {
+        let settings = ReplySettings {
+            agent_args: Some(vec!["-p".to_string()]),
+            agent_model: Some("X".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(build_cli_args(&settings), vec!["-p"]);
+    }
+
+    /// 会话参数由调用方追加在**最末尾**：`--tools` 是变长参数，排在它后面会被吃掉。
+    #[test]
+    fn cli_args_never_include_session_flags() {
+        let args = build_cli_args(&ReplySettings::default());
+
+        assert!(!args.iter().any(|arg| arg == "--resume"));
+        assert!(!args.iter().any(|arg| arg == "--session-id"));
     }
 
     /// 回归：不写角色约束时，Agent 会把「你好，吃晚饭了吗」当成任务并拒绝，

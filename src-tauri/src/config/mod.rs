@@ -46,6 +46,10 @@ pub struct AppConfig {
     /// 模型覆盖（-m）。空 = 用 CLI 默认模型。
     #[serde(default)]
     pub agent_model: Option<String>,
+    /// 思考强度（`--reasoning-effort`）。空 = 用 CLI 默认。
+    /// 实测合法值：auto/none/low/medium/high/xhigh/max/ultracode；界面只暴露低/中/高。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub reply_enabled: bool,
     pub reply_timeout_ms: u64,
     pub reply_max_chars: usize,
@@ -83,6 +87,7 @@ impl Default for AppConfig {
             agent_cwd: None,
             agent_args: None,
             agent_model: None,
+            reasoning_effort: None,
             reply_enabled: false,
             reply_timeout_ms: 120_000,
             reply_max_chars: 500,
@@ -334,6 +339,7 @@ pub fn reply_settings() -> crate::reply::ReplySettings {
             .clone()
             .filter(|args| !args.is_empty()),
         agent_model: config.agent_model.clone(),
+        reasoning_effort: config.reasoning_effort.clone(),
         agent_cwd,
         timeout_ms: config.reply_timeout_ms,
         max_chars: config.reply_max_chars,
@@ -407,6 +413,10 @@ pub fn reply_settings_for_project(project: &crate::project::Project) -> crate::r
             .agent_model
             .clone()
             .filter(|model| !model.trim().is_empty()),
+        reasoning_effort: global
+            .reasoning_effort
+            .clone()
+            .filter(|effort| !effort.trim().is_empty()),
         agent_cwd: project.work_dir.clone(),
         timeout_ms: project.reply_timeout_ms,
         max_chars: project.reply_max_chars,

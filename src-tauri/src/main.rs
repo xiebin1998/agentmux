@@ -139,6 +139,7 @@ fn main() {
             commands::conversation_details,
             commands::list_agent_models,
             commands::set_agent_model,
+            commands::set_reasoning_effort,
             commands::assign_conversation,
             commands::delete_conversation,
             commands::list_source_candidates,

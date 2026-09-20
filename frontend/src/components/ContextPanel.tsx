@@ -62,7 +62,16 @@ interface ConversationDetails {
   model: string | null;
   /** 配置里显式指定的模型；空 = 用 CLI 默认 */
   model_override: string | null;
+  /** 配置里显式指定的思考强度；空 = 用 CLI 默认 */
+  reasoning_effort_override: string | null;
 }
+
+/** 思考强度的界面档位：值传给后端，中文名给人看。 */
+const EFFORT_LABELS: Record<string, string> = {
+  low: "低",
+  medium: "中",
+  high: "高",
+};
 
 /** token 数按 k 显示：200000 → "200k"，64801 → "64.8k"。 */
 function formatTokens(value: number) {
@@ -131,6 +140,7 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
   const [details, setDetails] = useState<ConversationDetails | null>(null);
   const [models, setModels] = useState<string[]>([]);
   const [modelNotice, setModelNotice] = useState<string | null>(null);
+  const [effortNotice, setEffortNotice] = useState<string | null>(null);
 
   // 会话窗口要显示的上下文用量与当前模型；跟着会话切换刷新。
   useEffect(() => {
@@ -178,6 +188,19 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
       );
     } catch (e) {
       setModelNotice(`切换失败：${e}`);
+    }
+  };
+
+  const handlePickEffort = async (level: string) => {
+    try {
+      await invoke("set_reasoning_effort", { level });
+      setEffortNotice(
+        level
+          ? `已切到「${EFFORT_LABELS[level] ?? level}」（下一条消息生效）`
+          : "已恢复 CLI 默认强度（下一条消息生效）",
+      );
+    } catch (e) {
+      setEffortNotice(`切换失败：${e}`);
     }
   };
 
@@ -488,11 +511,38 @@ export default function ContextPanel({ session, project }: ContextPanelProps) {
               ))}
             </select>
           </div>
+          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <span style={{ fontSize: "12px", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+              思考强度
+            </span>
+            <select
+              value={details?.reasoning_effort_override ?? ""}
+              onChange={(e) => handlePickEffort(e.target.value)}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                padding: "4px 6px",
+                fontSize: "12px",
+                backgroundColor: "var(--bg-app)",
+                color: "var(--text-primary)",
+                border: "1px solid var(--border)",
+                borderRadius: "4px",
+              }}
+            >
+              <option value="">CLI 默认</option>
+              {Object.entries(EFFORT_LABELS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </div>
           <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
             {models.length === 0
               ? "读不到可选模型列表（该 CLI 不支持 --list-models），可只用默认模型"
-              : "切换写进全局设置，下一条消息生效；重启监听不需要"}
+              : "模型与思考强度写进全局设置，下一条消息生效；重启监听不需要；强度越高越慢"}
             {modelNotice ? ` · ${modelNotice}` : ""}
+            {effortNotice ? ` · ${effortNotice}` : ""}
           </div>
         </div>
       </div>

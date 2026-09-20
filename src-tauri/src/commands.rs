@@ -75,6 +75,8 @@ pub struct ConversationDetails {
     pub model: Option<String>,
     /// 配置里显式指定的模型（-m）；空 = 用 CLI 默认。
     pub model_override: Option<String>,
+    /// 配置里显式指定的思考强度（--reasoning-effort）；空 = 用 CLI 默认。
+    pub reasoning_effort_override: Option<String>,
 }
 
 #[tauri::command]
@@ -143,6 +145,7 @@ pub async fn conversation_details(
         compress_trigger_percent: settings.compress_trigger_percent,
         model,
         model_override: settings.agent_model,
+        reasoning_effort_override: settings.reasoning_effort,
     })
 }
 
@@ -175,6 +178,34 @@ pub async fn set_agent_model(
     // 保存即热更新到在跑的监听，别让界面那句「下一条消息生效」变成空话。
     crate::project::push_settings_to_running_listeners(&state).await;
     Ok(config.agent_model)
+}
+
+/// 界面暴露的思考强度档位（CLI 还支持 xhigh/max/ultracode，需要时自己填 agent_args）。
+const ALLOWED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
+
+/// 设置思考强度。传空 = 恢复 CLI 默认。
+#[tauri::command]
+pub async fn set_reasoning_effort(
+    state: State<'_, AppState>,
+    level: String,
+) -> Result<Option<String>, String> {
+    let trimmed = level.trim().to_ascii_lowercase();
+    let normalized = if trimmed.is_empty() {
+        None
+    } else if ALLOWED_REASONING_EFFORTS.contains(&trimmed.as_str()) {
+        Some(trimmed)
+    } else {
+        return Err(format!(
+            "不支持的思考强度：{level}（可选 low / medium / high，或留空用默认）"
+        ));
+    };
+
+    let mut config = crate::config::load_config().unwrap_or_default();
+    config.reasoning_effort = normalized;
+    crate::config::save_config(&config).map_err(|e| e.to_string())?;
+    // 保存即热更新到在跑的监听，别让界面那句「下一条消息生效」变成空话。
+    crate::project::push_settings_to_running_listeners(&state).await;
+    Ok(config.reasoning_effort)
 }
 
 /// 启动某项目的一路监听（@我 / 单聊各自独立，可并发）。
