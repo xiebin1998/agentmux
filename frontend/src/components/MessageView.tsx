@@ -62,6 +62,11 @@ const KIND_LABEL: Record<string, string> = { group: "群聊", direct: "单聊" }
 /** 列表刷新周期。生成中的块走监听频道即时到达，这里只是兜底对齐权威数据。 */
 const POLL_MS = 3000;
 
+/** 去掉全部空白后比对：钉钉回来的原话与台账正文在空白上可能有细微差别。 */
+function squash(text: string) {
+  return text.replace(/\s+/g, "");
+}
+
 /** 块超过这么久没再到达，就当作"已经不在生成了"，免得气泡永远转着。 */
 const LIVE_TIMEOUT_MS = 20_000;
 
@@ -202,6 +207,9 @@ export default function MessageView({
   const [notice, setNotice] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [agentSession, setAgentSession] = useState<AgentSessionInfo | null>(null);
+  /** 上次成功取到的自身身份。取一次失败就永远不再过滤是非常糟的退化（重复会回来），
+      所以留着上次的值继续用。 */
+  const selfOpenIdRef = useRef<string | null>(null);
   /** 作废会话后要重取建档信息。 */
   const [metaVersion, setMetaVersion] = useState(0);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -227,13 +235,27 @@ export default function MessageView({
           }).catch(() => null),
         ]);
         if (!cancelled) {
-          const self = identity?.self_open_id ?? null;
+          const fetched = identity?.self_open_id ?? null;
+          if (fetched) selfOpenIdRef.current = fetched;
+          const self = selfOpenIdRef.current;
+
           // 机器人发出去的回复会以「我自己发的消息」回流成一条事件（真实库里 77 条有 19 条是这种）。
           // 那句话已经作为右侧助手气泡挂在触发它的那条消息上了，再按事件渲染一遍就是左右各显示一次。
+          // 主规则按身份；兜底按「skipped + 正文等于本会话某条台账回复」——
+          // 身份没配上时靠它拦住回流，宁可比对也不能让回复跑到左边去。
+          const replied = new Set(
+            nextEvents
+              .map((event) => event.reply_text)
+              .filter((text): text is string => text != null && text !== "")
+              .map(squash),
+          );
           setEvents(
-            [...nextEvents]
-              .reverse()
-              .filter((event) => self == null || event.sender_open_dingtalk_id !== self),
+            [...nextEvents].reverse().filter((event) => {
+              if (self != null && event.sender_open_dingtalk_id === self) {
+                return false;
+              }
+              return !(event.reply_status === "skipped" && replied.has(squash(event.content)));
+            }),
           );
           if (nextDetails) setDetails(nextDetails);
         }

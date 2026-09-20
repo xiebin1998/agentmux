@@ -10,9 +10,16 @@ import EventLog from "./components/EventLog";
 import ListenerLogs from "./components/ListenerLogs";
 import OverviewView from "./components/OverviewView";
 import OverlayPanel from "./components/OverlayPanel";
+import ConfirmDialog from "./components/ConfirmDialog";
 import SettingsPanel from "./components/SettingsPanel";
 import { ThemeToggle } from "./theme";
 import type { Project, Session } from "./types";
+
+/** delete_conversation / delete_project 的返回：真删掉多少条。 */
+interface Purged {
+  events: number;
+  archived: number;
+}
 
 /** 顶栏次要按钮（运行总览 / 全部事件）。 */
 const headerButton: CSSProperties = {
@@ -154,6 +161,11 @@ function App() {
   const [showEvents, setShowEvents] = useState(false);
   /** 监听日志降为底部抽屉，默认收起。 */
   const [logsOpen, setLogsOpen] = useState(false);
+  /** 待确认的删除（真删，不可恢复）：先挂起，弹窗确认后才动手。 */
+  const [pendingDelete, setPendingDelete] = useState<
+    { kind: "session"; session: Session } | { kind: "project"; project: Project } | null
+  >(null);
+  const [deleting, setDeleting] = useState(false);
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
   /** 正在生成的块，按 message_id 归位（监听频道的 progress 分支往里追加）。 */
@@ -262,6 +274,7 @@ function App() {
       created_at: conversation.last_received_at,
       kind: conversation.kind || "unknown",
       name_known: Boolean(conversation.name?.trim()),
+      events: conversation.events ?? 0,
     });
 
     await Promise.all(
@@ -383,44 +396,58 @@ function App() {
     }
   };
 
-  /** 删除会话：从左树与统计里去掉（事件仍在「事件与回复」里可查）。 */
-  const handleDeleteConversation = async (session: Session) => {
-    if (
-      !confirm(
-        `删除会话「${session.name}」？\n\n` +
-          "它会从左树与统计里消失，Agent 会话记录一并清掉；" +
-          "历史事件不会被删（仍可在「事件与回复」里查）。\n" +
-          "之后该会话再来新消息，它会自动重新出现。",
-      )
-    ) {
-      return;
-    }
-    try {
-      await invoke("delete_conversation", { conversationId: session.conversation_id });
-      const list = await loadProjects();
-      await loadSessions(list);
-      if (selectedSession?.conversation_id === session.conversation_id) {
-        setSelectedSession(null);
-      }
-    } catch (e) {
-      setBanner(String(e));
-    }
+  /**
+   * 删除会话：**真删**（消息、Agent 会话记录、摘要、归档行一起清掉），不可恢复。
+   *
+   * 不直接删 —— 先挂起，由确认弹窗把「会清掉多少条消息」说清楚再动手。
+   */
+  const handleDeleteConversation = (session: Session) => {
+    setPendingDelete({ kind: "session", session });
   };
 
-  const handleDeleteProject = async (id: string) => {
-    if (!confirm("确定要删除这个项目吗？（已落盘的事件与会话记录不会删除）")) return;
+  const handleDeleteProject = (project: Project) => {
+    setPendingDelete({ kind: "project", project });
+  };
+
+  /** 确认弹窗里点「删除」：真删 + 刷新左树与统计。 */
+  const confirmPendingDelete = async () => {
+    if (!pendingDelete) return;
+    setDeleting(true);
     try {
-      await invoke("delete_project", { id });
-      const list = await loadProjects();
-      await loadSessions(list);
-      if (selectedProject?.id === id) {
+      const purged =
+        pendingDelete.kind === "session"
+          ? await invoke<Purged>("delete_conversation", {
+              conversationId: pendingDelete.session.conversation_id,
+            })
+          : await invoke<Purged>("delete_project", { id: pendingDelete.project.id });
+
+      if (
+        pendingDelete.kind === "session" &&
+        selectedSession?.conversation_id === pendingDelete.session.conversation_id
+      ) {
+        setSelectedSession(null);
+      }
+      if (pendingDelete.kind === "project" && selectedProject?.id === pendingDelete.project.id) {
         setSelectedProject(null);
         setSelectedSession(null);
       }
+
+      const list = await loadProjects();
+      await loadSessions(list);
+      await loadStatuses();
+      const archived = purged.archived > 0 ? `，归档里 ${purged.archived} 行原始记录也一并清掉` : "";
+      setBanner(`已删除 ${purged.events} 条消息${archived}`);
     } catch (e) {
-      console.error("Failed to delete project:", e);
+      setBanner(`删除失败：${e}`);
+    } finally {
+      setDeleting(false);
+      setPendingDelete(null);
     }
   };
+
+  /** 该项目下所有会话的消息条数：删除确认里要如实说清会清掉多少。 */
+  const projectEventCount = (projectId: string) =>
+    (sessionsByProject[projectId] ?? []).reduce((sum, session) => sum + session.events, 0);
 
   const handleSelectSession = (session: Session, project: Project | null) => {
     setSelectedProject(project);
@@ -670,6 +697,45 @@ function App() {
 
       {showSettings && (
         <SettingsPanel project={selectedProject} onClose={() => setShowSettings(false)} />
+      )}
+
+      {pendingDelete && (
+        <ConfirmDialog
+          title={pendingDelete.kind === "session" ? "删除会话" : "删除项目"}
+          confirmText="删除"
+          busy={deleting}
+          onCancel={() => setPendingDelete(null)}
+          onConfirm={confirmPendingDelete}
+          body={
+            pendingDelete.kind === "session" ? (
+              <>
+                将删除会话「{pendingDelete.session.name}」在本地存下的{" "}
+                <b>{pendingDelete.session.events} 条消息</b>
+                ，以及它的 Agent 会话记录与上下文摘要。
+                <br />
+                <br />
+                <span style={{ color: "var(--danger)" }}>
+                  删除后不可恢复：这些消息不会再出现在会话窗口，也不会留在「全部事件」里。
+                </span>
+                <br />
+                之后对方再发消息，会话会从干净状态重新出现。
+              </>
+            ) : (
+              <>
+                将删除项目「{pendingDelete.project.name}」，连同它下面{" "}
+                <b>{projectEventCount(pendingDelete.project.id)} 条消息</b>
+                与相关会话的 Agent 记录、上下文摘要。
+                <br />
+                <br />
+                <span style={{ color: "var(--danger)" }}>
+                  删除后不可恢复：这些消息不会再出现在会话窗口，也不会留在「全部事件」里。
+                </span>
+                <br />
+                项目的工作目录与 CLI 配置不会被改动。
+              </>
+            )
+          }
+        />
       )}
 
       {showCloseDialog && (

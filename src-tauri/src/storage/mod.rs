@@ -46,6 +46,13 @@ pub struct EventRow {
     pub reply_anchor: Option<String>,
 }
 
+/// 真删的结果：清掉多少条事件、多少行归档原始记录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Purged {
+    pub events: usize,
+    pub archived: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
     pub total_events: i64,
@@ -295,28 +302,114 @@ impl Storage {
         }
     }
 
-    /// 删除会话：记下删除时该会话的最大事件序号当墓碑，并清掉它的 Agent 会话记录。
+    /// **真删**一个会话：事件、Agent 会话记录、会话元信息、摘要，以及归档里的原始行。
     ///
-    /// 事件不删（归档与审计照旧）。之后又收到新消息（序号更大）会话会自己回来，
-    /// 不会因为删过就永久收不到。
-    pub fn delete_conversation(&self, conversation_id: &str) -> Result<()> {
-        self.db.execute(
-            "INSERT INTO conversations (conversation_id, name, kind, name_known, updated_at, deleted_seq)
-             VALUES (
-                ?1, '', 'unknown', 0, ?2,
-                COALESCE((SELECT MAX(id) FROM events WHERE conversation_id = ?1), 0)
-             )
-             ON CONFLICT(conversation_id) DO UPDATE SET
-                deleted_seq = excluded.deleted_seq,
-                updated_at = excluded.updated_at",
-            params![conversation_id, chrono::Local::now().to_rfc3339()],
+    /// 与「只从界面移除」不同 —— **不可恢复**，调用方必须先让用户二次确认。
+    /// 归档是**按天**的全局 NDJSON，所以只能逐行过滤：不清它，内容就还在磁盘上。
+    pub fn purge_conversation(&self, conversation_id: &str) -> Result<Purged> {
+        let events = self.db.execute(
+            "DELETE FROM events WHERE conversation_id = ?1",
+            params![conversation_id],
         )?;
-        // Agent 会话记录一起清掉：会话回来时从干净状态重新开始，不带旧上下文。
         self.db.execute(
             "DELETE FROM sessions WHERE conversation_id = ?1",
             params![conversation_id],
         )?;
-        Ok(())
+        self.db.execute(
+            "DELETE FROM conversations WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        self.db.execute(
+            "DELETE FROM summaries WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+
+        let wanted = conversation_id.to_string();
+        let archived = self.strip_archive(&|value| {
+            value.get("conversation_id").and_then(|id| id.as_str()) == Some(wanted.as_str())
+        })?;
+        Ok(Purged { events, archived })
+    }
+
+    /// **真删**一个项目下的全部消息：事件、Agent 会话记录、会话元信息、摘要、归档行。
+    ///
+    /// 同样不可恢复。会话归属看事件上的 `project_id`（`conversations` 表本身不带项目），
+    /// 所以先把会话 id 收出来再删 —— 删完事件就查不出归属了。
+    pub fn purge_project(&self, project_id: &str) -> Result<Purged> {
+        let conversations: Vec<String> = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT DISTINCT conversation_id FROM events WHERE project_id = ?1")?;
+            let rows = stmt.query_map(params![project_id], |row| row.get(0))?;
+            rows.collect::<Result<Vec<String>, _>>()?
+        };
+
+        let events = self.db.execute(
+            "DELETE FROM events WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        self.db.execute(
+            "DELETE FROM sessions WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        for conversation_id in &conversations {
+            self.db.execute(
+                "DELETE FROM conversations WHERE conversation_id = ?1",
+                params![conversation_id],
+            )?;
+            self.db.execute(
+                "DELETE FROM summaries WHERE conversation_id = ?1",
+                params![conversation_id],
+            )?;
+        }
+
+        let wanted = project_id.to_string();
+        let archived = self.strip_archive(&|value| {
+            value.get("project_id").and_then(|id| id.as_str()) == Some(wanted.as_str())
+        })?;
+        Ok(Purged { events, archived })
+    }
+
+    /// 逐行过滤归档文件，把命中的原始行剔掉。
+    ///
+    /// 先写 `.tmp` 再改名：中途失败也不会留下半截归档。
+    /// 解析不出来的行**保留**（宁可多留，也不要把看不懂的行当垃圾删掉）。
+    fn strip_archive(&self, doomed: &dyn Fn(&serde_json::Value) -> bool) -> Result<usize> {
+        let mut removed = 0;
+        let Ok(entries) = std::fs::read_dir(&self.archive_dir) else {
+            return Ok(0);
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+
+            let mut kept = String::with_capacity(text.len());
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let doomed_line = serde_json::from_str::<serde_json::Value>(line)
+                    .map(|value| doomed(&value))
+                    .unwrap_or(false);
+                if doomed_line {
+                    removed += 1;
+                } else {
+                    kept.push_str(line);
+                    kept.push('\n');
+                }
+            }
+
+            let temp = path.with_extension("ndjson.tmp");
+            std::fs::write(&temp, kept)?;
+            std::fs::rename(&temp, &path)?;
+        }
+        Ok(removed)
     }
 
     /// 建项目时「指定群 / 指定人」的候选名单。全部来自本地已有数据，不起 CLI 子进程。
@@ -1227,11 +1320,11 @@ mod tests {
         }
     }
 
-    /// 删除会话：立刻从左树与统计里消失；之后再收到新消息要能自己回来
-    /// （不能因为删过一次就永久收不到）。
+    /// 删除会话 = **真删**：消息、Agent 会话记录、会话元信息、摘要、归档行全清掉；
+/// 之后再收到新消息，会话要能从干净状态自己回来。
     #[test]
-    fn deleted_conversation_hides_until_a_new_event_arrives() {
-        let dir = std::env::temp_dir().join("agentmux-delete-conversation-test");
+    fn purged_conversation_disappears_until_a_new_event_arrives() {
+        let dir = std::env::temp_dir().join("agentmux-purge-conversation-test");
         let _ = std::fs::remove_dir_all(&dir);
         let storage = Storage::new(dir.clone()).unwrap();
 
@@ -1242,12 +1335,15 @@ mod tests {
         storage
             .upsert_conversations(&[meta("cid-1", "客服一群", "group")])
             .unwrap();
+        storage.save_summary("cid-1", "旧摘要", 1).unwrap();
 
         assert_eq!(conversation_ids(&storage.list_conversations(Some("p1"), false).unwrap()).len(), 1);
         assert_eq!(storage.get_stats(Some("p1")).unwrap().conversations, 1);
 
-        storage.delete_conversation("cid-1").unwrap();
+        let purged = storage.purge_conversation("cid-1").unwrap();
 
+        assert_eq!(purged.events, 1, "该会话的事件要被删掉");
+        assert_eq!(purged.archived, 1, "归档里的原始行同样要剔掉，否则内容还在磁盘上");
         assert!(
             storage.list_conversations(Some("p1"), false).unwrap().is_empty(),
             "删掉的会话不应再出现在左树"
@@ -1257,22 +1353,25 @@ mod tests {
             0,
             "统计口径也要跟着少掉"
         );
+        assert_eq!(
+            storage.get_stats(Some("p1")).unwrap().total_events,
+            0,
+            "真删：事件不再留着"
+        );
         assert!(
             storage.get_session("p1", "cid-1").unwrap().is_none(),
             "删除会话应同时清掉 Agent 会话记录"
         );
-        assert_eq!(
-            storage.get_stats(Some("p1")).unwrap().total_events,
-            1,
-            "事件本身不删，归档与审计照旧"
+        assert!(
+            storage.get_summary("cid-1").unwrap().is_none(),
+            "摘要里也是对话内容，必须一起清掉"
         );
-        assert_eq!(
-            storage.conversation_meta("cid-1").unwrap().unwrap().name,
-            "客服一群",
-            "名字要留着，会话回来时还能显示"
+        assert!(
+            storage.conversation_meta("cid-1").unwrap().is_none(),
+            "会话元信息（名字/类型）也不再留着"
         );
 
-        // 新消息（序号更大）让它自己回来。
+        // 新消息让它自己回来（不因为删过一次就永久收不到）。
         storage
             .save_event(&sample_event("msg-2", "cid-1", "p1"))
             .unwrap();
@@ -1282,8 +1381,67 @@ mod tests {
             vec!["cid-1".to_string()],
             "删除后又收到新消息，会话应重新出现"
         );
-        assert_eq!(after[0].name, "客服一群");
         assert_eq!(storage.get_stats(Some("p1")).unwrap().conversations, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 删除项目 = 真删该项目下所有会话的消息；别的项目一条都不能少。
+    #[test]
+    fn purge_project_removes_only_its_own_messages() {
+        let dir = std::env::temp_dir().join("agentmux-purge-project-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir.clone()).unwrap();
+
+        for (mid, conv, project) in [
+            ("m1", "cid-a", "p1"),
+            ("m2", "cid-a", "p1"),
+            ("m3", "cid-b", "p1"),
+            ("m4", "cid-c", "p2"),
+        ] {
+            storage.save_event(&sample_event(mid, conv, project)).unwrap();
+        }
+        storage.save_session("p1", "cid-a", "sess-a", "D:\\a").unwrap();
+        storage.save_session("p2", "cid-c", "sess-c", "D:\\c").unwrap();
+        storage.save_summary("cid-a", "p1 的摘要", 2).unwrap();
+        storage.save_summary("cid-c", "p2 的摘要", 1).unwrap();
+
+        let purged = storage.purge_project("p1").unwrap();
+
+        assert_eq!(purged.events, 3, "p1 的 3 条事件要被删掉");
+        assert_eq!(purged.archived, 3, "归档里 p1 的原始行同样要剔掉");
+        assert_eq!(
+            storage.get_stats(Some("p1")).unwrap().total_events,
+            0,
+            "p1 不该还有事件"
+        );
+        assert_eq!(
+            storage.get_stats(Some("p2")).unwrap().total_events,
+            1,
+            "p2 的一条都不能少"
+        );
+        assert!(
+            storage.get_session("p1", "cid-a").unwrap().is_none(),
+            "p1 的 Agent 会话记录要清掉"
+        );
+        assert!(
+            storage.get_session("p2", "cid-c").unwrap().is_some(),
+            "p2 的 Agent 会话记录不能动"
+        );
+        assert!(
+            storage.get_summary("cid-a").unwrap().is_none(),
+            "p1 会话的摘要要清掉"
+        );
+        assert!(
+            storage.get_summary("cid-c").unwrap().is_some(),
+            "p2 会话的摘要不能动"
+        );
+        let left = storage.list_conversations(Some("p2"), false).unwrap();
+        assert_eq!(
+            conversation_ids(&left),
+            vec!["cid-c".to_string()],
+            "p2 的会话仍在"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

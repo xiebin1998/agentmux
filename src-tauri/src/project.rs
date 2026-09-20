@@ -450,12 +450,25 @@ pub async fn push_settings_to_running_listeners(state: &crate::AppState) -> usiz
     }
 }
 
-#[tauri::command]
-pub async fn delete_project(id: String) -> Result<(), String> {
-    let data_dir = crate::config::data_dir();
-    let store = ProjectStore::new(data_dir).map_err(|e| e.to_string())?;
-    store.delete(&id).map_err(|e| e.to_string())
-}
+/// **真删**一个项目：先把该项目下所有会话的消息清掉，再删项目记录。
+    ///
+    /// 不可恢复 —— 界面侧必须先让用户二次确认。先清消息再删记录：反过来的话
+    /// 项目没了，事件上的 project_id 就成了孤儿，谁都认领不了。
+    #[tauri::command]
+    pub async fn delete_project(
+        state: tauri::State<'_, crate::AppState>,
+        id: String,
+    ) -> Result<crate::storage::Purged, String> {
+        let purged = {
+            let storage = state.storage.lock().await;
+            storage.purge_project(&id).map_err(|e| e.to_string())?
+        };
+
+        let data_dir = crate::config::data_dir();
+        let store = ProjectStore::new(data_dir).map_err(|e| e.to_string())?;
+        store.delete(&id).map_err(|e| e.to_string())?;
+        Ok(purged)
+    }
 
 #[cfg(test)]
 mod tests {

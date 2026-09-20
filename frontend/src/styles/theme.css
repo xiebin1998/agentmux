@@ -106,3 +106,16 @@ input[type="range"].agentmux-range {
   accent-color: var(--accent);
   cursor: pointer;
 }
+
+/* 左树的行操作：默认隐藏，鼠标移到该行才露出「⋯」——
+   否则每行都挂着「编辑/删除」，整列都在喊危险操作。
+   键盘用户靠 :focus-within 也能露出来，不至于点不到。 */
+.amx-row-actions {
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.amx-row:hover .amx-row-actions,
+.amx-row-actions:focus-within {
+  opacity: 1;
+}

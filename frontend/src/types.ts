@@ -44,6 +44,8 @@ export interface Session {
   kind: string;
   /** 是否已知名字；未知时界面回退显示会话 id */
   name_known: boolean;
+  /** 该会话已落盘的事件数；删除确认要如实说清会清掉多少条 */
+  events: number;
 }
 
 /** 候选项：id 是会话 id 或 open id，name 只用于显示。 */

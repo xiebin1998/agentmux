@@ -1,5 +1,12 @@
-import { useState } from "react";
+import { useState, type MouseEvent as ReactMouseEvent } from "react";
 import type { Project, Session } from "../types";
+
+/** 行操作菜单里的一项。 */
+interface MenuItem {
+  label: string;
+  danger?: boolean;
+  onClick: () => void;
+}
 
 /** 群聊 / 单聊标签：样式与文案都在这里，列表里两处复用。 */
 function KindTag({ kind }: { kind: string }) {
@@ -81,7 +88,7 @@ interface ProjectListProps {
   onAssignConversation: (conversationId: string, projectId: string) => void;
   onDeleteSession: (session: Session) => void;
   onEditProject: (project: Project) => void;
-  onDeleteProject: (id: string) => void;
+  onDeleteProject: (project: Project) => void;
   onToggleListener: (project: Project, kind: ListenKind, active: boolean) => void;
 }
 
@@ -112,6 +119,18 @@ export default function ProjectList({
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   /** 每个未归类会话当前选中的目标项目 */
   const [assignTarget, setAssignTarget] = useState<Record<string, string>>({});
+  /**
+   * 行操作菜单：「⋯」点开的小菜单。
+   *
+   * 位置按按钮的实测坐标算、用 `fixed` 定位 —— 左列是滚动容器（overflow），
+   * 用 absolute 会被裁掉；鼠标移上去才显示「⋯」本身，省得整列都是删除按钮。
+   */
+  const [menu, setMenu] = useState<{ top: number; left: number; items: MenuItem[] } | null>(null);
+
+  const openRowMenu = (event: ReactMouseEvent<HTMLButtonElement>, items: MenuItem[]) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setMenu({ top: rect.bottom + 4, left: Math.max(8, rect.right - 132), items });
+  };
 
   return (
     <div style={{ flex: 1, overflow: "auto" }}>
@@ -142,7 +161,10 @@ export default function ProjectList({
             <div key={project.id} style={{ borderBottom: "1px solid var(--border)" }}>
               {/* 项目行：名称 + 本项目自己的监听开关 */}
               <div style={{ padding: "8px 12px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <div
+                  className="amx-row"
+                  style={{ display: "flex", alignItems: "center", gap: "6px" }}
+                >
                   <button
                     onClick={() =>
                       setCollapsed((current) => ({
@@ -186,14 +208,22 @@ export default function ProjectList({
                   >
                     {project.name}
                   </span>
-                  <button onClick={() => onEditProject(project)} style={iconButton}>
-                    编辑
-                  </button>
                   <button
-                    onClick={() => onDeleteProject(project.id)}
-                    style={{ ...iconButton, color: "var(--danger)" }}
+                    className="amx-row-actions"
+                    title="更多操作"
+                    onClick={(e) =>
+                      openRowMenu(e, [
+                        { label: "编辑项目", onClick: () => onEditProject(project) },
+                        {
+                          label: "删除项目",
+                          danger: true,
+                          onClick: () => onDeleteProject(project),
+                        },
+                      ])
+                    }
+                    style={{ ...iconButton, lineHeight: 1, fontSize: "14px" }}
                   >
-                    删除
+                    ⋯
                   </button>
                 </div>
 
@@ -281,6 +311,7 @@ export default function ProjectList({
                       return (
                         <div
                           key={session.conversation_id}
+                          className="amx-row"
                           onClick={() => onSelectSession(session, project)}
                           style={{
                             padding: "5px 12px 5px 28px",
@@ -308,15 +339,22 @@ export default function ProjectList({
                               {session.name}
                             </span>
                             <button
-                              title="删除这个会话"
+                              className="amx-row-actions"
+                              title="更多操作"
                               onClick={(e) => {
                                 // 别把点击冒泡成「选中会话」：删完就跳进空会话很困惑。
                                 e.stopPropagation();
-                                onDeleteSession(session);
+                                openRowMenu(e, [
+                                  {
+                                    label: "删除会话",
+                                    danger: true,
+                                    onClick: () => onDeleteSession(session),
+                                  },
+                                ]);
                               }}
-                              style={{ ...iconButton, marginLeft: "auto", color: "var(--danger)" }}
+                              style={{ ...iconButton, marginLeft: "auto", lineHeight: 1, fontSize: "14px" }}
                             >
-                              删除
+                              ⋯
                             </button>
                           </div>
                           {/* 名字已知时不再重复显示会话 id，省一行视觉噪音 */}
@@ -362,6 +400,7 @@ export default function ProjectList({
             return (
               <div
                 key={session.conversation_id}
+                className="amx-row"
                 style={{
                   padding: "6px 12px 8px",
                   backgroundColor: selected ? "var(--bg-active)" : "transparent",
@@ -391,14 +430,21 @@ export default function ProjectList({
                       {session.name}
                     </span>
                     <button
-                      title="删除这个会话"
+                      className="amx-row-actions"
+                      title="更多操作"
                       onClick={(e) => {
                         e.stopPropagation();
-                        onDeleteSession(session);
+                        openRowMenu(e, [
+                          {
+                            label: "删除会话",
+                            danger: true,
+                            onClick: () => onDeleteSession(session),
+                          },
+                        ]);
                       }}
-                      style={{ ...iconButton, marginLeft: "auto", color: "var(--danger)" }}
+                      style={{ ...iconButton, marginLeft: "auto", lineHeight: 1, fontSize: "14px" }}
                     >
-                      删除
+                      ⋯
                     </button>
                   </div>
                   {!session.name_known && (
@@ -454,6 +500,55 @@ export default function ProjectList({
             );
           })}
         </div>
+      )}
+
+      {/* 行操作菜单：fixed 定位 + 一层透明遮罩（点别处即关） */}
+      {menu && (
+        <>
+          <div
+            onClick={() => setMenu(null)}
+            style={{ position: "fixed", inset: 0, zIndex: 40 }}
+          />
+          <div
+            style={{
+              position: "fixed",
+              top: menu.top,
+              left: menu.left,
+              zIndex: 41,
+              width: "132px",
+              padding: "4px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "2px",
+              backgroundColor: "var(--bg-elevated)",
+              border: "1px solid var(--border)",
+              borderRadius: "6px",
+              boxShadow: "var(--shadow)",
+            }}
+          >
+            {menu.items.map((item) => (
+              <button
+                key={item.label}
+                onClick={() => {
+                  setMenu(null);
+                  item.onClick();
+                }}
+                style={{
+                  padding: "5px 10px",
+                  fontSize: "12px",
+                  textAlign: "left",
+                  backgroundColor: "transparent",
+                  color: item.danger ? "var(--danger)" : "var(--text-secondary)",
+                  border: "none",
+                  borderRadius: "4px",
+                  cursor: "pointer",
+                }}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </>
       )}
     </div>
   );

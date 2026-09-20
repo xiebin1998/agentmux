@@ -372,18 +372,19 @@ pub async fn assign_conversation(
         .map_err(|e| e.to_string())
 }
 
-/// 删除会话：从左树与统计里去掉（记墓碑），并清掉它的 Agent 会话记录。
-/// 事件不删；之后收到新消息会话会自己回来。
-#[tauri::command]
-pub async fn delete_conversation(
-    state: State<'_, AppState>,
-    conversation_id: String,
-) -> Result<(), String> {
-    let storage = state.storage.lock().await;
-    storage
-        .delete_conversation(&conversation_id)
-        .map_err(|e| e.to_string())
-}
+/// **真删**一个会话：消息、Agent 会话记录、会话元信息、摘要、归档行一起清掉。
+    ///
+    /// 不可恢复 —— 界面侧必须先让用户二次确认。
+    #[tauri::command]
+    pub async fn delete_conversation(
+        state: State<'_, AppState>,
+        conversation_id: String,
+    ) -> Result<crate::storage::Purged, String> {
+        let storage = state.storage.lock().await;
+        storage
+            .purge_conversation(&conversation_id)
+            .map_err(|e| e.to_string())
+    }
 
 /// 建项目时「指定群 / 指定人」的候选名单（来自会话列表与历史发送人）。
 #[tauri::command]
